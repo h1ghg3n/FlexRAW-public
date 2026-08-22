@@ -1,0 +1,43 @@
+{
+  "name": "flexraw",
+  "version": "0.1.0",
+  "default-features": [ "desktop", "tests" ],
+  "dependencies": [
+    "exiv2",
+    {
+      "name": "libiconv",
+      "platform": "windows"
+    },
+    "libraw",
+    "lcms",
+    "spdlog",
+    {
+      "name": "qtbase",
+      "default-features": false,
+      "features": [ "gui", "network", "jpeg", "png", "thread" ]
+    }
+  ],
+  "features": {
+    "desktop": {
+      "description": "Desktop UI and Catalog dependencies",
+      "dependencies": [
+        "lensfun",
+        {
+          "name": "opencv4",
+          "default-features": false,
+          "features": [ "contrib", "intrinsics", "jpeg", "png", "thread", "tiff", "webp" ]
+        },
+        {
+          "name": "qtbase",
+          "default-features": false,
+          "features": [ "widgets", "sql" ]
+        },
+        "qtimageformats"
+      ]
+    },
+    "tests": {
+      "description": "Google Test dependency",
+      "dependencies": [ "gtest" ]
+    }
+  }
+}

@@ -1,0 +1,270 @@
+#pragma once
+
+#include <optional>
+
+#include <QHash>
+#include <QMainWindow>
+
+#include "catalog_contracts.h"
+#include "catalog_entry.h"
+#include "develop_params.h"
+
+namespace flexraw::ui::catalog
+{
+class CatalogListWidget;
+class SourceResolutionWidget;
+}  // namespace flexraw::ui::catalog
+
+namespace flexraw::ui::editor
+{
+class DevelopPanel;
+class PreviewWidget;
+}  // namespace flexraw::ui::editor
+
+namespace flexraw::ui::cli
+{
+class ConsoleModeWidget;
+}
+
+namespace flexraw::core::orchestration
+{
+class CatalogOrchestrator;
+class ExportOrchestrator;
+struct EditorState;
+}  // namespace flexraw::core::orchestration
+
+namespace flexraw::ui::facade
+{
+class CatalogEditorFacade;
+}
+
+namespace flexraw::ui::mainwindow
+{
+class FolderScanController;
+}
+
+class QAction;
+class QCloseEvent;
+class QStackedWidget;
+class QTimer;
+class QToolButton;
+
+namespace flexraw::ui::mainwindow
+{
+
+class MainWindow : public QMainWindow
+{
+public:
+    // 목적: Flexraw 첫 catalog-to-preview window를 editor session adapter로 초기화
+    // 입력: catalogEditorFacade: GUI boundary, catalogOrchestrator: console catalog use case,
+    //       exportOrchestrator: Local/Remote/Auto export use case, parent: Qt 부모 widget
+    // 출력: 초기화된 MainWindow 객체
+    explicit MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
+                        core::orchestration::CatalogOrchestrator& catalogOrchestrator,
+                        core::orchestration::ExportOrchestrator& exportOrchestrator,
+                        QWidget* parent = nullptr);
+
+protected:
+    // 목적: explicit save policy에서 dirty catalog edit의 종료 전 저장 여부 확인
+    // 입력: event: Qt window close event
+    // 출력: 저장·폐기 선택 시 종료, 취소·저장 실패 시 종료 중단
+    void closeEvent(QCloseEvent* event) override;
+
+private:
+    // 목적: 새 catalog file 경로를 선택하고 migration된 빈 catalog 생성
+    // 입력: 없음
+    // 출력: 없음
+    void createCatalog();
+
+    // 목적: catalog file 선택 dialog를 열고 stable PhotoId 목록을 현재 window에 연결
+    // 입력: 없음
+    // 출력: 없음
+    void openCatalog();
+
+    // 목적: 지정 catalog를 단일 active session으로 열고 stable PhotoId 목록 표시
+    // 입력: catalogPath: 생성하거나 열 catalog file 경로
+    // 출력: catalog와 photo list를 모두 열었으면 true
+    [[nodiscard]] bool openCatalogPath(const QString& catalogPath);
+
+    // 목적: 이미 열린 Catalog의 photo 목록과 관련 action을 현재 window에 반영
+    // 입력: 없음
+    // 출력: photo 목록을 정상 조회해 표시했으면 true
+    [[nodiscard]] bool refreshCatalogPhotos();
+
+    // 목적: cursor 요청에 해당하는 bounded Catalog photo page를 현재 목록에 적용
+    // 입력: request: page 크기, 이동 방향과 exclusive cursor
+    // 출력: 조회와 UI 적용에 성공하면 true
+    [[nodiscard]] bool loadCatalogPhotoPage(const core::catalog::CatalogPhotoPageRequest& request);
+
+    // 목적: 현재 첫 record 이전의 Catalog photo page로 이동
+    // 입력: 없음
+    // 출력: dirty state 저장 후 이전 page 적용
+    void showPreviousCatalogPage();
+
+    // 목적: 현재 마지막 record 다음의 Catalog photo page로 이동
+    // 입력: 없음
+    // 출력: dirty state 저장 후 다음 page 적용
+    void showNextCatalogPage();
+
+    // 목적: Catalog page cursor state와 navigation control 초기화
+    // 입력: 없음
+    // 출력: 현재 page가 제거되고 navigation button 비활성화
+    void resetCatalogPhotoPage();
+
+    // 목적: 현재 page의 이전·다음 cursor 존재 여부를 button 상태에 반영
+    // 입력: 없음
+    // 출력: 유효한 방향의 navigation button만 활성화
+    void updateCatalogPageActions();
+
+    // 목적: 현재 열린 catalog에 추가할 photo folder를 선택하고 background scan 시작
+    // 입력: 없음
+    // 출력: 없음
+    void importFolder();
+
+    // 목적: folder 선택 dialog를 열고 선택된 folder scan 시작
+    // 입력: 없음
+    // 출력: 없음
+    void openFolder();
+
+    // 목적: UI thread를 차단하지 않고 지정 folder의 catalog scan 시작
+    // 입력: folderPath: scan할 folder 경로
+    // 출력: 비동기 scan 시작
+    void loadFolder(const QString& folderPath);
+
+    // 목적: 선택된 Folder photo를 active Catalog에 등록·resolve하고 Editor에 연결
+    // 입력: entry: 사용자가 선택한 CatalogEntry 값
+    // 출력: stable PhotoId activation 성공 시 preview 예약, 실패 시 이전 선택 복원
+    void showSelectedEntry(const core::catalog::CatalogEntry& entry);
+
+    // 목적: 선택된 catalog-backed photo를 persisted develop state와 함께 editor에 연결
+    // 입력: photo: stable PhotoId와 source binding을 포함한 catalog record
+    // 출력: 없음
+    void showSelectedCatalogPhoto(const core::catalog::CatalogPhotoRecord& photo);
+
+    // 목적: 선택 photo의 replacement source를 기존 identity의 새 baseline으로 수용
+    // 입력: 없음
+    // 출력: accepted source request를 inline pending 상태로 표시
+    void acceptReplacement();
+
+    // 목적: 선택 photo의 replacement source를 새 identity로 등록
+    // 입력: 없음
+    // 출력: 기존 dirty state 저장 후 accepted source request 표시
+    void registerReplacementAsNew();
+
+    // 목적: 선택 photo와 동일한 content의 다른 source locator 선택
+    // 입력: 없음
+    // 출력: file 선택 후 accepted relink request 표시
+    void relinkSource();
+
+    // 목적: source resolution command 제출 결과를 공통 inline 상태로 변환
+    // 입력: result: request ID 또는 오류, failureMessage: 사용자용 실패 안내
+    // 출력: request가 accepted되면 true
+    [[nodiscard]] bool beginSourceResolution(const core::orchestration::CatalogSourceSubmissionResult& result,
+                                             const QString& failureMessage);
+
+    // 목적: source transition을 현재 Editor selection과 catalog list에 반영
+    // 입력: update: 갱신된 기존 photo와 optional 신규 photo
+    // 출력: 현재 selection의 Register as New이면 신규 PhotoId로 전환
+    void handleSourceBindingUpdated(const core::orchestration::CatalogSourceUpdate& update);
+
+    // 목적: current photo의 source verification/resolution 실패를 inline 상태로 표시
+    // 입력: issue: request·photo identity와 technical 오류
+    // 출력: pending 해제와 사용자용 실패 안내
+    void handleSourceBindingFailed(const core::orchestration::CatalogIssue& issue);
+
+    // 목적: source request terminal cancellation을 inline 상태에 반영
+    // 입력: requestId: 취소된 request identity
+    // 출력: pending 상태 해제
+    void handleSourceBindingCancelled(core::types::RequestId requestId);
+
+    // 목적: terminal event와 일치하는 explicit source request 추적을 제거
+    // 입력: requestId: 완료·실패·취소된 request identity
+    // 출력: 해당 request가 명시적 GUI command이면 대상 PhotoId
+    [[nodiscard]] std::optional<core::types::PhotoId> takeSourceResolutionRequest(core::types::RequestId requestId);
+
+    // 목적: 현재 catalog-backed photo의 develop state를 explicit user command로 저장
+    // 입력: 없음
+    // 출력: 성공 시 persisted baseline 갱신, 실패 시 non-modal 상태 표시
+    void saveCurrentPhoto();
+
+    // 목적: 현재 Editor snapshot을 Local graphical export dialog에 연결
+    // 입력: 없음
+    // 출력: 선택 photo가 처리 가능하면 modal export workflow 실행
+    void exportCurrentPhoto();
+
+    // 목적: 현재 catalog-backed photo 저장 command를 실행하고 결과를 UI에 표시
+    // 입력: 없음
+    // 출력: 저장 성공 또는 저장할 dirty state가 없으면 true
+    [[nodiscard]] bool persistCurrentPhoto();
+
+    // 목적: catalog 전환 또는 window 종료 전에 dirty edit의 저장·폐기·취소 의사 확인
+    // 입력: 없음
+    // 출력: 호출자가 전환을 계속해도 되면 true
+    [[nodiscard]] bool confirmPendingSave();
+
+    // 목적: 중앙 UI를 graphical 또는 console mode로 전환
+    // 입력: enabled: console mode 활성화 여부
+    // 출력: 없음
+    void setConsoleMode(bool enabled);
+
+    // 목적: 현재 선택 사진에 대한 develop parameter 변경을 preview와 history에 반영
+    // 입력: params: panel에서 변경된 develop parameter 값
+    // 출력: 없음
+    void applyDevelopParams(const core::types::DevelopParams& params);
+
+    // 목적: 현재 사진의 연속 parameter 조작을 하나의 undo 단계로 시작
+    // 입력: 없음
+    // 출력: 없음
+    void beginDevelopAdjustment();
+
+    // 목적: 현재 사진의 연속 parameter 조작을 완료하고 undo action 상태 갱신
+    // 입력: 없음
+    // 출력: 없음
+    void finishDevelopAdjustment();
+
+    // 목적: 현재 사진의 마지막 develop parameter 변경을 undo
+    // 입력: 없음
+    // 출력: 없음
+    void undoDevelopAdjustment();
+
+    // 목적: 현재 사진의 마지막 undo된 develop parameter 변경을 redo
+    // 입력: 없음
+    // 출력: 없음
+    void redoDevelopAdjustment();
+
+    // 목적: Editor state 변경을 action 활성화와 source-blocked 안내에 반영
+    // 입력: state: CatalogEditorFacade가 publish한 immutable state
+    // 출력: 없음
+    void updateEditorStateUi(const core::orchestration::EditorState& state);
+
+    // 목적: 현재 사진 state에 맞춰 Save, undo와 redo action 활성화 갱신
+    // 입력: 없음
+    // 출력: 없음
+    void updateEditorActions();
+
+    catalog::CatalogListWidget* m_catalogWidget{nullptr};
+    editor::DevelopPanel* m_developPanel{nullptr};
+    catalog::SourceResolutionWidget* m_sourceResolutionWidget{nullptr};
+    editor::PreviewWidget* m_previewWidget{nullptr};
+    cli::ConsoleModeWidget* m_consoleWidget{nullptr};
+    FolderScanController* m_folderScanController{nullptr};
+    facade::CatalogEditorFacade* m_catalogEditorFacade{nullptr};
+    core::orchestration::ExportOrchestrator* m_exportOrchestrator{nullptr};
+    QStackedWidget* m_contentStack{nullptr};
+    QAction* m_newCatalogAction{nullptr};
+    QAction* m_openCatalogAction{nullptr};
+    QAction* m_importFolderAction{nullptr};
+    QAction* m_openFolderAction{nullptr};
+    QAction* m_saveDevelopAction{nullptr};
+    QAction* m_exportAction{nullptr};
+    QAction* m_consoleModeAction{nullptr};
+    QAction* m_undoDevelopAction{nullptr};
+    QAction* m_redoDevelopAction{nullptr};
+    QToolButton* m_previousCatalogPageButton{nullptr};
+    QToolButton* m_nextCatalogPageButton{nullptr};
+    std::optional<core::catalog::CatalogPhotoPage> m_catalogPhotoPage;
+    QHash<qint64, core::types::RequestId> m_sourceResolutionRequests;
+    bool m_importingFolder{false};
+};
+
+}  // namespace flexraw::ui::mainwindow
