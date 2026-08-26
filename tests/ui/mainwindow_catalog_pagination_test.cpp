@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QImage>
 #include <QSlider>
+#include <QSplitter>
 #include <QTemporaryDir>
 #include <QToolButton>
 
@@ -131,12 +132,16 @@ TEST(MainWindowCatalogPaginationTest, FinishesAndPersistsAdjustmentBeforePageNav
     QToolButton* nextButton = window.findChild<QToolButton*>(QStringLiteral("catalogNextPageButton"));
     auto* developPanel = window.findChild<editor::DevelopPanel*>();
     QSlider* exposureSlider = window.findChild<QSlider*>(QStringLiteral("exposureSlider"));
+    QSplitter* workspaceSplitter = window.findChild<QSplitter*>(QStringLiteral("workspaceSplitter"));
     int adjustmentFinishedCount = 0;
 
     ASSERT_NE(nullptr, previousButton);
     ASSERT_NE(nullptr, nextButton);
     ASSERT_NE(nullptr, developPanel);
     ASSERT_NE(nullptr, exposureSlider);
+    ASSERT_NE(nullptr, workspaceSplitter);
+    EXPECT_EQ(5, workspaceSplitter->handleWidth());
+    EXPECT_TRUE(workspaceSplitter->styleSheet().contains(QStringLiteral("palette(mid)")));
     QObject::connect(developPanel, &editor::DevelopPanel::adjustmentFinished, [&adjustmentFinishedCount] {
         ++adjustmentFinishedCount;
     });

@@ -162,6 +162,10 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     connect(m_settingsAction, &QAction::triggered, this, &MainWindow::openSettings);
 
     auto* splitter = new QSplitter(this);
+    splitter->setObjectName(QStringLiteral("workspaceSplitter"));
+    splitter->setHandleWidth(5);
+    splitter->setStyleSheet(
+        QStringLiteral("QSplitter#workspaceSplitter::handle:horizontal { background: palette(mid); margin: 0 2px; }"));
     auto* catalogSurface = new QWidget(splitter);
     auto* catalogLayout = new QVBoxLayout(catalogSurface);
     catalogLayout->setContentsMargins(0, 0, 0, 0);

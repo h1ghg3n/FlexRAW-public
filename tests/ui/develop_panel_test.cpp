@@ -1,3 +1,4 @@
+#include <QApplication>
 #include <QComboBox>
 #include <QGroupBox>
 #include <QObject>
@@ -8,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "adjustment_control.h"
 #include "develop_panel.h"
 
 namespace flexraw::ui::editor
@@ -58,6 +60,30 @@ TEST(DevelopPanelTest, StyleSwitchPreservesParamsWithoutCreatingHistoryEvent)
     EXPECT_EQ(0, paramsChangedCount);
     EXPECT_EQ(0, adjustmentStartedCount);
     EXPECT_EQ(0, adjustmentFinishedCount);
+    const QList<AdjustmentParameterControl*> controls = panel.findChildren<AdjustmentParameterControl*>();
+    ASSERT_EQ(26, controls.size());
+    for (const AdjustmentParameterControl* control : controls)
+    {
+        EXPECT_EQ(AdjustmentControlStyle::Relative, control->controlStyle());
+    }
+}
+
+TEST(DevelopPanelTest, UsesFullWidthCommonRowsForLightSliders)
+{
+    DevelopPanel panel;
+    panel.resize(320, 900);
+    panel.show();
+    QApplication::processEvents();
+    auto* exposureControl = panel.findChild<AdjustmentParameterControl*>(QStringLiteral("exposureAdjustmentControl"));
+    auto* contrastControl = panel.findChild<AdjustmentParameterControl*>(QStringLiteral("contrastAdjustmentControl"));
+    ASSERT_NE(nullptr, exposureControl);
+    ASSERT_NE(nullptr, contrastControl);
+
+    EXPECT_EQ(200, panel.minimumWidth());
+    EXPECT_EQ(320, panel.maximumWidth());
+    EXPECT_EQ(QSizePolicy::Expanding, exposureControl->sizePolicy().horizontalPolicy());
+    EXPECT_EQ(QSizePolicy::Expanding, contrastControl->sizePolicy().horizontalPolicy());
+    EXPECT_EQ(exposureControl->width(), contrastControl->width());
 }
 
 TEST(DevelopPanelTest, AppliesDehazeFromSlider)

@@ -9,7 +9,6 @@
 
 class QComboBox;
 class QFormLayout;
-class QSlider;
 class QSpinBox;
 
 namespace flexraw::core::develop
@@ -21,7 +20,8 @@ namespace flexraw::ui::editor
 {
 
 class HistogramWidget;
-class ExposureAdjustmentControl;
+class AdjustmentParameterControl;
+struct AdjustmentParameterConfiguration;
 
 class DevelopPanel : public QWidget
 {
@@ -90,12 +90,20 @@ signals:
     void adjustmentFinished();
 
 private:
-    struct NormalizedControl
+    struct ParameterControlBinding
     {
-        QSlider* slider{nullptr};
-        QSpinBox* spinBox{nullptr};
+        AdjustmentParameterControl* control{nullptr};
         float core::types::DevelopParams::* parameter{nullptr};
     };
+
+    // 목적: 공통 label/value와 Classic/Relative presentation을 가진 parameter control 생성
+    // 입력: layout: 추가 대상, configuration: 표시·범위·rate, parameter: 연결할 DevelopParams member,
+    //       activatesCustomWhiteBalance: 변경 시 Custom White Balance로 전환할지 여부
+    // 출력: 생성되어 layout과 parameter에 연결된 control
+    AdjustmentParameterControl* addParameterControl(QFormLayout* layout,
+                                                    const AdjustmentParameterConfiguration& configuration,
+                                                    float core::types::DevelopParams::* parameter,
+                                                    bool activatesCustomWhiteBalance = false);
 
     // 목적: 노출 control을 생성하고 DevelopParams::exposureEv에 연결
     // 입력: layout: control을 추가할 form layout
@@ -147,17 +155,12 @@ private:
     void finishAdjustment();
 
     core::types::DevelopParams m_params;
-    ExposureAdjustmentControl* m_exposureControl{nullptr};
     QComboBox* m_whiteBalanceModeCombo{nullptr};
     QSpinBox* m_whiteBalanceTemperatureSpinBox{nullptr};
-    QSlider* m_whiteBalanceTintSlider{nullptr};
-    QSpinBox* m_whiteBalanceTintSpinBox{nullptr};
-    QSlider* m_sharpeningRadiusSlider{nullptr};
-    QSpinBox* m_sharpeningRadiusSpinBox{nullptr};
-    QSlider* m_sharpeningMaskingSlider{nullptr};
-    QSpinBox* m_sharpeningMaskingSpinBox{nullptr};
+    AdjustmentParameterControl* m_whiteBalanceTintControl{nullptr};
     HistogramWidget* m_histogramWidget{nullptr};
-    std::vector<NormalizedControl> m_normalizedControls;
+    std::vector<ParameterControlBinding> m_parameterControls;
+    AdjustmentControlStyle m_adjustmentControlStyle{AdjustmentControlStyle::Classic};
     bool m_adjustmentInProgress{false};
 };
 

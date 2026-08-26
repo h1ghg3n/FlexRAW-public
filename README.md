@@ -15,7 +15,7 @@ CPU 사용량은 현재 4코어 고정이며, 추후 지원할 예정입니다.
 - 연속된 조작에서는 빠른 interactive preview를 사용하고, 조작이 끝나면 final preview를 다시 생성합니다.
 - Catalog, Folder와 Project 범위의 bounded page navigation과 다중 선택 Project membership을 지원합니다.
 - 화면에 보이는 행과 인접 viewport만 thumbnail로 유지해 큰 Catalog의 UI memory 사용을 제한합니다.
-- 보정 control은 Classic slider와 중앙 복귀형 Relative 방식을 설정에서 선택할 수 있습니다.
+- 모든 숫자 보정 slider는 설정에서 Classic과 중앙 복귀형 Relative rate control 중 하나를 선택할 수 있습니다.
 - JPEG, PNG, TIFF 형식의 단일, 다중 선택과 folder batch 내보내기를 지원합니다.
 - Local/Remote/Auto placement를 이용해 Desktop과 별도 Worker의 여유 slot에 내보내기 작업을 배치합니다.
 - Worker는 bounded queue, cancellation, backpressure와 실행 전 resource admission을 사용합니다.

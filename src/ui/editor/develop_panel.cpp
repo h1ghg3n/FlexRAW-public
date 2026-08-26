@@ -9,7 +9,6 @@
 #include <QLabel>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
 #include <QToolButton>
@@ -65,7 +64,7 @@ private:
 // 출력: 초기화된 DevelopPanel 객체
 DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
 {
-    setMinimumWidth(260);
+    setMinimumWidth(200);
     setMaximumWidth(320);
 
     auto* layout = new QVBoxLayout(this);
@@ -98,6 +97,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* lightGroup = new QGroupBox(contentWidget);
     lightGroup->setObjectName(QStringLiteral("lightGroup"));
     auto* lightLayout = new QFormLayout(lightGroup);
+    lightLayout->setVerticalSpacing(2);
     addExposureControl(lightLayout);
     addNormalizedControl(
         lightLayout, tr("Contrast"), QStringLiteral("contrastSlider"), &core::types::DevelopParams::contrast);
@@ -114,6 +114,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* colorGroup = new QGroupBox(contentWidget);
     colorGroup->setObjectName(QStringLiteral("colorGroup"));
     auto* colorLayout = new QFormLayout(colorGroup);
+    colorLayout->setVerticalSpacing(2);
     addWhiteBalanceControls(colorLayout);
     addNormalizedControl(
         colorLayout, tr("Vibrance"), QStringLiteral("vibranceSlider"), &core::types::DevelopParams::vibrance);
@@ -124,6 +125,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* presenceGroup = new QGroupBox(contentWidget);
     presenceGroup->setObjectName(QStringLiteral("presenceGroup"));
     auto* presenceLayout = new QFormLayout(presenceGroup);
+    presenceLayout->setVerticalSpacing(2);
     addNormalizedControl(
         presenceLayout, tr("Clarity"), QStringLiteral("claritySlider"), &core::types::DevelopParams::clarity);
     addNormalizedControl(
@@ -133,6 +135,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* toneCurveGroup = new QGroupBox(contentWidget);
     toneCurveGroup->setObjectName(QStringLiteral("toneCurveGroup"));
     auto* toneCurveLayout = new QFormLayout(toneCurveGroup);
+    toneCurveLayout->setVerticalSpacing(2);
     addNormalizedControl(toneCurveLayout,
                          tr("Shadows"),
                          QStringLiteral("toneCurveShadowsSlider"),
@@ -154,6 +157,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* pointCurveGroup = new QGroupBox(contentWidget);
     pointCurveGroup->setObjectName(QStringLiteral("pointCurveGroup"));
     auto* pointCurveLayout = new QFormLayout(pointCurveGroup);
+    pointCurveLayout->setVerticalSpacing(2);
     addNormalizedControl(pointCurveLayout,
                          tr("Black"),
                          QStringLiteral("pointCurveBlackSlider"),
@@ -179,6 +183,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     auto* detailGroup = new QGroupBox(contentWidget);
     detailGroup->setObjectName(QStringLiteral("detailGroup"));
     auto* detailLayout = new QFormLayout(detailGroup);
+    detailLayout->setVerticalSpacing(2);
     addNormalizedControl(detailLayout,
                          tr("Sharpening"),
                          QStringLiteral("sharpeningSlider"),
@@ -203,6 +208,7 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     contentLayout->addStretch();
 
     connect(resetButton, &QToolButton::clicked, this, &DevelopPanel::reset);
+    updateControls();
 }
 
 // 목적: 현재 panel에 설정된 develop parameter 읽기 전용 참조 반환
@@ -263,7 +269,11 @@ void DevelopPanel::finishActiveAdjustment()
 void DevelopPanel::setAdjustmentControlStyle(AdjustmentControlStyle style)
 {
     finishAdjustment();
-    m_exposureControl->setControlStyle(style);
+    m_adjustmentControlStyle = style;
+    for (const ParameterControlBinding& binding : m_parameterControls)
+    {
+        binding.control->setControlStyle(style);
+    }
 }
 
 // 목적: 현재 adjustment presentation preference 반환
@@ -271,7 +281,37 @@ void DevelopPanel::setAdjustmentControlStyle(AdjustmentControlStyle style)
 // 출력: Classic 또는 Relative style
 AdjustmentControlStyle DevelopPanel::adjustmentControlStyle() const
 {
-    return m_exposureControl->controlStyle();
+    return m_adjustmentControlStyle;
+}
+
+// 목적: 공통 label/value와 Classic/Relative presentation을 가진 parameter control 생성
+// 입력: layout: 추가 대상, configuration: 표시·범위·rate, parameter: 연결할 DevelopParams member,
+//       activatesCustomWhiteBalance: 변경 시 Custom White Balance로 전환할지 여부
+// 출력: 생성되어 layout과 parameter에 연결된 control
+AdjustmentParameterControl* DevelopPanel::addParameterControl(QFormLayout* layout,
+                                                              const AdjustmentParameterConfiguration& configuration,
+                                                              float core::types::DevelopParams::* parameter,
+                                                              bool activatesCustomWhiteBalance)
+{
+    auto* control = new AdjustmentParameterControl(configuration, this);
+    control->setControlStyle(m_adjustmentControlStyle);
+    layout->addRow(control);
+    m_parameterControls.push_back({control, parameter});
+    connect(control,
+            &AdjustmentParameterControl::valueChanged,
+            this,
+            [this, parameter, activatesCustomWhiteBalance](double value) {
+                m_params.*parameter = static_cast<float>(value);
+                if (activatesCustomWhiteBalance)
+                {
+                    m_params.whiteBalanceMode = core::types::WhiteBalanceMode::Custom;
+                    updateWhiteBalanceControls();
+                }
+                emit paramsChanged(m_params);
+            });
+    connect(control, &AdjustmentParameterControl::adjustmentStarted, this, &DevelopPanel::beginAdjustment);
+    connect(control, &AdjustmentParameterControl::adjustmentFinished, this, &DevelopPanel::finishAdjustment);
+    return control;
 }
 
 // 목적: 노출 control을 생성하고 DevelopParams::exposureEv에 연결
@@ -279,14 +319,18 @@ AdjustmentControlStyle DevelopPanel::adjustmentControlStyle() const
 // 출력: 없음
 void DevelopPanel::addExposureControl(QFormLayout* layout)
 {
-    m_exposureControl = new ExposureAdjustmentControl(this);
-    layout->addRow(m_exposureControl);
-    connect(m_exposureControl, &ExposureAdjustmentControl::valueChanged, this, [this](double value) {
-        m_params.exposureEv = static_cast<float>(value);
-        emit paramsChanged(m_params);
-    });
-    connect(m_exposureControl, &ExposureAdjustmentControl::adjustmentStarted, this, &DevelopPanel::beginAdjustment);
-    connect(m_exposureControl, &ExposureAdjustmentControl::adjustmentFinished, this, &DevelopPanel::finishAdjustment);
+    AdjustmentParameterConfiguration configuration;
+    configuration.label = tr("Exposure");
+    configuration.sliderObjectName = QStringLiteral("exposureSlider");
+    configuration.suffix = tr(" EV");
+    configuration.minimum = -5.0;
+    configuration.maximum = 5.0;
+    configuration.sliderScale = 100.0;
+    configuration.displayScale = 1.0;
+    configuration.singleStep = 0.1;
+    configuration.maximumRate = 0.8;
+    configuration.displayDecimals = 2;
+    addParameterControl(layout, configuration, &core::types::DevelopParams::exposureEv);
 }
 
 // 목적: as-shot 또는 custom white balance control을 생성하고 DevelopParams에 연결
@@ -307,16 +351,18 @@ void DevelopPanel::addWhiteBalanceControls(QFormLayout* layout)
     m_whiteBalanceTemperatureSpinBox->setSuffix(tr(" K"));
     layout->addRow(tr("Temperature"), m_whiteBalanceTemperatureSpinBox);
 
-    m_whiteBalanceTintSlider = new QSlider(Qt::Horizontal, this);
-    m_whiteBalanceTintSlider->setObjectName(QStringLiteral("whiteBalanceTintSlider"));
-    m_whiteBalanceTintSlider->setRange(-100, 100);
-    m_whiteBalanceTintSpinBox = new QSpinBox(this);
-    m_whiteBalanceTintSpinBox->setRange(-100, 100);
-    auto* tintLayout = new QHBoxLayout();
-    tintLayout->setContentsMargins({});
-    tintLayout->addWidget(m_whiteBalanceTintSlider);
-    tintLayout->addWidget(m_whiteBalanceTintSpinBox);
-    layout->addRow(tr("Tint"), tintLayout);
+    AdjustmentParameterConfiguration tintConfiguration;
+    tintConfiguration.label = tr("Tint");
+    tintConfiguration.sliderObjectName = QStringLiteral("whiteBalanceTintSlider");
+    tintConfiguration.minimum = -1.0;
+    tintConfiguration.maximum = 1.0;
+    tintConfiguration.sliderScale = 100.0;
+    tintConfiguration.displayScale = 100.0;
+    tintConfiguration.singleStep = 0.01;
+    tintConfiguration.maximumRate = 0.1;
+    tintConfiguration.displayDecimals = 0;
+    m_whiteBalanceTintControl =
+        addParameterControl(layout, tintConfiguration, &core::types::DevelopParams::whiteBalanceTint, true);
 
     connect(m_whiteBalanceModeCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
         beginAdjustment();
@@ -334,22 +380,6 @@ void DevelopPanel::addWhiteBalanceControls(QFormLayout* layout)
         emit paramsChanged(m_params);
     });
     connect(m_whiteBalanceTemperatureSpinBox, &QSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
-    connect(m_whiteBalanceTintSlider, &QSlider::valueChanged, this, [this](int value) {
-        m_params.whiteBalanceMode = core::types::WhiteBalanceMode::Custom;
-        m_params.whiteBalanceTint = static_cast<float>(value) / 100.0F;
-        QSignalBlocker blocker(m_whiteBalanceTintSpinBox);
-        m_whiteBalanceTintSpinBox->setValue(value);
-        updateWhiteBalanceControls();
-        emit paramsChanged(m_params);
-    });
-    connect(m_whiteBalanceTintSpinBox, &QSpinBox::valueChanged, this, [this](int value) {
-        beginAdjustment();
-        m_whiteBalanceTintSlider->setValue(value);
-    });
-    connect(m_whiteBalanceTintSlider, &QSlider::sliderPressed, this, &DevelopPanel::beginAdjustment);
-    connect(m_whiteBalanceTintSlider, &QSlider::sliderReleased, this, &DevelopPanel::finishAdjustment);
-    connect(m_whiteBalanceTintSpinBox, &QSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
-
     updateWhiteBalanceControls();
 }
 
@@ -358,32 +388,19 @@ void DevelopPanel::addWhiteBalanceControls(QFormLayout* layout)
 // 출력: 없음
 void DevelopPanel::addSharpeningRadiusControl(QFormLayout* layout)
 {
-    m_sharpeningRadiusSlider = new QSlider(Qt::Horizontal, this);
-    m_sharpeningRadiusSlider->setObjectName(QStringLiteral("sharpeningRadiusSlider"));
-    m_sharpeningRadiusSlider->setRange(1, 3);
-    m_sharpeningRadiusSpinBox = new QSpinBox(this);
-    m_sharpeningRadiusSpinBox->setRange(1, 3);
-    m_sharpeningRadiusSpinBox->setSuffix(tr(" px"));
-
-    auto* controlLayout = new QHBoxLayout();
-    controlLayout->setContentsMargins({});
-    controlLayout->addWidget(m_sharpeningRadiusSlider);
-    controlLayout->addWidget(m_sharpeningRadiusSpinBox);
-    layout->addRow(tr("Radius"), controlLayout);
-
-    connect(m_sharpeningRadiusSlider, &QSlider::valueChanged, this, [this](int value) {
-        m_params.sharpeningRadius = static_cast<float>(value);
-        QSignalBlocker blocker(m_sharpeningRadiusSpinBox);
-        m_sharpeningRadiusSpinBox->setValue(value);
-        emit paramsChanged(m_params);
-    });
-    connect(m_sharpeningRadiusSpinBox, &QSpinBox::valueChanged, this, [this](int value) {
-        beginAdjustment();
-        m_sharpeningRadiusSlider->setValue(value);
-    });
-    connect(m_sharpeningRadiusSlider, &QSlider::sliderPressed, this, &DevelopPanel::beginAdjustment);
-    connect(m_sharpeningRadiusSlider, &QSlider::sliderReleased, this, &DevelopPanel::finishAdjustment);
-    connect(m_sharpeningRadiusSpinBox, &QSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
+    AdjustmentParameterConfiguration configuration;
+    configuration.label = tr("Radius");
+    configuration.sliderObjectName = QStringLiteral("sharpeningRadiusSlider");
+    configuration.suffix = tr(" px");
+    configuration.minimum = 1.0;
+    configuration.maximum = 3.0;
+    configuration.sliderScale = 1.0;
+    configuration.displayScale = 1.0;
+    configuration.singleStep = 1.0;
+    configuration.maximumRate = 1.0;
+    configuration.displayDecimals = 0;
+    configuration.showPlusSign = false;
+    addParameterControl(layout, configuration, &core::types::DevelopParams::sharpeningRadius);
 }
 
 // 목적: sharpening masking control을 생성하고 DevelopParams::sharpeningMasking에 연결
@@ -391,32 +408,19 @@ void DevelopPanel::addSharpeningRadiusControl(QFormLayout* layout)
 // 출력: 없음
 void DevelopPanel::addSharpeningMaskingControl(QFormLayout* layout)
 {
-    m_sharpeningMaskingSlider = new QSlider(Qt::Horizontal, this);
-    m_sharpeningMaskingSlider->setObjectName(QStringLiteral("sharpeningMaskingSlider"));
-    m_sharpeningMaskingSlider->setRange(0, 100);
-    m_sharpeningMaskingSpinBox = new QSpinBox(this);
-    m_sharpeningMaskingSpinBox->setRange(0, 100);
-    m_sharpeningMaskingSpinBox->setSuffix(tr("%"));
-
-    auto* controlLayout = new QHBoxLayout();
-    controlLayout->setContentsMargins({});
-    controlLayout->addWidget(m_sharpeningMaskingSlider);
-    controlLayout->addWidget(m_sharpeningMaskingSpinBox);
-    layout->addRow(tr("Masking"), controlLayout);
-
-    connect(m_sharpeningMaskingSlider, &QSlider::valueChanged, this, [this](int value) {
-        m_params.sharpeningMasking = static_cast<float>(value) / 100.0F;
-        QSignalBlocker blocker(m_sharpeningMaskingSpinBox);
-        m_sharpeningMaskingSpinBox->setValue(value);
-        emit paramsChanged(m_params);
-    });
-    connect(m_sharpeningMaskingSpinBox, &QSpinBox::valueChanged, this, [this](int value) {
-        beginAdjustment();
-        m_sharpeningMaskingSlider->setValue(value);
-    });
-    connect(m_sharpeningMaskingSlider, &QSlider::sliderPressed, this, &DevelopPanel::beginAdjustment);
-    connect(m_sharpeningMaskingSlider, &QSlider::sliderReleased, this, &DevelopPanel::finishAdjustment);
-    connect(m_sharpeningMaskingSpinBox, &QSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
+    AdjustmentParameterConfiguration configuration;
+    configuration.label = tr("Masking");
+    configuration.sliderObjectName = QStringLiteral("sharpeningMaskingSlider");
+    configuration.suffix = tr("%");
+    configuration.minimum = 0.0;
+    configuration.maximum = 1.0;
+    configuration.sliderScale = 100.0;
+    configuration.displayScale = 100.0;
+    configuration.singleStep = 0.01;
+    configuration.maximumRate = 0.1;
+    configuration.displayDecimals = 0;
+    configuration.showPlusSign = false;
+    addParameterControl(layout, configuration, &core::types::DevelopParams::sharpeningMasking);
 }
 
 // 목적: 지정된 정수 범위의 표준 develop control을 생성하고 parameter에 연결
@@ -428,33 +432,19 @@ void DevelopPanel::addNormalizedControl(QFormLayout* layout,
                                         float core::types::DevelopParams::* parameter,
                                         int minimumValue)
 {
-    auto* slider = new QSlider(Qt::Horizontal, this);
-    slider->setObjectName(objectName);
-    slider->setRange(minimumValue, 100);
-    auto* spinBox = new QSpinBox(this);
-    spinBox->setRange(minimumValue, 100);
-    spinBox->setSuffix(tr("%"));
-
-    auto* controlLayout = new QHBoxLayout();
-    controlLayout->setContentsMargins({});
-    controlLayout->addWidget(slider);
-    controlLayout->addWidget(spinBox);
-    layout->addRow(label, controlLayout);
-    m_normalizedControls.push_back({slider, spinBox, parameter});
-
-    connect(slider, &QSlider::valueChanged, this, [this, spinBox, parameter](int value) {
-        m_params.*parameter = static_cast<float>(value) / 100.0F;
-        QSignalBlocker blocker(spinBox);
-        spinBox->setValue(value);
-        emit paramsChanged(m_params);
-    });
-    connect(spinBox, &QSpinBox::valueChanged, this, [this, slider](int value) {
-        beginAdjustment();
-        slider->setValue(value);
-    });
-    connect(slider, &QSlider::sliderPressed, this, &DevelopPanel::beginAdjustment);
-    connect(slider, &QSlider::sliderReleased, this, &DevelopPanel::finishAdjustment);
-    connect(spinBox, &QSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
+    AdjustmentParameterConfiguration configuration;
+    configuration.label = label;
+    configuration.sliderObjectName = objectName;
+    configuration.suffix = tr("%");
+    configuration.minimum = static_cast<double>(minimumValue) / 100.0;
+    configuration.maximum = 1.0;
+    configuration.sliderScale = 100.0;
+    configuration.displayScale = 100.0;
+    configuration.singleStep = 0.01;
+    configuration.maximumRate = 0.1;
+    configuration.displayDecimals = 0;
+    configuration.showPlusSign = minimumValue < 0;
+    addParameterControl(layout, configuration, parameter);
 }
 
 // 목적: 현재 DevelopParams 값을 모든 control에 signal 없이 반영
@@ -462,27 +452,9 @@ void DevelopPanel::addNormalizedControl(QFormLayout* layout,
 // 출력: 없음
 void DevelopPanel::updateControls()
 {
-    m_exposureControl->setValue(m_params.exposureEv);
-
-    const QSignalBlocker sharpeningRadiusSliderBlocker(m_sharpeningRadiusSlider);
-    const QSignalBlocker sharpeningRadiusSpinBoxBlocker(m_sharpeningRadiusSpinBox);
-    const int sharpeningRadius = static_cast<int>(std::lround(m_params.sharpeningRadius));
-    m_sharpeningRadiusSlider->setValue(sharpeningRadius);
-    m_sharpeningRadiusSpinBox->setValue(sharpeningRadius);
-
-    const QSignalBlocker sharpeningMaskingSliderBlocker(m_sharpeningMaskingSlider);
-    const QSignalBlocker sharpeningMaskingSpinBoxBlocker(m_sharpeningMaskingSpinBox);
-    const int sharpeningMasking = static_cast<int>(std::lround(m_params.sharpeningMasking * 100.0F));
-    m_sharpeningMaskingSlider->setValue(sharpeningMasking);
-    m_sharpeningMaskingSpinBox->setValue(sharpeningMasking);
-
-    for (const NormalizedControl& control : m_normalizedControls)
+    for (const ParameterControlBinding& binding : m_parameterControls)
     {
-        const QSignalBlocker sliderBlocker(control.slider);
-        const QSignalBlocker spinBoxBlocker(control.spinBox);
-        const int value = static_cast<int>(std::lround(m_params.*(control.parameter) * 100.0F));
-        control.slider->setValue(value);
-        control.spinBox->setValue(value);
+        binding.control->setValue(m_params.*(binding.parameter));
     }
 
     updateWhiteBalanceControls();
@@ -496,16 +468,10 @@ void DevelopPanel::updateWhiteBalanceControls()
     const bool isCustom = m_params.whiteBalanceMode == core::types::WhiteBalanceMode::Custom;
     const QSignalBlocker modeBlocker(m_whiteBalanceModeCombo);
     const QSignalBlocker temperatureBlocker(m_whiteBalanceTemperatureSpinBox);
-    const QSignalBlocker tintSliderBlocker(m_whiteBalanceTintSlider);
-    const QSignalBlocker tintSpinBoxBlocker(m_whiteBalanceTintSpinBox);
     m_whiteBalanceModeCombo->setCurrentIndex(isCustom ? 1 : 0);
     m_whiteBalanceTemperatureSpinBox->setValue(static_cast<int>(std::lround(m_params.whiteBalanceTemperatureKelvin)));
-    const int tint = static_cast<int>(std::lround(m_params.whiteBalanceTint * 100.0F));
-    m_whiteBalanceTintSlider->setValue(tint);
-    m_whiteBalanceTintSpinBox->setValue(tint);
     m_whiteBalanceTemperatureSpinBox->setEnabled(isCustom);
-    m_whiteBalanceTintSlider->setEnabled(isCustom);
-    m_whiteBalanceTintSpinBox->setEnabled(isCustom);
+    m_whiteBalanceTintControl->setEnabled(isCustom);
 }
 
 // 목적: history를 위한 조작 transaction을 아직 시작하지 않았으면 시작

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
@@ -13,9 +14,9 @@
 #include <QPalette>
 #include <QSignalBlocker>
 #include <QSlider>
-#include <QStackedLayout>
 #include <QStyle>
 #include <QStyleOptionSlider>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace flexraw::ui::editor
@@ -24,12 +25,12 @@ namespace
 {
 
 constexpr int KnobWidth = 72;
-constexpr int KnobHeight = 24;
+constexpr int KnobHeight = 22;
 constexpr int HorizontalMargin = 8;
-constexpr double MaximumGestureDeltaEv = 0.5;
-constexpr double ExposureMinimum = -5.0;
-constexpr double ExposureMaximum = 5.0;
-constexpr int ExposureScale = 100;
+constexpr int TrackCenterOverhang = 19;
+constexpr int RateTimerIntervalMs = 16;
+constexpr double NeutralDeadZoneRatio = 0.04;
+constexpr double LinearRateWeight = 0.25;
 
 class DirectTrackSlider final : public QSlider
 {
@@ -120,7 +121,7 @@ public:
     using QDoubleSpinBox::QDoubleSpinBox;
 
 protected:
-    // 목적: 양수 Exposure 값에 explicit plus sign을 붙인 numeric text 생성
+    // 목적: 양수 adjustment 값에 explicit plus sign을 붙인 numeric text 생성
     // 입력: value: 표시할 spin box 값
     // 출력: locale formatting을 유지한 signed 숫자 text
     [[nodiscard]] QString textFromValue(double value) const override
@@ -130,9 +131,22 @@ protected:
     }
 };
 
+// 목적: 기존 slider object name에서 공통 parameter control base name 추출
+// 입력: sliderObjectName: Slider suffix를 가진 test/automation 이름
+// 출력: suffix가 제거된 object name base
+[[nodiscard]] QString parameterObjectBase(QString sliderObjectName)
+{
+    const QString suffix = QStringLiteral("Slider");
+    if (sliderObjectName.endsWith(suffix))
+    {
+        sliderObjectName.chop(suffix.size());
+    }
+    return sliderObjectName;
+}
+
 }  // namespace
 
-// 목적: neutral-position relative adjustment controller 초기화
+// 목적: neutral-position relative rate controller 초기화
 // 입력: parent: Qt 부모 widget
 // 출력: 초기화된 RelativeAdjustmentControl 객체
 RelativeAdjustmentControl::RelativeAdjustmentControl(QWidget* parent) : QWidget(parent)
@@ -142,6 +156,10 @@ RelativeAdjustmentControl::RelativeAdjustmentControl(QWidget* parent) : QWidget(
     setFocusPolicy(Qt::StrongFocus);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     setAccessibleName(tr("Relative adjustment controller"));
+    m_rateTimer = new QTimer(this);
+    m_rateTimer->setInterval(RateTimerIntervalMs);
+    m_rateTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_rateTimer, &QTimer::timeout, this, &RelativeAdjustmentControl::applyRateTick);
 }
 
 // 목적: relative gesture가 변경할 실제 parameter 범위 설정
@@ -156,6 +174,7 @@ void RelativeAdjustmentControl::setRange(double minimum, double maximum)
     m_minimum = minimum;
     m_maximum = maximum;
     m_value = std::clamp(m_value, m_minimum, m_maximum);
+    m_continuousValue = std::clamp(m_continuousValue, m_minimum, m_maximum);
     update();
 }
 
@@ -170,12 +189,35 @@ void RelativeAdjustmentControl::setSingleStep(double step)
     }
 }
 
+// 목적: rate 적분 결과를 parameter가 표현할 수 있는 최소 단위로 양자화
+// 입력: resolution: 양수인 절대 parameter 해상도
+// 출력: 이후 rate tick의 publish 해상도 갱신
+void RelativeAdjustmentControl::setResolution(double resolution)
+{
+    if (resolution > 0.0)
+    {
+        m_resolution = resolution;
+    }
+}
+
+// 목적: knob가 최대 거리에 있을 때의 절대 parameter 변화 속도 설정
+// 입력: maximumRate: 초당 양수 변화량
+// 출력: 이후 drag의 최대 rate 갱신
+void RelativeAdjustmentControl::setMaximumRate(double maximumRate)
+{
+    if (maximumRate > 0.0)
+    {
+        m_maximumRate = maximumRate;
+    }
+}
+
 // 목적: 외부 parameter state를 gesture 없이 controller에 동기화
 // 입력: value: 표시 대상 절대 parameter 값
 // 출력: valueChanged signal 없이 내부 값 갱신
 void RelativeAdjustmentControl::setValue(double value)
 {
     m_value = std::clamp(value, m_minimum, m_maximum);
+    m_continuousValue = m_value;
     update();
 }
 
@@ -192,7 +234,7 @@ double RelativeAdjustmentControl::value() const noexcept
 // 출력: full track과 knob를 표시할 size hint
 QSize RelativeAdjustmentControl::sizeHint() const
 {
-    return {240, 36};
+    return {240, 30};
 }
 
 // 목적: Relative Wide controller 최소 크기 반환
@@ -200,10 +242,10 @@ QSize RelativeAdjustmentControl::sizeHint() const
 // 출력: Compact 전환 없이 유지할 최소 size hint
 QSize RelativeAdjustmentControl::minimumSizeHint() const
 {
-    return {180, 32};
+    return {140, 28};
 }
 
-// 목적: track, neutral notch, transient displacement와 knob painting
+// 목적: track, neutral notch, transient rate displacement와 knob painting
 // 입력: event: Qt paint event
 // 출력: 현재 gesture state가 widget surface에 표시됨
 void RelativeAdjustmentControl::paintEvent(QPaintEvent*)
@@ -213,13 +255,23 @@ void RelativeAdjustmentControl::paintEvent(QPaintEvent*)
     const QPalette colors = palette();
     const int centerX = rect().center().x();
     const int centerY = rect().center().y();
-    const int trackLeft = HorizontalMargin;
-    const int trackRight = width() - HorizontalMargin;
+    const int trackLeft = HorizontalMargin + (KnobWidth / 2) - TrackCenterOverhang;
+    const int trackRight = width() - HorizontalMargin - (KnobWidth / 2) + TrackCenterOverhang;
+    const QRect knob = neutralKnobRect().translated(m_gestureDisplacement, 0);
 
     QPen trackPen(colors.color(QPalette::Mid), 2.0);
     trackPen.setCapStyle(Qt::RoundCap);
     painter.setPen(trackPen);
-    painter.drawLine(trackLeft, centerY, trackRight, centerY);
+    const int leftTrackEnd = knob.left() - 2;
+    const int rightTrackStart = knob.right() + 2;
+    if (leftTrackEnd > trackLeft)
+    {
+        painter.drawLine(trackLeft, centerY, leftTrackEnd, centerY);
+    }
+    if (rightTrackStart < trackRight)
+    {
+        painter.drawLine(rightTrackStart, centerY, trackRight, centerY);
+    }
 
     painter.setPen(QPen(colors.color(QPalette::Text), 1.0));
     painter.drawLine(centerX, centerY - 8, centerX, centerY + 8);
@@ -232,9 +284,10 @@ void RelativeAdjustmentControl::paintEvent(QPaintEvent*)
         painter.drawLine(centerX, centerY, centerX + m_gestureDisplacement, centerY);
     }
 
-    QRect knob = neutralKnobRect().translated(m_gestureDisplacement, 0);
     painter.setPen(QPen(colors.color(QPalette::Mid), 1.0));
-    painter.setBrush(colors.color(QPalette::Button));
+    QColor knobColor = colors.color(QPalette::Button);
+    knobColor.setAlpha(255);
+    painter.setBrush(knobColor);
     painter.drawRoundedRect(knob, 5.0, 5.0);
     painter.setPen(colors.color(QPalette::ButtonText));
     painter.drawLine(knob.center().x(), knob.top() + 4, knob.center().x(), knob.bottom() - 4);
@@ -268,15 +321,16 @@ void RelativeAdjustmentControl::mousePressEvent(QMouseEvent* event)
     m_dragging = false;
     m_pressPosition = event->position().toPoint();
     m_pressValue = m_value;
+    m_continuousValue = m_value;
     m_gestureDisplacement = 0;
     setCursor(Qt::ClosedHandCursor);
     emit adjustmentStarted();
     event->accept();
 }
 
-// 목적: drag threshold를 넘은 pointer 변위를 relative parameter delta로 변환
+// 목적: drag threshold를 넘은 pointer 변위를 지속 rate로 변환
 // 입력: event: 현재 local pointer 위치와 button 상태
-// 출력: drag 중 valueChanged signal 발생 가능
+// 출력: knob displacement와 이후 timer tick rate 갱신
 void RelativeAdjustmentControl::mouseMoveEvent(QMouseEvent* event)
 {
     if (!m_pressed || !event->buttons().testFlag(Qt::LeftButton))
@@ -289,17 +343,20 @@ void RelativeAdjustmentControl::mouseMoveEvent(QMouseEvent* event)
     if (!m_dragging && displacement.manhattanLength() >= QApplication::startDragDistance())
     {
         m_dragging = true;
+        m_continuousValue = m_value;
+        m_rateClock.start();
+        m_rateTimer->start();
     }
     if (m_dragging)
     {
+        applyRateTick();
         m_gestureDisplacement = std::clamp(displacement.x(), -maximumDisplacement(), maximumDisplacement());
-        publishValue(valueForDisplacement(m_gestureDisplacement));
         update();
     }
     event->accept();
 }
 
-// 목적: short click 적용 또는 drag 값을 유지하고 knob를 neutral로 복귀
+// 목적: short click 적용 또는 rate 적분을 정지하고 knob를 neutral로 복귀
 // 입력: event: release 위치와 button 정보
 // 출력: click이면 한 step 변경, 이후 adjustmentFinished signal 발생
 void RelativeAdjustmentControl::mouseReleaseEvent(QMouseEvent* event)
@@ -310,7 +367,11 @@ void RelativeAdjustmentControl::mouseReleaseEvent(QMouseEvent* event)
         return;
     }
 
-    if (!m_dragging)
+    if (m_dragging)
+    {
+        applyRateTick();
+    }
+    else
     {
         const int neutralCenter = neutralKnobRect().center().x();
         if (m_pressPosition.x() < neutralCenter)
@@ -323,6 +384,7 @@ void RelativeAdjustmentControl::mouseReleaseEvent(QMouseEvent* event)
         }
     }
 
+    m_rateTimer->stop();
     m_pressed = false;
     m_dragging = false;
     m_gestureDisplacement = 0;
@@ -348,17 +410,47 @@ int RelativeAdjustmentControl::maximumDisplacement() const
     return std::max(1, ((width() - KnobWidth) / 2) - HorizontalMargin);
 }
 
-// 목적: drag pixel 변위를 non-linear relative delta가 적용된 절대 값으로 변환
+// 목적: drag 거리를 neutral dead zone과 혼합 2차 곡선으로 초당 rate에 매핑
 // 입력: displacement: neutral notch 기준 signed pixel 변위
-// 출력: press baseline에서 계산하고 range와 0.01 단위로 제한한 값
-double RelativeAdjustmentControl::valueForDisplacement(int displacement) const
+// 출력: 최대 rate 범위의 signed parameter units/second
+double RelativeAdjustmentControl::rateForDisplacement(int displacement) const
 {
     const double normalized =
         std::clamp(static_cast<double>(std::abs(displacement)) / static_cast<double>(maximumDisplacement()), 0.0, 1.0);
-    const double curved = (0.2 * normalized) + (0.8 * std::pow(normalized, 1.6));
-    const double signedDelta = std::copysign(MaximumGestureDeltaEv * curved, static_cast<double>(displacement));
-    const double bounded = std::clamp(m_pressValue + signedDelta, m_minimum, m_maximum);
-    return std::round(bounded * 100.0) / 100.0;
+    if (normalized <= NeutralDeadZoneRatio)
+    {
+        return 0.0;
+    }
+    const double activeDistance = (normalized - NeutralDeadZoneRatio) / (1.0 - NeutralDeadZoneRatio);
+    const double curved =
+        (LinearRateWeight * activeDistance) + ((1.0 - LinearRateWeight) * activeDistance * activeDistance);
+    return std::copysign(m_maximumRate * curved, static_cast<double>(displacement));
+}
+
+// 목적: 직전 tick 이후 경과 시간만큼 현재 displacement rate를 값에 적분
+// 입력: 없음
+// 출력: 값이 바뀌면 valueChanged signal 발생
+void RelativeAdjustmentControl::applyRateTick()
+{
+    if (!m_dragging || !m_rateClock.isValid())
+    {
+        return;
+    }
+    constexpr double NanosecondsPerSecond = 1'000'000'000.0;
+    const double elapsedSeconds = static_cast<double>(m_rateClock.nsecsElapsed()) / NanosecondsPerSecond;
+    m_rateClock.restart();
+    m_continuousValue = std::clamp(
+        m_continuousValue + (rateForDisplacement(m_gestureDisplacement) * elapsedSeconds), m_minimum, m_maximum);
+    publishValue(quantizedValue(m_continuousValue));
+}
+
+// 목적: parameter resolution에 맞춘 range 내부 값 생성
+// 입력: value: 양자화할 절대 parameter 후보
+// 출력: resolution과 range로 제한된 값
+double RelativeAdjustmentControl::quantizedValue(double value) const
+{
+    const double quantized = std::round(value / m_resolution) * m_resolution;
+    return std::clamp(quantized, m_minimum, m_maximum);
 }
 
 // 목적: user gesture 값을 저장하고 실제 변경 시 signal publish
@@ -375,82 +467,98 @@ void RelativeAdjustmentControl::publishValue(double value)
     emit valueChanged(m_value);
 }
 
-// 목적: label/value header와 교체 가능한 Classic/Relative Exposure control 초기화
-// 입력: parent: Qt 부모 widget
-// 출력: Classic style이 선택된 ExposureAdjustmentControl 객체
-ExposureAdjustmentControl::ExposureAdjustmentControl(QWidget* parent) : QWidget(parent)
+// 목적: label/value header와 교체 가능한 Classic/Relative parameter control 초기화
+// 입력: configuration: 이름, 범위, 표시 단위와 rate, parent: Qt 부모 widget
+// 출력: Classic style이 선택된 AdjustmentParameterControl 객체
+AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameterConfiguration& configuration,
+                                                       QWidget* parent)
+    : QWidget(parent),
+      m_minimum(std::min(configuration.minimum, configuration.maximum)),
+      m_maximum(std::max(configuration.minimum, configuration.maximum)),
+      m_sliderScale(configuration.sliderScale > 0.0 ? configuration.sliderScale : 1.0),
+      m_displayScale(configuration.displayScale > 0.0 ? configuration.displayScale : 1.0)
 {
-    setObjectName(QStringLiteral("exposureAdjustmentControl"));
+    const QString objectBase = parameterObjectBase(configuration.sliderObjectName);
+    setObjectName(objectBase + QStringLiteral("AdjustmentControl"));
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins({});
-    layout->setSpacing(3);
+    layout->setSpacing(1);
 
     auto* headerLayout = new QHBoxLayout();
     headerLayout->setContentsMargins({});
-    auto* label = new QLabel(tr("Exposure"), this);
-    m_valueSpinBox = new SignedDoubleSpinBox(this);
+    auto* label = new QLabel(configuration.label, this);
+    m_valueSpinBox = configuration.showPlusSign ? static_cast<QDoubleSpinBox*>(new SignedDoubleSpinBox(this))
+                                                : new QDoubleSpinBox(this);
     label->setBuddy(m_valueSpinBox);
-    m_valueSpinBox->setObjectName(QStringLiteral("exposureValueSpinBox"));
-    m_valueSpinBox->setRange(ExposureMinimum, ExposureMaximum);
-    m_valueSpinBox->setDecimals(2);
-    m_valueSpinBox->setSingleStep(0.1);
-    m_valueSpinBox->setSuffix(tr(" EV"));
+    m_valueSpinBox->setObjectName(objectBase + QStringLiteral("ValueSpinBox"));
+    m_valueSpinBox->setRange(m_minimum * m_displayScale, m_maximum * m_displayScale);
+    m_valueSpinBox->setDecimals(configuration.displayDecimals);
+    m_valueSpinBox->setSingleStep(configuration.singleStep * m_displayScale);
+    m_valueSpinBox->setSuffix(configuration.suffix);
     m_valueSpinBox->setAlignment(Qt::AlignRight);
-    m_valueSpinBox->setMinimumWidth(88);
+    m_valueSpinBox->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    m_valueSpinBox->setFixedWidth(64);
     headerLayout->addWidget(label);
     headerLayout->addStretch();
     headerLayout->addWidget(m_valueSpinBox);
     layout->addLayout(headerLayout);
 
-    auto* classicPage = new QWidget(this);
-    auto* classicLayout = new QHBoxLayout(classicPage);
+    m_classicPage = new QWidget(this);
+    auto* classicLayout = new QHBoxLayout(m_classicPage);
     classicLayout->setContentsMargins({});
-    m_classicSlider = new DirectTrackSlider(Qt::Horizontal, classicPage);
-    m_classicSlider->setObjectName(QStringLiteral("exposureSlider"));
-    m_classicSlider->setRange(static_cast<int>(ExposureMinimum * ExposureScale),
-                              static_cast<int>(ExposureMaximum * ExposureScale));
+    m_classicSlider = new DirectTrackSlider(Qt::Horizontal, m_classicPage);
+    m_classicSlider->setObjectName(configuration.sliderObjectName);
+    m_classicSlider->setRange(static_cast<int>(std::lround(m_minimum * m_sliderScale)),
+                              static_cast<int>(std::lround(m_maximum * m_sliderScale)));
     m_classicSlider->setSingleStep(1);
-    m_classicSlider->setPageStep(10);
+    m_classicSlider->setPageStep(std::max(1, static_cast<int>(std::lround(configuration.singleStep * m_sliderScale))));
     classicLayout->addWidget(m_classicSlider);
 
-    auto* relativePage = new QWidget(this);
-    auto* relativeLayout = new QHBoxLayout(relativePage);
+    m_relativePage = new QWidget(this);
+    auto* relativeLayout = new QHBoxLayout(m_relativePage);
     relativeLayout->setContentsMargins({});
-    m_relativeControl = new RelativeAdjustmentControl(relativePage);
-    m_relativeControl->setObjectName(QStringLiteral("exposureRelativeControl"));
-    m_relativeControl->setRange(ExposureMinimum, ExposureMaximum);
-    m_relativeControl->setSingleStep(0.1);
+    m_relativeControl = new RelativeAdjustmentControl(m_relativePage);
+    m_relativeControl->setObjectName(objectBase + QStringLiteral("RelativeControl"));
+    m_relativeControl->setRange(m_minimum, m_maximum);
+    m_relativeControl->setSingleStep(configuration.singleStep);
+    m_relativeControl->setResolution(1.0 / m_sliderScale);
+    m_relativeControl->setMaximumRate(configuration.maximumRate);
     relativeLayout->addWidget(m_relativeControl);
 
-    m_controlStack = new QStackedLayout();
-    m_controlStack->setContentsMargins({});
-    m_controlStack->addWidget(classicPage);
-    m_controlStack->addWidget(relativePage);
-    layout->addLayout(m_controlStack);
+    auto* controlLayout = new QVBoxLayout();
+    controlLayout->setContentsMargins({});
+    controlLayout->setSpacing(0);
+    controlLayout->addWidget(m_classicPage);
+    controlLayout->addWidget(m_relativePage);
+    m_relativePage->hide();
+    layout->addLayout(controlLayout);
 
-    connect(m_classicSlider, &QSlider::sliderPressed, this, &ExposureAdjustmentControl::adjustmentStarted);
+    m_value = std::clamp(0.0, m_minimum, m_maximum);
+    setValue(m_value);
+    connect(m_classicSlider, &QSlider::sliderPressed, this, &AdjustmentParameterControl::adjustmentStarted);
     connect(m_classicSlider, &QSlider::valueChanged, this, [this](int value) {
-        applyUserValue(static_cast<double>(value) / ExposureScale, m_classicSlider);
+        applyUserValue(static_cast<double>(value) / m_sliderScale, m_classicSlider);
     });
-    connect(m_classicSlider, &QSlider::sliderReleased, this, &ExposureAdjustmentControl::adjustmentFinished);
+    connect(m_classicSlider, &QSlider::sliderReleased, this, &AdjustmentParameterControl::adjustmentFinished);
     connect(m_relativeControl,
             &RelativeAdjustmentControl::adjustmentStarted,
             this,
-            &ExposureAdjustmentControl::adjustmentStarted);
+            &AdjustmentParameterControl::adjustmentStarted);
     connect(m_relativeControl, &RelativeAdjustmentControl::valueChanged, this, [this](double value) {
         applyUserValue(value, m_relativeControl);
     });
     connect(m_relativeControl,
             &RelativeAdjustmentControl::adjustmentFinished,
             this,
-            &ExposureAdjustmentControl::adjustmentFinished);
+            &AdjustmentParameterControl::adjustmentFinished);
     connect(m_valueSpinBox, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         if (!m_spinAdjustmentInProgress)
         {
             m_spinAdjustmentInProgress = true;
             emit adjustmentStarted();
         }
-        applyUserValue(value, m_valueSpinBox);
+        applyUserValue(value / m_displayScale, m_valueSpinBox);
     });
     connect(m_valueSpinBox, &QDoubleSpinBox::editingFinished, this, [this] {
         if (m_spinAdjustmentInProgress)
@@ -461,24 +569,24 @@ ExposureAdjustmentControl::ExposureAdjustmentControl(QWidget* parent) : QWidget(
     });
 }
 
-// 목적: 실제 Exposure 값을 모든 presentation에 signal 없이 동기화
-// 입력: value: -5~+5 EV 절대 값
+// 목적: 실제 parameter 값을 모든 presentation에 signal 없이 동기화
+// 입력: value: configuration 범위의 절대 값
 // 출력: Classic, Relative와 numeric value가 같은 값으로 갱신
-void ExposureAdjustmentControl::setValue(double value)
+void AdjustmentParameterControl::setValue(double value)
 {
-    m_value = std::clamp(value, ExposureMinimum, ExposureMaximum);
+    m_value = std::clamp(value, m_minimum, m_maximum);
     const QSignalBlocker sliderBlocker(m_classicSlider);
     const QSignalBlocker spinBoxBlocker(m_valueSpinBox);
     const QSignalBlocker relativeBlocker(m_relativeControl);
-    m_classicSlider->setValue(static_cast<int>(std::lround(m_value * ExposureScale)));
-    m_valueSpinBox->setValue(m_value);
+    m_classicSlider->setValue(static_cast<int>(std::lround(m_value * m_sliderScale)));
+    m_valueSpinBox->setValue(m_value * m_displayScale);
     m_relativeControl->setValue(m_value);
 }
 
-// 목적: 현재 Exposure 절대 값 반환
+// 목적: 현재 parameter 절대 값 반환
 // 입력: 없음
-// 출력: -5~+5 EV 범위 값
-double ExposureAdjustmentControl::value() const noexcept
+// 출력: configuration 범위의 값
+double AdjustmentParameterControl::value() const noexcept
 {
     return m_value;
 }
@@ -486,35 +594,39 @@ double ExposureAdjustmentControl::value() const noexcept
 // 목적: parameter 의미를 유지하며 control presentation 교체
 // 입력: style: Classic 또는 Relative
 // 출력: 선택 presentation만 표시되고 값과 history signal은 변경되지 않음
-void ExposureAdjustmentControl::setControlStyle(AdjustmentControlStyle style)
+void AdjustmentParameterControl::setControlStyle(AdjustmentControlStyle style)
 {
     m_controlStyle = style;
-    m_controlStack->setCurrentIndex(style == AdjustmentControlStyle::Classic ? 0 : 1);
+    const bool classicVisible = style == AdjustmentControlStyle::Classic;
+    m_classicPage->setVisible(classicVisible);
+    m_relativePage->setVisible(!classicVisible);
+    layout()->invalidate();
+    updateGeometry();
 }
 
 // 목적: 현재 선택된 control presentation 반환
 // 입력: 없음
 // 출력: Classic 또는 Relative style
-AdjustmentControlStyle ExposureAdjustmentControl::controlStyle() const noexcept
+AdjustmentControlStyle AdjustmentParameterControl::controlStyle() const noexcept
 {
     return m_controlStyle;
 }
 
 // 목적: user control에서 받은 값을 모든 peer presentation에 반영하고 publish
-// 입력: value: 새 Exposure 후보, source: 변경을 시작한 QObject
+// 입력: value: 새 parameter 후보, source: 변경을 시작한 QObject
 // 출력: 실제 값이 변경되면 valueChanged signal 발생
-void ExposureAdjustmentControl::applyUserValue(double value, const QObject* source)
+void AdjustmentParameterControl::applyUserValue(double value, const QObject* source)
 {
-    const double bounded = std::clamp(value, ExposureMinimum, ExposureMaximum);
+    const double bounded = std::clamp(value, m_minimum, m_maximum);
     if (source != m_classicSlider)
     {
         const QSignalBlocker blocker(m_classicSlider);
-        m_classicSlider->setValue(static_cast<int>(std::lround(bounded * ExposureScale)));
+        m_classicSlider->setValue(static_cast<int>(std::lround(bounded * m_sliderScale)));
     }
     if (source != m_valueSpinBox)
     {
         const QSignalBlocker blocker(m_valueSpinBox);
-        m_valueSpinBox->setValue(bounded);
+        m_valueSpinBox->setValue(bounded * m_displayScale);
     }
     if (source != m_relativeControl)
     {
