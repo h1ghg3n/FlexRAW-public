@@ -6,7 +6,14 @@ target_sources(flexraw_core_orchestration PRIVATE
     catalog_contracts.h
     catalog_orchestrator.cpp
     catalog_orchestrator.h
+    catalog_thumbnail_contracts.h
+    catalog_thumbnail_orchestrator.cpp
+    catalog_thumbnail_orchestrator.h
+    catalog_thumbnail_pipeline.cpp
+    catalog_thumbnail_pipeline.h
     editor_contracts.h
+    editor_client_projection.cpp
+    editor_client_projection.h
     editor_orchestrator.cpp
     editor_orchestrator.h
     export_contracts.h
@@ -30,6 +37,7 @@ target_include_directories(flexraw_core_orchestration PUBLIC
 
 target_link_libraries(flexraw_core_orchestration
     PUBLIC
+        flexraw_core_client
         flexraw_core_types
         flexraw_core_develop
         flexraw_core_export

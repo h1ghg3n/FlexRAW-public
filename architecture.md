@@ -51,7 +51,8 @@ Preview와 Export use case를 소유한다. Worker는 Catalog나 UI를 알지 �
 3. Domain module은 SQL, RAW decode, Develop, encode 같은 실제 작업을 담당한다.
 4. `ApplicationContext`와 `WorkerApplicationContext`만 production object graph를 조립한다.
 5. Worker는 Desktop의 Catalog, Preview, UI와 `ApplicationContext`에 의존하지 않는다.
-6. 현재 Core/Orchestration에는 Qt type이 남아 있다. Qt-free Engine이나 client boundary는 아직 추출되지 않았다.
+6. `flexraw_core_client`의 public command/state/event와 `DisplayFrame` contract는 Qt-free다. Core/Orchestration
+   implementation과 Processing Engine에는 Qt dependency가 남아 있다.
 
 ## 2. Dependency 방향
 
@@ -66,13 +67,13 @@ Desktop executable
         │                  │
         ▼                  ▼
        ui              worker/client
-        │                  │
-        └────────┬─────────┘
-                 ▼
-          core/orchestration
-                 │
-                 ▼
-       Core domain/processing leaves
+      ┌─┴───────┐          │
+      ▼         ▼          │
+ core/client  core/orchestration
+      ▲         │          │
+      └─────────┴────┬─────┘
+                     ▼
+          Core domain/processing leaves
                  │
                  ▼
               util
@@ -108,6 +109,9 @@ ApplicationContext
 ├─ PreviewOrchestrator
 │  └─ FilePreviewPipeline
 │
+├─ CatalogThumbnailOrchestrator
+│  └─ FileCatalogThumbnailPipeline
+│
 ├─ ISystemMemoryProbe
 │  └─ current Windows/Linux Platform Adapter
 │
@@ -121,6 +125,7 @@ ApplicationContext
 │     ├─ CatalogDatabase
 │     ├─ CatalogPhotoRepository
 │     ├─ CatalogDevelopRepository
+│     ├─ CatalogProjectRepository
 │     └─ CatalogFolderImporter
 │
 ├─ EditorOrchestrator
@@ -196,13 +201,22 @@ Source path가 없어지거나 같은 path의 content가 바뀌어도 Photo iden
 Processing 가능 여부와 사용자 resolution 필요 여부는 state machine의 domain policy가 판단한다. GUI는 기존 source
 수용, 새 Photo 등록, relink command를 노출하지만 state correctness를 소유하지 않는다.
 
-Catalog photo 목록은 stable cursor를 사용하는 bounded page로 조회한다. Catalog open이 모든 Photo와 thumbnail을 RAM에
-적재한다는 의미는 아니다.
+Catalog photo 목록은 stable cursor를 사용하는 Catalog/Folder/Project 범위의 bounded page로 조회한다. Project와 Photo는
+M:N 관계이며 Project 삭제는 Photo나 Develop state를 삭제하지 않는다.
+
+GUI는 visible row 앞뒤 한 viewport만 thumbnail window로 요청한다. Application-scoped
+`CatalogThumbnailOrchestrator`는 concurrency 1의 전용 queue에서 decode하고 새 window가 이전 pending work를 대체하며
+stale result를 폐기한다. 범위 밖 `QPixmap`은 해제하므로 Catalog open이 모든 Photo와 thumbnail을 RAM에 적재한다는
+의미는 아니다.
 
 ## 5. Editor와 Preview
 
 Editor는 현재 선택, Develop state, undo/redo, persisted baseline과 preview scheduling policy를 소유한다. Preview
 Orchestrator는 실제 background request lifecycle을 소유한다.
+
+`IEditorClient`는 Photo selection, Develop update, Adjustment begin/end, undo/redo와 save를 Qt-free immutable
+snapshot으로 제공한다. `IEditorStateEventSource`는 initial snapshot과 이후 state를 adapter-owned queue에 직렬화하며
+unsubscribe 또는 adapter destruction 뒤에는 queued callback도 전달하지 않는다.
 
 ```text
 User input
@@ -245,6 +259,11 @@ Preview correctness에는 서로 다른 두 방어가 있다.
 
 현재 result 여부는 request, photo/source identity, Develop revision과 preview sequence 같은 값으로 확인한다. 사용자가
 연속 조작하는 동안에는 latest-wins latency를 우선하고, 조작이 끝나면 final preview를 다시 요청한다.
+
+Preview presentation은 owned BGRA8/sRGB `DisplayFrame`으로 Qt-free client boundary를 통과한 뒤 Qt adapter에서
+`QImage` view로 복원된다. `QtActivityAdapter`는 Preview, folder scan과 source verification owner lifecycle을 active
+snapshot과 exact terminal event로 투영한다. MainWindow는 이를 indeterminate status/progress UI로 표시하며 Preview와
+source verification cancel만 실제 owner에 전달한다.
 
 ## 6. Shared Processing Path
 
@@ -461,6 +480,7 @@ untrusted Internet service용 security boundary가 아니다.
 |---|---|
 | Desktop GUI event loop | widget state, Facade event, Orchestrator command 호출 |
 | Preview dedicated `QThread` | synchronous Preview Pipeline |
+| Catalog thumbnail serial pool | visible/adjacent thumbnail decode와 stale window 폐기 |
 | Catalog fingerprint pool | SHA-256 baseline/verification과 source transition |
 | Export preparation pool | request를 immutable item으로 해석 |
 | Export Local pool | Local item processing |
@@ -480,6 +500,7 @@ flexraw.exe
 └─ flexraw_app
    ├─ flexraw_ui_mainwindow
    ├─ flexraw_ui_facade
+   ├─ flexraw_core_client
    ├─ flexraw_core_orchestration
    ├─ flexraw_core_preview
    ├─ flexraw_worker_export_adapter
@@ -516,9 +537,10 @@ test가 fixture 부재를 success로 가장하지는 않는다.
 
 이 snapshot에서 다음은 의도적으로 완료된 architecture로 주장하지 않는다.
 
-- Core와 frontend contract의 완전한 Qt-free 전환
+- Core implementation과 Processing Engine의 완전한 Qt-free 전환
 - 독립 installable Engine package 또는 별도 Engine repository
-- Project M:N persistence와 완성된 Library navigation
+- Project hierarchy, Smart Project와 cross-catalog Project
+- MCP/foreign-language client adapter와 Qt-free Catalog/Editor runtime
 - RAW upload, artifact download와 cross-storage synchronization
 - LAN discovery, multi-worker scheduling, durable retry/resume
 - Remote protocol authentication, authorization과 TLS
@@ -535,9 +557,13 @@ locator, global Orchestrator singleton 또는 범용 backend registry를 미리 
 |---|---|
 | Desktop Composition Root | `src/app/application_context.*` |
 | Managed Catalog startup | `src/app/managed_catalog_session.*` |
+| Qt-free client contract | `src/core/client/` |
 | Catalog/Editor GUI boundary | `src/ui/facade/catalog_editor_facade.*` |
 | Catalog use case | `src/core/orchestration/catalog_orchestrator.*` |
+| Project persistence | `src/core/catalog/catalog_project_repository.*` |
+| Catalog thumbnail lifecycle | `src/core/orchestration/catalog_thumbnail_orchestrator.*` |
 | Editor/Preview use case | `src/core/orchestration/editor_orchestrator.*`, `preview_orchestrator.*` |
+| Activity GUI adapter | `src/ui/mainwindow/qt_activity_adapter.*` |
 | Export placement | `src/core/orchestration/export_orchestrator.*` |
 | Synchronous render seam | `src/core/render/resolved_render_pipeline.*` |
 | Remote Desktop adapter | `src/worker/client/` |

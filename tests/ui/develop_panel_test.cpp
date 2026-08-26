@@ -28,11 +28,36 @@ TEST(DevelopPanelTest, EmitsParamsChangedForSliderInput)
 
     QSlider* exposureSlider = panel.findChild<QSlider*>(QStringLiteral("exposureSlider"));
     ASSERT_NE(exposureSlider, nullptr);
-    exposureSlider->setValue(15);
+    exposureSlider->setValue(150);
 
     EXPECT_EQ(signalCount, 1);
     EXPECT_FLOAT_EQ(emittedParams.exposureEv, 1.5F);
     EXPECT_FLOAT_EQ(panel.params().exposureEv, 1.5F);
+}
+
+TEST(DevelopPanelTest, StyleSwitchPreservesParamsWithoutCreatingHistoryEvent)
+{
+    DevelopPanel panel;
+    core::types::DevelopParams params;
+    params.exposureEv = 0.35F;
+    panel.setParams(params);
+    int paramsChangedCount = 0;
+    int adjustmentStartedCount = 0;
+    int adjustmentFinishedCount = 0;
+    QObject::connect(&panel, &DevelopPanel::paramsChanged, [&paramsChangedCount](const core::types::DevelopParams&) {
+        ++paramsChangedCount;
+    });
+    QObject::connect(&panel, &DevelopPanel::adjustmentStarted, [&adjustmentStartedCount] { ++adjustmentStartedCount; });
+    QObject::connect(
+        &panel, &DevelopPanel::adjustmentFinished, [&adjustmentFinishedCount] { ++adjustmentFinishedCount; });
+
+    panel.setAdjustmentControlStyle(AdjustmentControlStyle::Relative);
+
+    EXPECT_EQ(AdjustmentControlStyle::Relative, panel.adjustmentControlStyle());
+    EXPECT_FLOAT_EQ(0.35F, panel.params().exposureEv);
+    EXPECT_EQ(0, paramsChangedCount);
+    EXPECT_EQ(0, adjustmentStartedCount);
+    EXPECT_EQ(0, adjustmentFinishedCount);
 }
 
 TEST(DevelopPanelTest, AppliesDehazeFromSlider)

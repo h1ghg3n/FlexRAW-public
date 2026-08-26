@@ -1,6 +1,8 @@
+#include <QApplication>
 #include <QItemSelection>
 #include <QItemSelectionModel>
 #include <QListWidgetItem>
+#include <QScrollBar>
 
 #include <gtest/gtest.h>
 
@@ -189,6 +191,50 @@ TEST(CatalogListWidgetTest, AppliesSourceUpdateAndSelectsCreatedIdentityWithoutS
     EXPECT_EQ(1, widget.currentRow());
     EXPECT_EQ(QStringLiteral("replacement.jpg"), widget.item(1)->text());
     EXPECT_EQ(1, catalogSelectionCount);
+}
+
+TEST(CatalogListWidgetTest, MaterializesOnlyVisibleAndAdjacentThumbnailRows)
+{
+    CatalogListWidget widget;
+    widget.resize(280, 240);
+    widget.show();
+    QVector<QVector<core::types::FileDescriptor>> requestedWindows;
+    QObject::connect(&widget,
+                     &CatalogListWidget::thumbnailWindowChanged,
+                     &widget,
+                     [&requestedWindows](const QVector<core::types::FileDescriptor>& sources, const QSize&) {
+                         if (!sources.isEmpty())
+                         {
+                             requestedWindows.push_back(sources);
+                         }
+                     });
+    QVector<core::catalog::CatalogPhotoRecord> photos;
+    for (int index = 0; index < 20; ++index)
+    {
+        photos.push_back(makePhoto(index + 1, QStringLiteral("photo-%1.jpg").arg(index)));
+    }
+
+    widget.setPhotos(photos);
+    QApplication::processEvents();
+    QApplication::processEvents();
+
+    ASSERT_FALSE(requestedWindows.isEmpty());
+    const QVector<core::types::FileDescriptor> firstWindow = requestedWindows.back();
+    EXPECT_GT(firstWindow.size(), 0);
+    EXPECT_LT(firstWindow.size(), photos.size());
+    QImage thumbnail(2, 1, QImage::Format_RGB32);
+    thumbnail.fill(Qt::blue);
+    widget.applyThumbnail(firstWindow.front().path, thumbnail);
+    EXPECT_FALSE(widget.item(0)->icon().isNull());
+
+    widget.verticalScrollBar()->setValue(widget.verticalScrollBar()->maximum());
+    QApplication::processEvents();
+    QApplication::processEvents();
+
+    EXPECT_TRUE(widget.item(0)->icon().isNull());
+    ASSERT_GE(requestedWindows.size(), 2);
+    EXPECT_LT(requestedWindows.back().size(), photos.size());
+    EXPECT_NE(firstWindow.front().path, requestedWindows.back().front().path);
 }
 
 }  // namespace

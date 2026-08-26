@@ -1,18 +1,27 @@
 #include "mainwindow.h"
 
+#include <cstddef>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include <QAction>
 #include <QCloseEvent>
+#include <QComboBox>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QKeySequence>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProgressBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -23,19 +32,75 @@
 
 #include "catalog_editor_facade.h"
 #include "catalog_list_widget.h"
+#include "catalog_photo_page_qt_adapter.h"
 #include "console_mode_widget.h"
 #include "develop_panel.h"
+#include "display_frame_qt_adapter.h"
+#include "editor_client_projection.h"
+#include "editor_settings.h"
 #include "export_dialog.h"
 #include "folder_scan_controller.h"
 #include "log.h"
 #include "photo_identity.h"
 #include "preview_widget.h"
+#include "qt_activity_adapter.h"
+#include "settings_dialog.h"
 #include "shared_storage_locator.h"
 #include "source_binding.h"
 #include "source_resolution_widget.h"
 
 namespace flexraw::ui::mainwindow
 {
+namespace
+{
+
+// 목적: UTF-8 client string을 Qt presentation 문자열로 변환
+// 입력: value: byte length가 명시된 UTF-8 string
+// 출력: 같은 Unicode text를 보유한 QString
+[[nodiscard]] QString fromClientString(const std::string& value)
+{
+    return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+// 목적: optional Qt Folder scope를 Qt-free UTF-8 client scope로 변환
+// 입력: folderPath: exact Folder path 또는 전체 Catalog를 뜻하는 빈 값
+// 출력: byte length가 보존된 optional UTF-8 path
+[[nodiscard]] std::optional<std::string> toClientFolderPath(const std::optional<QString>& folderPath)
+{
+    if (!folderPath.has_value())
+    {
+        return std::nullopt;
+    }
+    return folderPath->toUtf8().toStdString();
+}
+
+// 목적: optional internal Project identity를 fixed-width client identity로 변환
+// 입력: projectId: Project scope 또는 Catalog/Folder scope를 뜻하는 빈 값
+// 출력: optional client Project identity
+[[nodiscard]] std::optional<core::client::ClientProjectId> toClientProjectId(
+    const std::optional<core::catalog::ProjectId>& projectId)
+{
+    if (!projectId.has_value())
+    {
+        return std::nullopt;
+    }
+    return core::client::ClientProjectId{projectId->value};
+}
+
+// 목적: 현재 MainWindow scope를 Qt-free bounded page request로 조립
+// 입력: folderPath: optional exact Folder, projectId: optional Project identity
+// 출력: 두 scope가 배타적인 첫 page request
+[[nodiscard]] core::client::CatalogPhotoPageRequest makePhotoPageRequest(
+    const std::optional<QString>& folderPath, const std::optional<core::catalog::ProjectId>& projectId)
+{
+    core::client::CatalogPhotoPageRequest request;
+    request.exactFolderPath = projectId.has_value() ? std::nullopt : toClientFolderPath(folderPath);
+    request.projectId = toClientProjectId(projectId);
+    return request;
+}
+
+}  // namespace
+
 // 목적: Flexraw 첫 catalog-to-preview window를 editor session adapter로 초기화
 // 입력: catalogEditorFacade: GUI boundary, catalogOrchestrator: console catalog use case,
 //       exportOrchestrator: Local/Remote/Auto export use case, parent: Qt 부모 widget
@@ -52,11 +117,15 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
       m_consoleWidget(new cli::ConsoleModeWidget(catalogOrchestrator, exportOrchestrator, this)),
       m_folderScanController(new FolderScanController(this)),
       m_catalogEditorFacade(&catalogEditorFacade),
+      m_activityAdapter(new QtActivityAdapter(catalogEditorFacade, *m_folderScanController, this)),
       m_exportOrchestrator(&exportOrchestrator),
       m_contentStack(new QStackedWidget(this))
 {
     setWindowTitle(tr("Flexraw"));
     resize(1200, 800);
+    QSettings applicationSettings;
+    m_developPanel->setAdjustmentControlStyle(
+        settings::EditorSettings(applicationSettings).loadAdjustmentControlStyle());
 
     QMenu* fileMenu = menuBar()->addMenu(tr("&File"));
     m_newCatalogAction = fileMenu->addAction(tr("New Catalog..."));
@@ -87,12 +156,52 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     m_redoDevelopAction = editMenu->addAction(tr("Redo"));
     m_redoDevelopAction->setShortcut(QKeySequence::Redo);
     connect(m_redoDevelopAction, &QAction::triggered, this, &MainWindow::redoDevelopAdjustment);
+    editMenu->addSeparator();
+    m_settingsAction = editMenu->addAction(tr("Settings..."));
+    m_settingsAction->setObjectName(QStringLiteral("settingsAction"));
+    connect(m_settingsAction, &QAction::triggered, this, &MainWindow::openSettings);
 
     auto* splitter = new QSplitter(this);
     auto* catalogSurface = new QWidget(splitter);
     auto* catalogLayout = new QVBoxLayout(catalogSurface);
     catalogLayout->setContentsMargins(0, 0, 0, 0);
     catalogLayout->setSpacing(0);
+    m_catalogFolderScopeComboBox = new QComboBox(catalogSurface);
+    m_catalogFolderScopeComboBox->setObjectName(QStringLiteral("catalogFolderScopeComboBox"));
+    m_catalogFolderScopeComboBox->setPlaceholderText(tr("No catalog"));
+    m_catalogFolderScopeComboBox->setToolTip(tr("Catalog photo scope"));
+    m_catalogFolderScopeComboBox->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_catalogFolderScopeComboBox->setMinimumContentsLength(20);
+    m_catalogFolderScopeComboBox->setEnabled(false);
+    catalogLayout->addWidget(m_catalogFolderScopeComboBox);
+    auto* projectNavigation = new QWidget(catalogSurface);
+    auto* projectNavigationLayout = new QHBoxLayout(projectNavigation);
+    projectNavigationLayout->setContentsMargins(0, 0, 0, 0);
+    m_catalogProjectScopeComboBox = new QComboBox(projectNavigation);
+    m_catalogProjectScopeComboBox->setObjectName(QStringLiteral("catalogProjectScopeComboBox"));
+    m_catalogProjectScopeComboBox->setPlaceholderText(tr("No catalog"));
+    m_catalogProjectScopeComboBox->setEnabled(false);
+    projectNavigationLayout->addWidget(m_catalogProjectScopeComboBox, 1);
+    m_catalogProjectMenuButton = new QToolButton(projectNavigation);
+    m_catalogProjectMenuButton->setObjectName(QStringLiteral("catalogProjectMenuButton"));
+    m_catalogProjectMenuButton->setText(tr("Project"));
+    m_catalogProjectMenuButton->setPopupMode(QToolButton::InstantPopup);
+    auto* projectMenu = new QMenu(m_catalogProjectMenuButton);
+    m_createProjectAction = projectMenu->addAction(tr("New Project..."));
+    m_createProjectAction->setObjectName(QStringLiteral("createProjectAction"));
+    m_renameProjectAction = projectMenu->addAction(tr("Rename Project..."));
+    m_renameProjectAction->setObjectName(QStringLiteral("renameProjectAction"));
+    m_removeProjectAction = projectMenu->addAction(tr("Delete Project"));
+    m_removeProjectAction->setObjectName(QStringLiteral("removeProjectAction"));
+    projectMenu->addSeparator();
+    m_addSelectedPhotosToProjectAction = projectMenu->addAction(tr("Add Selected Photos to Project..."));
+    m_addSelectedPhotosToProjectAction->setObjectName(QStringLiteral("addSelectedPhotosToProjectAction"));
+    m_removeSelectedPhotosFromProjectAction = projectMenu->addAction(tr("Remove Selected Photos from Project"));
+    m_removeSelectedPhotosFromProjectAction->setObjectName(QStringLiteral("removeSelectedPhotosFromProjectAction"));
+    m_catalogProjectMenuButton->setMenu(projectMenu);
+    m_catalogProjectMenuButton->setEnabled(false);
+    projectNavigationLayout->addWidget(m_catalogProjectMenuButton);
+    catalogLayout->addWidget(projectNavigation);
     catalogLayout->addWidget(m_catalogWidget, 1);
     auto* catalogNavigationLayout = new QHBoxLayout();
     catalogNavigationLayout->setContentsMargins(4, 2, 4, 2);
@@ -128,21 +237,78 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     m_contentStack->addWidget(splitter);
     m_contentStack->addWidget(m_consoleWidget);
     setCentralWidget(m_contentStack);
+    initializeActivityStatus();
+    subscribeToActivityEvents();
 
     connect(m_catalogWidget, &catalog::CatalogListWidget::entrySelected, this, &MainWindow::showSelectedEntry);
     connect(m_catalogWidget, &catalog::CatalogListWidget::photoSelected, this, &MainWindow::showSelectedCatalogPhoto);
     connect(m_previousCatalogPageButton, &QToolButton::clicked, this, &MainWindow::showPreviousCatalogPage);
     connect(m_nextCatalogPageButton, &QToolButton::clicked, this, &MainWindow::showNextCatalogPage);
+    connect(m_catalogFolderScopeComboBox, &QComboBox::currentIndexChanged, this, [this](int index) {
+        changeCatalogFolderScope(index);
+    });
+    connect(m_catalogProjectScopeComboBox, &QComboBox::currentIndexChanged, this, [this](int index) {
+        changeCatalogProjectScope(index);
+    });
+    connect(m_createProjectAction, &QAction::triggered, this, &MainWindow::createProject);
+    connect(m_renameProjectAction, &QAction::triggered, this, &MainWindow::renameCurrentProject);
+    connect(m_removeProjectAction, &QAction::triggered, this, &MainWindow::removeCurrentProject);
+    connect(m_addSelectedPhotosToProjectAction, &QAction::triggered, this, &MainWindow::addSelectedPhotosToProject);
+    connect(m_removeSelectedPhotosFromProjectAction,
+            &QAction::triggered,
+            this,
+            &MainWindow::removeSelectedPhotosFromProject);
+    connect(m_catalogWidget, &QListWidget::itemSelectionChanged, this, &MainWindow::updateProjectActions);
+    connect(m_catalogWidget,
+            &catalog::CatalogListWidget::thumbnailWindowChanged,
+            this,
+            [this](QVector<core::types::FileDescriptor> sources, const QSize& targetSize) {
+                const core::orchestration::CatalogThumbnailWindowResult result =
+                    m_catalogEditorFacade->updateThumbnailWindow(std::move(sources), targetSize);
+                if (result.hasError())
+                {
+                    LOG_WARN("catalog", "Unable to update thumbnail window: {}", result.error().message.toStdString());
+                }
+            });
+    connect(m_catalogEditorFacade,
+            &facade::CatalogEditorFacade::catalogThumbnailReady,
+            this,
+            [this](const core::orchestration::CatalogThumbnailFrame& frame) {
+                m_catalogWidget->applyThumbnail(frame.sourcePath, frame.image);
+            });
+    connect(m_catalogEditorFacade,
+            &facade::CatalogEditorFacade::catalogThumbnailFailed,
+            this,
+            [this](const core::orchestration::CatalogThumbnailIssue& issue) {
+                m_catalogWidget->markThumbnailFailed(issue.sourcePath);
+                LOG_DEBUG("catalog",
+                          "Catalog thumbnail unavailable for {}: {}",
+                          issue.sourcePath.toStdString(),
+                          issue.error.message.toStdString());
+            });
     connect(m_developPanel, &editor::DevelopPanel::paramsChanged, this, &MainWindow::applyDevelopParams);
     connect(m_developPanel, &editor::DevelopPanel::adjustmentStarted, this, &MainWindow::beginDevelopAdjustment);
     connect(m_developPanel, &editor::DevelopPanel::adjustmentFinished, this, &MainWindow::finishDevelopAdjustment);
     connect(m_previewWidget, &editor::PreviewWidget::viewportSizeChanged, this, [this](const QSize& size) {
         (void)m_catalogEditorFacade->updatePreviewTargetSize(size);
     });
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::editorStateChanged,
-            this,
-            &MainWindow::updateEditorStateUi);
+    const core::client::EditorStateSubscriptionResult editorStateSubscription =
+        m_catalogEditorFacade->subscribeToEditorState([this](const core::client::EditorStateEvent& event) {
+            updateEditorStateUi(core::orchestration::fromClientEditorSnapshot(event.snapshot));
+        });
+    if (editorStateSubscription.hasValue())
+    {
+        m_editorStateSubscription = editorStateSubscription.value();
+    }
+    else
+    {
+        LOG_ERROR(
+            "app", "Unable to subscribe to Editor state events: {}", editorStateSubscription.error().technicalMessage);
+        connect(m_catalogEditorFacade,
+                &facade::CatalogEditorFacade::editorStateChanged,
+                this,
+                &MainWindow::updateEditorStateUi);
+    }
     connect(m_sourceResolutionWidget,
             &catalog::SourceResolutionWidget::acceptReplacementRequested,
             this,
@@ -168,11 +334,19 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
             this,
             &MainWindow::handleSourceBindingCancelled);
     connect(m_catalogEditorFacade,
+            &facade::CatalogEditorFacade::displayFrameUpdated,
+            this,
+            [this](const core::client::DisplayFrame& frame) {
+                const QImage image = facade::toQImage(frame);
+                if (!image.isNull())
+                {
+                    m_previewWidget->showPreview(image);
+                }
+            });
+    connect(m_catalogEditorFacade,
             &facade::CatalogEditorFacade::previewUpdated,
             this,
             [this](const core::orchestration::PreviewResult& result) {
-                m_previewWidget->showPreview(result.image);
-
                 if (result.renderMode == core::orchestration::PreviewRenderMode::Final)
                 {
                     m_developPanel->setHistogram(result.histogram);
@@ -210,6 +384,9 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
         m_importFolderAction->setEnabled(false);
         m_previousCatalogPageButton->setEnabled(false);
         m_nextCatalogPageButton->setEnabled(false);
+        m_catalogFolderScopeComboBox->setEnabled(false);
+        m_catalogProjectScopeComboBox->setEnabled(false);
+        m_catalogProjectMenuButton->setEnabled(false);
 
         if (m_importingFolder)
         {
@@ -222,6 +399,17 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
         m_previewWidget->clearClippingSummary();
         m_catalogEditorFacade->clearSelection();
         resetCatalogPhotoPage();
+        m_catalogFolderPath.reset();
+        m_catalogProjectId.reset();
+        {
+            const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+            m_catalogFolderScopeComboBox->setCurrentIndex(-1);
+            m_catalogFolderScopeComboBox->setPlaceholderText(tr("Open Folder"));
+        }
+        {
+            const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+            m_catalogProjectScopeComboBox->setCurrentIndex(0);
+        }
         m_previewWidget->showMessage(tr("Scanning folder..."));
         statusBar()->showMessage(tr("Scanning folder..."));
     });
@@ -235,6 +423,7 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
                 m_openCatalogAction->setEnabled(true);
                 m_openFolderAction->setEnabled(true);
                 m_importFolderAction->setEnabled(m_catalogEditorFacade->catalogState().isOpen);
+                updateProjectActions();
 
                 if (scanResult.hasError())
                 {
@@ -301,6 +490,110 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     {
         m_previewWidget->showMessage(tr("Open a catalog or folder to view photos."));
         statusBar()->showMessage(tr("Ready."));
+    }
+}
+
+// 목적: status bar의 compact Activity label, indeterminate progress와 cancel control 구성
+// 입력: 없음
+// 출력: 초기에는 숨겨진 Activity presentation widget 생성
+void MainWindow::initializeActivityStatus()
+{
+    m_activityLabel = new QLabel(statusBar());
+    m_activityLabel->setObjectName(QStringLiteral("activityStatusLabel"));
+    m_activityProgressBar = new QProgressBar(statusBar());
+    m_activityProgressBar->setObjectName(QStringLiteral("activityProgressBar"));
+    m_activityProgressBar->setRange(0, 0);
+    m_activityProgressBar->setTextVisible(false);
+    m_activityProgressBar->setMaximumWidth(80);
+    m_cancelActivityButton = new QToolButton(statusBar());
+    m_cancelActivityButton->setObjectName(QStringLiteral("cancelActivityButton"));
+    m_cancelActivityButton->setIcon(style()->standardIcon(QStyle::SP_DialogCancelButton));
+    m_cancelActivityButton->setAutoRaise(true);
+    connect(m_cancelActivityButton, &QToolButton::clicked, this, &MainWindow::cancelDisplayedActivity);
+    statusBar()->addPermanentWidget(m_activityLabel);
+    statusBar()->addPermanentWidget(m_activityProgressBar);
+    statusBar()->addPermanentWidget(m_cancelActivityButton);
+    m_activityLabel->hide();
+    m_activityProgressBar->hide();
+    m_cancelActivityButton->hide();
+}
+
+// 목적: Qt-free Activity client를 실제 MainWindow presentation consumer에 연결
+// 입력: 없음
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void MainWindow::subscribeToActivityEvents()
+{
+    const core::client::ActivitySubscriptionResult subscription = m_activityAdapter->subscribeToActivities(
+        [this](const core::client::ActivityEvent& event) { updateActivityUi(event); });
+    if (subscription.hasValue())
+    {
+        m_activitySubscription = subscription.value();
+        return;
+    }
+    LOG_ERROR("app", "Unable to subscribe to Activity events: {}", subscription.error().technicalMessage);
+}
+
+// 목적: immutable active 목록을 status bar progress와 owner cancel target에 투영
+// 입력: event: initial 또는 lifecycle transition 뒤 Activity snapshot
+// 출력: active 여부와 cancellability에 맞는 compact status UI
+void MainWindow::updateActivityUi(const core::client::ActivityEvent& event)
+{
+    if (event.activeActivities.empty())
+    {
+        m_cancelActivityId.reset();
+        m_activityLabel->hide();
+        m_activityProgressBar->hide();
+        m_cancelActivityButton->hide();
+        return;
+    }
+
+    const core::client::ActiveActivity& displayed = event.activeActivities.back();
+    QString activityName;
+    switch (displayed.id.kind)
+    {
+    case core::client::ActivityKind::Preview:
+        activityName = tr("Rendering preview...");
+        break;
+    case core::client::ActivityKind::FolderScan:
+        activityName = tr("Scanning folder...");
+        break;
+    case core::client::ActivityKind::SourceVerification:
+        activityName = tr("Verifying source...");
+        break;
+    }
+    m_activityLabel->setText(event.activeActivities.size() == 1
+                                 ? activityName
+                                 : tr("%1 background activities...").arg(event.activeActivities.size()));
+    m_activityLabel->show();
+    m_activityProgressBar->show();
+
+    m_cancelActivityId.reset();
+    for (auto activity = event.activeActivities.crbegin(); activity != event.activeActivities.crend(); ++activity)
+    {
+        if (activity->canCancel)
+        {
+            m_cancelActivityId = activity->id;
+            break;
+        }
+    }
+    m_cancelActivityButton->setToolTip(tr("Cancel background activity"));
+    m_cancelActivityButton->setVisible(m_cancelActivityId.has_value());
+}
+
+// 목적: status bar에 선택된 cancellable Activity를 실제 owner에서 취소
+// 입력: 없음
+// 출력: cancellation command 전달 또는 non-modal 실패 안내
+void MainWindow::cancelDisplayedActivity()
+{
+    if (!m_cancelActivityId.has_value())
+    {
+        return;
+    }
+    const core::client::ActivityCancelResult cancelled = m_activityAdapter->cancelActivity(*m_cancelActivityId);
+    if (cancelled.hasError())
+    {
+        LOG_WARN("app", "Unable to cancel Activity: {}", cancelled.error().technicalMessage);
+        statusBar()->showMessage(tr("Background activity could not be cancelled."));
     }
 }
 
@@ -385,6 +678,21 @@ bool MainWindow::openCatalogPath(const QString& catalogPath)
 
     m_catalogEditorFacade->clearSelection();
     resetCatalogPhotoPage();
+    m_catalogFolderPath.reset();
+    m_catalogProjectId.reset();
+    {
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->clear();
+        m_catalogFolderScopeComboBox->setPlaceholderText(tr("No catalog"));
+    }
+    m_catalogFolderScopeComboBox->setEnabled(false);
+    {
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->clear();
+        m_catalogProjectScopeComboBox->setPlaceholderText(tr("No catalog"));
+    }
+    m_catalogProjectScopeComboBox->setEnabled(false);
+    m_catalogProjectMenuButton->setEnabled(false);
     m_catalogWidget->clearEntries();
     m_importFolderAction->setEnabled(false);
     if (session.isOpen)
@@ -409,13 +717,25 @@ bool MainWindow::openCatalogPath(const QString& catalogPath)
 // 출력: photo 목록을 정상 조회해 표시했으면 true
 bool MainWindow::refreshCatalogPhotos()
 {
-    const core::orchestration::CatalogPhotoPageResult photos =
-        m_catalogEditorFacade->queryPhotos(core::catalog::CatalogPhotoPageRequest{});
-    if (photos.hasError())
+    if (!refreshCatalogFolders() || !refreshCatalogProjects(m_catalogProjectId))
     {
-        LOG_WARN("catalog", "Unable to list GUI catalog photos: {}", photos.error().message.toStdString());
         resetCatalogPhotoPage();
         (void)m_catalogEditorFacade->closeCatalog();
+        m_previewWidget->showMessage(tr("Unable to load catalog navigation."));
+        statusBar()->showMessage(tr("Catalog navigation failed."));
+        return false;
+    }
+
+    const core::client::CatalogPhotoPageRequest request = makePhotoPageRequest(m_catalogFolderPath, m_catalogProjectId);
+    const core::client::CatalogPhotoPageResult photos = m_catalogEditorFacade->queryPhotoPage(request);
+    if (photos.hasError())
+    {
+        LOG_WARN("catalog", "Unable to list GUI catalog photos: {}", photos.error().technicalMessage);
+        resetCatalogPhotoPage();
+        (void)m_catalogEditorFacade->closeCatalog();
+        m_catalogFolderScopeComboBox->setEnabled(false);
+        m_catalogProjectScopeComboBox->setEnabled(false);
+        m_catalogProjectMenuButton->setEnabled(false);
         m_previewWidget->showMessage(tr("Unable to load catalog photos."));
         statusBar()->showMessage(tr("Catalog photo list failed."));
         return false;
@@ -423,9 +743,10 @@ bool MainWindow::refreshCatalogPhotos()
 
     m_importFolderAction->setEnabled(true);
     m_catalogPhotoPage = photos.value();
-    m_catalogWidget->setPhotos(photos.value().photos);
+    m_catalogWidget->setPhotos(facade::toCatalogPhotoRecords(photos.value().photos));
     updateCatalogPageActions();
-    if (photos.value().photos.isEmpty())
+    updateProjectActions();
+    if (photos.value().photos.empty())
     {
         m_previewWidget->showMessage(tr("No photos are registered in this catalog."));
     }
@@ -433,22 +754,404 @@ bool MainWindow::refreshCatalogPhotos()
     return true;
 }
 
+// 목적: active Catalog의 distinct Folder scope를 navigation control에 반영
+// 입력: 없음
+// 출력: Folder summary 조회와 control 갱신에 성공하면 true
+bool MainWindow::refreshCatalogFolders()
+{
+    const core::orchestration::CatalogFolderListResult folders = m_catalogEditorFacade->queryFolders();
+    if (folders.hasError())
+    {
+        LOG_WARN("catalog", "Unable to list GUI catalog folders: {}", folders.error().message.toStdString());
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->clear();
+        m_catalogFolderScopeComboBox->setPlaceholderText(tr("No catalog"));
+        m_catalogFolderScopeComboBox->setEnabled(false);
+        return false;
+    }
+
+    const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+    m_catalogFolderScopeComboBox->clear();
+    m_catalogFolderScopeComboBox->addItem(tr("All Photos"), QString{});
+    int selectedIndex = m_catalogFolderPath.has_value() ? -1 : 0;
+    for (const core::catalog::CatalogFolderSummary& folder : folders.value())
+    {
+        const QString displayPath = QDir::toNativeSeparators(folder.path);
+        const int index = m_catalogFolderScopeComboBox->count();
+        m_catalogFolderScopeComboBox->addItem(tr("%1 (%2)").arg(displayPath).arg(folder.photoCount), folder.path);
+        m_catalogFolderScopeComboBox->setItemData(index, displayPath, Qt::ToolTipRole);
+        if (m_catalogFolderPath.has_value() && folder.path == *m_catalogFolderPath)
+        {
+            selectedIndex = index;
+        }
+    }
+
+    if (selectedIndex < 0)
+    {
+        m_catalogFolderPath.reset();
+        selectedIndex = 0;
+    }
+    m_catalogFolderScopeComboBox->setCurrentIndex(selectedIndex);
+    m_catalogFolderScopeComboBox->setEnabled(!m_catalogProjectId.has_value());
+    return true;
+}
+
+// 목적: active Catalog Project 목록을 navigation control에 반영
+// 입력: preferredProjectId: refresh 뒤 유지할 optional Project identity
+// 출력: Project 조회와 control 갱신에 성공하면 true
+bool MainWindow::refreshCatalogProjects(std::optional<core::catalog::ProjectId> preferredProjectId)
+{
+    const core::client::CatalogProjectListResult projects = m_catalogEditorFacade->listProjects();
+    if (projects.hasError())
+    {
+        LOG_WARN("catalog", "Unable to list GUI catalog projects: {}", projects.error().technicalMessage);
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->clear();
+        m_catalogProjectScopeComboBox->setPlaceholderText(tr("No catalog"));
+        m_catalogProjectScopeComboBox->setEnabled(false);
+        m_catalogProjectMenuButton->setEnabled(false);
+        return false;
+    }
+
+    const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+    m_catalogProjectScopeComboBox->clear();
+    m_catalogProjectScopeComboBox->addItem(tr("Catalog / Folders"), qint64{0});
+    int selectedIndex = preferredProjectId.has_value() ? -1 : 0;
+    for (const core::client::CatalogProjectSnapshot& project : projects.value())
+    {
+        const QString projectName = fromClientString(project.name);
+        const int index = m_catalogProjectScopeComboBox->count();
+        m_catalogProjectScopeComboBox->addItem(projectName, project.id.value);
+        m_catalogProjectScopeComboBox->setItemData(
+            index, tr("%1 (Project #%2)").arg(projectName).arg(project.id.value), Qt::ToolTipRole);
+        if (preferredProjectId.has_value() && project.id.value == preferredProjectId->value)
+        {
+            selectedIndex = index;
+        }
+    }
+
+    if (selectedIndex < 0)
+    {
+        m_catalogProjectId.reset();
+        selectedIndex = 0;
+    }
+    m_catalogProjectScopeComboBox->setCurrentIndex(selectedIndex);
+    updateProjectActions();
+    return true;
+}
+
+// 목적: 사용자가 선택한 전체 Catalog 또는 exact Folder scope로 photo page 전환
+// 입력: index: Folder scope combo box의 선택 index
+// 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
+void MainWindow::changeCatalogFolderScope(int index)
+{
+    if (index < 0 || !m_catalogEditorFacade->catalogState().isOpen)
+    {
+        return;
+    }
+
+    const QString folderPath = m_catalogFolderScopeComboBox->itemData(index).toString();
+    const std::optional<QString> requestedScope =
+        folderPath.isEmpty() ? std::nullopt : std::optional<QString>{folderPath};
+    if (requestedScope == m_catalogFolderPath && !m_catalogProjectId.has_value())
+    {
+        return;
+    }
+
+    const std::optional<QString> previousScope = m_catalogFolderPath;
+    const std::optional<core::catalog::ProjectId> previousProjectId = m_catalogProjectId;
+    if (!persistCurrentPhoto())
+    {
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->setCurrentIndex(
+            previousScope.has_value() ? m_catalogFolderScopeComboBox->findData(*previousScope) : 0);
+        return;
+    }
+
+    core::client::CatalogPhotoPageRequest request;
+    request.exactFolderPath = toClientFolderPath(requestedScope);
+    m_catalogFolderPath = requestedScope;
+    m_catalogProjectId.reset();
+    {
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->setCurrentIndex(0);
+    }
+    if (!loadCatalogPhotoPage(request))
+    {
+        m_catalogFolderPath = previousScope;
+        m_catalogProjectId = previousProjectId;
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->setCurrentIndex(
+            previousScope.has_value() ? m_catalogFolderScopeComboBox->findData(*previousScope) : 0);
+    }
+    updateProjectActions();
+}
+
+// 목적: 사용자가 선택한 Catalog/Folder 또는 Project scope로 photo page 전환
+// 입력: index: Project scope combo box의 선택 index
+// 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
+void MainWindow::changeCatalogProjectScope(int index)
+{
+    if (index < 0 || !m_catalogEditorFacade->catalogState().isOpen)
+    {
+        return;
+    }
+
+    const qint64 value = m_catalogProjectScopeComboBox->itemData(index).toLongLong();
+    const std::optional<core::catalog::ProjectId> requestedProjectId =
+        value > 0 ? std::optional<core::catalog::ProjectId>{{value}} : std::nullopt;
+    if (requestedProjectId == m_catalogProjectId)
+    {
+        return;
+    }
+
+    const std::optional<core::catalog::ProjectId> previousProjectId = m_catalogProjectId;
+    const std::optional<QString> previousFolderPath = m_catalogFolderPath;
+    if (!persistCurrentPhoto())
+    {
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->setCurrentIndex(
+            previousProjectId.has_value() ? m_catalogProjectScopeComboBox->findData(previousProjectId->value) : 0);
+        return;
+    }
+
+    core::client::CatalogPhotoPageRequest request;
+    request.projectId = toClientProjectId(requestedProjectId);
+    m_catalogProjectId = requestedProjectId;
+    m_catalogFolderPath.reset();
+    {
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->setCurrentIndex(0);
+    }
+    if (!loadCatalogPhotoPage(request))
+    {
+        m_catalogProjectId = previousProjectId;
+        m_catalogFolderPath = previousFolderPath;
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->setCurrentIndex(
+            previousProjectId.has_value() ? m_catalogProjectScopeComboBox->findData(previousProjectId->value) : 0);
+    }
+    updateProjectActions();
+}
+
+// 목적: 이름 입력을 받아 active Catalog에 Project 생성
+// 입력: 없음
+// 출력: 생성 성공 시 새 Project scope로 이동
+void MainWindow::createProject()
+{
+    bool accepted = false;
+    const QString name =
+        QInputDialog::getText(this, tr("New Project"), tr("Project name:"), QLineEdit::Normal, {}, &accepted);
+    if (!accepted)
+    {
+        return;
+    }
+
+    const core::client::CatalogProjectResult created =
+        m_catalogEditorFacade->createProject({name.toUtf8().toStdString()});
+    if (created.hasError())
+    {
+        LOG_WARN("catalog", "Unable to create GUI project: {}", created.error().technicalMessage);
+        statusBar()->showMessage(tr("Project creation failed."));
+        return;
+    }
+
+    const core::catalog::ProjectId projectId{created.value().id.value};
+    if (!refreshCatalogProjects(projectId))
+    {
+        statusBar()->showMessage(tr("Project created, but navigation refresh failed."));
+        return;
+    }
+    changeCatalogProjectScope(m_catalogProjectScopeComboBox->findData(projectId.value));
+    statusBar()->showMessage(tr("Created project %1.").arg(fromClientString(created.value().name)));
+}
+
+// 목적: 현재 Project의 표시 이름 변경
+// 입력: 없음
+// 출력: 변경 성공 시 Project navigation 갱신
+void MainWindow::renameCurrentProject()
+{
+    if (!m_catalogProjectId.has_value())
+    {
+        return;
+    }
+
+    bool accepted = false;
+    const QString currentName = m_catalogProjectScopeComboBox->currentText();
+    const QString name = QInputDialog::getText(
+        this, tr("Rename Project"), tr("Project name:"), QLineEdit::Normal, currentName, &accepted);
+    if (!accepted)
+    {
+        return;
+    }
+
+    const core::client::CatalogProjectResult renamed =
+        m_catalogEditorFacade->renameProject({{m_catalogProjectId->value}, name.toUtf8().toStdString()});
+    if (renamed.hasError())
+    {
+        LOG_WARN("catalog", "Unable to rename GUI project: {}", renamed.error().technicalMessage);
+        statusBar()->showMessage(tr("Project rename failed."));
+        return;
+    }
+
+    (void)refreshCatalogProjects(core::catalog::ProjectId{renamed.value().id.value});
+    statusBar()->showMessage(tr("Renamed project to %1.").arg(fromClientString(renamed.value().name)));
+}
+
+// 목적: 현재 Project와 membership 삭제
+// 입력: 없음
+// 출력: 사용자 확인 후 Photo를 보존하고 Catalog scope로 이동
+void MainWindow::removeCurrentProject()
+{
+    if (!m_catalogProjectId.has_value() ||
+        QMessageBox::question(this,
+                              tr("Delete Project"),
+                              tr("Delete project \"%1\"? Photos will remain in the catalog.")
+                                  .arg(m_catalogProjectScopeComboBox->currentText())) != QMessageBox::Yes ||
+        !persistCurrentPhoto())
+    {
+        return;
+    }
+
+    const core::client::CatalogProjectDeleteResult removed =
+        m_catalogEditorFacade->deleteProject({{m_catalogProjectId->value}});
+    if (removed.hasError())
+    {
+        LOG_WARN("catalog", "Unable to remove GUI project: {}", removed.error().technicalMessage);
+        statusBar()->showMessage(tr("Project deletion failed."));
+        return;
+    }
+
+    m_catalogProjectId.reset();
+    m_catalogFolderPath.reset();
+    (void)refreshCatalogProjects();
+    core::client::CatalogPhotoPageRequest request;
+    (void)loadCatalogPhotoPage(request);
+    updateProjectActions();
+    statusBar()->showMessage(tr("Project deleted. Photos remain in the catalog."));
+}
+
+// 목적: 현재 multi-selection Photo를 사용자가 고른 Project에 추가
+// 입력: 없음
+// 출력: photo별 idempotent membership command 결과를 status에 표시
+void MainWindow::addSelectedPhotosToProject()
+{
+    const QVector<core::catalog::CatalogPhotoRecord> selectedPhotos = m_catalogWidget->selectedPhotos();
+    const core::client::CatalogProjectListResult projects = m_catalogEditorFacade->listProjects();
+    if (selectedPhotos.isEmpty() || projects.hasError() || projects.value().empty())
+    {
+        statusBar()->showMessage(tr("Select catalog photos and create a project first."));
+        return;
+    }
+
+    QStringList projectLabels;
+    for (const core::client::CatalogProjectSnapshot& project : projects.value())
+    {
+        projectLabels.append(tr("%1 (#%2)").arg(fromClientString(project.name)).arg(project.id.value));
+    }
+
+    bool accepted = false;
+    const QString selectedLabel =
+        QInputDialog::getItem(this, tr("Add to Project"), tr("Project:"), projectLabels, 0, false, &accepted);
+    const qsizetype projectIndex = projectLabels.indexOf(selectedLabel);
+    if (!accepted || projectIndex < 0)
+    {
+        return;
+    }
+    const core::client::CatalogProjectSnapshot& project = projects.value().at(static_cast<std::size_t>(projectIndex));
+
+    qsizetype storedCount = 0;
+    for (const core::catalog::CatalogPhotoRecord& photo : selectedPhotos)
+    {
+        const core::client::CatalogProjectMembershipResult stored =
+            m_catalogEditorFacade->addPhotoToProject({project.id, {photo.id.value}});
+        if (stored.hasError())
+        {
+            LOG_WARN("catalog", "Unable to add GUI project membership: {}", stored.error().technicalMessage);
+            statusBar()->showMessage(
+                tr("Added %1 of %2 selected photos to the project.").arg(storedCount).arg(selectedPhotos.size()));
+            return;
+        }
+        ++storedCount;
+    }
+
+    statusBar()->showMessage(tr("Added %1 selected photos to the project.").arg(storedCount));
+}
+
+// 목적: 현재 multi-selection Photo를 active Project에서 제거
+// 입력: 없음
+// 출력: membership 제거 후 active Project 첫 page reload
+void MainWindow::removeSelectedPhotosFromProject()
+{
+    const QVector<core::catalog::CatalogPhotoRecord> selectedPhotos = m_catalogWidget->selectedPhotos();
+    if (!m_catalogProjectId.has_value() || selectedPhotos.isEmpty() || !persistCurrentPhoto())
+    {
+        return;
+    }
+
+    qsizetype removedCount = 0;
+    for (const core::catalog::CatalogPhotoRecord& photo : selectedPhotos)
+    {
+        const core::client::CatalogProjectMembershipResult removed =
+            m_catalogEditorFacade->removePhotoFromProject({{m_catalogProjectId->value}, {photo.id.value}});
+        if (removed.hasError())
+        {
+            LOG_WARN("catalog", "Unable to remove GUI project membership: {}", removed.error().technicalMessage);
+            break;
+        }
+        ++removedCount;
+    }
+
+    core::client::CatalogPhotoPageRequest request;
+    request.projectId = toClientProjectId(m_catalogProjectId);
+    (void)loadCatalogPhotoPage(request);
+    statusBar()->showMessage(
+        tr("Removed %1 of %2 selected photos from the project.").arg(removedCount).arg(selectedPhotos.size()));
+}
+
+// 목적: Catalog session, active Project와 selected Photo에 맞춰 Project action 상태 갱신
+// 입력: 없음
+// 출력: 유효한 Project command만 활성화
+void MainWindow::updateProjectActions()
+{
+    const bool available = m_catalogEditorFacade->catalogState().isOpen && !m_folderScanController->isScanning();
+    const bool hasProject = m_catalogProjectId.has_value();
+    const bool hasSelectedPhotos = !m_catalogWidget->selectedPhotos().isEmpty();
+    m_catalogFolderScopeComboBox->setEnabled(available && !hasProject);
+    m_catalogProjectScopeComboBox->setEnabled(available);
+    m_catalogProjectMenuButton->setEnabled(available);
+    m_createProjectAction->setEnabled(available);
+    m_renameProjectAction->setEnabled(available && hasProject);
+    m_removeProjectAction->setEnabled(available && hasProject);
+    m_addSelectedPhotosToProjectAction->setEnabled(available && hasSelectedPhotos);
+    m_removeSelectedPhotosFromProjectAction->setEnabled(available && hasProject && hasSelectedPhotos);
+}
+
 // 목적: cursor 요청에 해당하는 bounded Catalog photo page를 현재 목록에 적용
 // 입력: request: page 크기, 이동 방향과 exclusive cursor
 // 출력: 조회와 UI 적용에 성공하면 true
-bool MainWindow::loadCatalogPhotoPage(const core::catalog::CatalogPhotoPageRequest& request)
+bool MainWindow::loadCatalogPhotoPage(const core::client::CatalogPhotoPageRequest& request)
 {
-    const core::orchestration::CatalogPhotoPageResult result = m_catalogEditorFacade->queryPhotos(request);
+    const core::client::CatalogPhotoPageResult result = m_catalogEditorFacade->queryPhotoPage(request);
     if (result.hasError())
     {
-        LOG_WARN("catalog", "Unable to navigate GUI catalog photos: {}", result.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to navigate GUI catalog photos: {}", result.error().technicalMessage);
         statusBar()->showMessage(tr("Catalog page navigation failed."));
         return false;
     }
 
     m_catalogPhotoPage = result.value();
-    m_catalogWidget->setPhotos(result.value().photos);
+    m_catalogEditorFacade->clearSelection();
+    m_developPanel->setEnabled(false);
+    m_developPanel->clearHistogram();
+    m_previewWidget->clearClippingSummary();
+    m_catalogWidget->setPhotos(facade::toCatalogPhotoRecords(result.value().photos));
     updateCatalogPageActions();
+    updateProjectActions();
+    if (result.value().photos.empty())
+    {
+        m_previewWidget->showMessage(tr("No photos in this scope."));
+    }
     statusBar()->showMessage(tr("Showing %1 catalog photos.").arg(result.value().photos.size()));
     return true;
 }
@@ -463,9 +1166,11 @@ void MainWindow::showPreviousCatalogPage()
         return;
     }
 
-    core::catalog::CatalogPhotoPageRequest request;
-    request.direction = core::catalog::CatalogPhotoPageDirection::Backward;
+    core::client::CatalogPhotoPageRequest request;
+    request.direction = core::client::CatalogPhotoPageDirection::Backward;
     request.cursor = m_catalogPhotoPage->previousCursor;
+    request.exactFolderPath = m_catalogProjectId.has_value() ? std::nullopt : toClientFolderPath(m_catalogFolderPath);
+    request.projectId = toClientProjectId(m_catalogProjectId);
     (void)loadCatalogPhotoPage(request);
 }
 
@@ -479,8 +1184,10 @@ void MainWindow::showNextCatalogPage()
         return;
     }
 
-    core::catalog::CatalogPhotoPageRequest request;
+    core::client::CatalogPhotoPageRequest request;
     request.cursor = m_catalogPhotoPage->nextCursor;
+    request.exactFolderPath = m_catalogProjectId.has_value() ? std::nullopt : toClientFolderPath(m_catalogFolderPath);
+    request.projectId = toClientProjectId(m_catalogProjectId);
     (void)loadCatalogPhotoPage(request);
 }
 
@@ -564,7 +1271,6 @@ void MainWindow::showSelectedEntry(const core::catalog::CatalogEntry& entry)
         return;
     }
 
-    finishDevelopAdjustment();
     m_developPanel->setEnabled(false);
     m_developPanel->clearHistogram();
     m_previewWidget->clearClippingSummary();
@@ -600,7 +1306,6 @@ void MainWindow::showSelectedCatalogPhoto(const core::catalog::CatalogPhotoRecor
         return;
     }
 
-    finishDevelopAdjustment();
     m_developPanel->setEnabled(false);
     m_developPanel->clearHistogram();
     m_previewWidget->clearClippingSummary();
@@ -865,6 +1570,7 @@ void MainWindow::exportCurrentPhoto()
 // 출력: 저장 성공 또는 저장할 dirty state가 없으면 true
 bool MainWindow::persistCurrentPhoto()
 {
+    m_developPanel->finishActiveAdjustment();
     const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
     if (!state.hasSelection || !core::types::isValidPhotoId(state.photo.photoId) || !state.dirty)
     {
@@ -888,6 +1594,7 @@ bool MainWindow::persistCurrentPhoto()
 // 출력: 호출자가 전환을 계속해도 되면 true
 bool MainWindow::confirmPendingSave()
 {
+    m_developPanel->finishActiveAdjustment();
     const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
     if (!state.hasSelection || !core::types::isValidPhotoId(state.photo.photoId) || !state.dirty)
     {
@@ -921,6 +1628,19 @@ void MainWindow::setConsoleMode(bool enabled)
     if (enabled)
     {
         m_consoleWidget->focusInput();
+    }
+}
+
+// 목적: application UI preference를 편집하고 accepted style을 즉시 DevelopPanel에 반영
+// 입력: 없음
+// 출력: Settings dialog가 modal로 표시되고 accept 시 preference 저장
+void MainWindow::openSettings()
+{
+    QSettings applicationSettings;
+    settings::SettingsDialog dialog(applicationSettings, this);
+    if (dialog.exec() == QDialog::Accepted)
+    {
+        m_developPanel->setAdjustmentControlStyle(dialog.adjustmentControlStyle());
     }
 }
 

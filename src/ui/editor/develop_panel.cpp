@@ -3,7 +3,6 @@
 #include <cmath>
 
 #include <QComboBox>
-#include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -16,6 +15,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include "adjustment_control.h"
 #include "histogram_widget.h"
 
 namespace flexraw::ui::editor
@@ -249,39 +249,44 @@ void DevelopPanel::clearHistogram()
     m_histogramWidget->clearHistogram();
 }
 
+// 목적: navigation 또는 외부 state 전환 전에 진행 중인 adjustment transaction 종료
+// 입력: 없음
+// 출력: 진행 중인 조작이 있으면 adjustmentFinished signal 발생
+void DevelopPanel::finishActiveAdjustment()
+{
+    finishAdjustment();
+}
+
+// 목적: 모든 Develop parameter 의미를 유지하며 adjustment presentation 교체
+// 입력: style: Classic 또는 Relative
+// 출력: style 변경은 paramsChanged나 history signal을 발생시키지 않음
+void DevelopPanel::setAdjustmentControlStyle(AdjustmentControlStyle style)
+{
+    finishAdjustment();
+    m_exposureControl->setControlStyle(style);
+}
+
+// 목적: 현재 adjustment presentation preference 반환
+// 입력: 없음
+// 출력: Classic 또는 Relative style
+AdjustmentControlStyle DevelopPanel::adjustmentControlStyle() const
+{
+    return m_exposureControl->controlStyle();
+}
+
 // 목적: 노출 control을 생성하고 DevelopParams::exposureEv에 연결
 // 입력: layout: control을 추가할 form layout
 // 출력: 없음
 void DevelopPanel::addExposureControl(QFormLayout* layout)
 {
-    m_exposureSlider = new QSlider(Qt::Horizontal, this);
-    m_exposureSlider->setObjectName(QStringLiteral("exposureSlider"));
-    m_exposureSlider->setRange(-50, 50);
-    m_exposureSpinBox = new QDoubleSpinBox(this);
-    m_exposureSpinBox->setRange(-5.0, 5.0);
-    m_exposureSpinBox->setDecimals(1);
-    m_exposureSpinBox->setSingleStep(0.1);
-    m_exposureSpinBox->setSuffix(tr(" EV"));
-
-    auto* controlLayout = new QHBoxLayout();
-    controlLayout->setContentsMargins({});
-    controlLayout->addWidget(m_exposureSlider);
-    controlLayout->addWidget(m_exposureSpinBox);
-    layout->addRow(tr("Exposure"), controlLayout);
-
-    connect(m_exposureSlider, &QSlider::valueChanged, this, [this](int value) {
-        m_params.exposureEv = static_cast<float>(value) / 10.0F;
-        QSignalBlocker blocker(m_exposureSpinBox);
-        m_exposureSpinBox->setValue(m_params.exposureEv);
+    m_exposureControl = new ExposureAdjustmentControl(this);
+    layout->addRow(m_exposureControl);
+    connect(m_exposureControl, &ExposureAdjustmentControl::valueChanged, this, [this](double value) {
+        m_params.exposureEv = static_cast<float>(value);
         emit paramsChanged(m_params);
     });
-    connect(m_exposureSpinBox, &QDoubleSpinBox::valueChanged, this, [this](double value) {
-        beginAdjustment();
-        m_exposureSlider->setValue(static_cast<int>(std::lround(value * 10.0)));
-    });
-    connect(m_exposureSlider, &QSlider::sliderPressed, this, &DevelopPanel::beginAdjustment);
-    connect(m_exposureSlider, &QSlider::sliderReleased, this, &DevelopPanel::finishAdjustment);
-    connect(m_exposureSpinBox, &QDoubleSpinBox::editingFinished, this, &DevelopPanel::finishAdjustment);
+    connect(m_exposureControl, &ExposureAdjustmentControl::adjustmentStarted, this, &DevelopPanel::beginAdjustment);
+    connect(m_exposureControl, &ExposureAdjustmentControl::adjustmentFinished, this, &DevelopPanel::finishAdjustment);
 }
 
 // 목적: as-shot 또는 custom white balance control을 생성하고 DevelopParams에 연결
@@ -457,10 +462,7 @@ void DevelopPanel::addNormalizedControl(QFormLayout* layout,
 // 출력: 없음
 void DevelopPanel::updateControls()
 {
-    const QSignalBlocker exposureSliderBlocker(m_exposureSlider);
-    const QSignalBlocker exposureSpinBoxBlocker(m_exposureSpinBox);
-    m_exposureSlider->setValue(static_cast<int>(std::lround(m_params.exposureEv * 10.0F)));
-    m_exposureSpinBox->setValue(m_params.exposureEv);
+    m_exposureControl->setValue(m_params.exposureEv);
 
     const QSignalBlocker sharpeningRadiusSliderBlocker(m_sharpeningRadiusSlider);
     const QSignalBlocker sharpeningRadiusSpinBoxBlocker(m_sharpeningRadiusSpinBox);

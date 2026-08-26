@@ -2,7 +2,7 @@
 
 ## Status
 
-Current milestone: **M1.3 — Qt-free Client Boundary**
+Current milestone: **M1.4 — MCP Contract Proof**
 
 이 문서는 가까운 개발 범위와 현재 구현 위치만 추적합니다. 장기 아이디어나 아직 구체화되지 않은 기능 목록은 포함하지 않습니다.
 
@@ -19,13 +19,13 @@ Current milestone: **M1.3 — Qt-free Client Boundary**
 |---|---|---|
 | M1.1 | Persistent Editor | DONE |
 | M1.2 | Catalog Navigation & Project | DONE |
-| M1.3 | Qt-free Client Boundary | IN PROGRESS |
-| M1.4 | MCP Contract Proof | PLANNED |
+| M1.3 | Qt-free Client Boundary | DONE |
+| M1.4 | MCP Contract Proof | IN PROGRESS |
 | M1.5 | Export & Acceptance | PLANNED |
 
 ## M1.3 — Qt-free Client Boundary
 
-현재 진행 중인 M1.3만 Phase 수준까지 펼칩니다. 기존 Qt Widgets GUI는 유지하면서 안정화된 client/use-case 의미를 Qt-free contract로 점진적으로 옮기는 단계입니다.
+기존 Qt Widgets GUI는 유지하면서 안정화된 Catalog/Editor client 의미를 Qt-free contract로 옮긴 단계입니다.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -34,24 +34,30 @@ Current milestone: **M1.3 — Qt-free Client Boundary**
 | Phase 3 | Catalog / Folder / Project photo paging | DONE |
 | Phase 4 | Project mutation / membership | DONE |
 | Phase 5 | Single-Photo Editor command / state | DONE |
-| Phase 6 | Editor event / subscription lifetime | CURRENT |
+| Phase 6 | Editor event / subscription lifetime | DONE |
+| Phase 7 | Preview / scan / source verification Activity projection | DONE |
 
-### Current — Phase 6
+M1.3에서 추가한 `flexraw_core_client` target은 Qt target이나 Qt object lifetime을 노출하지 않습니다. Qt GUI adapter는
+같은 contract를 실제 Catalog/Editor workflow에 연결하며 다음 항목을 검증합니다.
 
-현재 범위는 Editor의 Qt-free event 경계와 subscription lifetime을 닫는 것입니다.
-
-- Qt-free Editor event DTO
-- serialized subscription / unsubscribe lifetime
-- shutdown 중 callback lifetime 정의
-- 기존 Qt signal 기반 transitional event 경계 축소
-
-M1.3은 이 event/subscription 경계가 정리되고 기존 GUI 동작과 Qt-free client target의 독립성이 함께 검증되면 완료합니다.
+- owned `DisplayFrame`과 Catalog/Folder/Project bounded paging
+- Project CRUD와 Photo membership
+- Single-Photo Editor command, immutable state와 event subscription
+- serialized delivery와 unsubscribe/shutdown 이후 callback 차단
+- owner lifecycle을 보존하는 Preview, folder scan과 source verification Activity
 
 ## Next
 
-### M1.4 — MCP Contract Proof
+### Current — M1.4 MCP Contract Proof
 
-M1.3에서 정리한 Qt-free client contract를 headless consumer에서도 실제 사용할 수 있는지 검증합니다.
+M1.3에서 정리한 Qt-free client contract를 local headless consumer에서도 실제 사용할 수 있는지 검증합니다.
+
+- Catalog/Project bounded query
+- 명시적인 state-changing command 하나
+- typed error와 cancellation/lifetime
+- adapter-owned serialized delivery와 정상 shutdown
+
+범용 plugin framework, remote execution manager와 전체 Editor automation은 이 milestone에 포함하지 않습니다.
 
 ### M1.5 — Export & Acceptance
 

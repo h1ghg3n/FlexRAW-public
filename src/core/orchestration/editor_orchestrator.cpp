@@ -2,6 +2,7 @@
 
 #include "catalog_orchestrator.h"
 #include "develop.h"
+#include "editor_client_projection.h"
 #include "preview_orchestrator.h"
 
 namespace flexraw::core::orchestration
@@ -12,6 +13,22 @@ namespace
 constexpr int PreviewDebounceMs = 40;
 constexpr int PreviewResizeDebounceMs = 150;
 constexpr int InteractivePreviewIntervalMs = 33;
+
+// 목적: Editor client command가 사용할 수 있는 양의 Preview target인지 확인
+// 입력: targetSize: adapter가 마지막으로 전달한 viewport 크기
+// 출력: width와 height가 모두 양수이면 true
+[[nodiscard]] bool hasPreviewTarget(const QSize& targetSize) noexcept
+{
+    return targetSize.width() > 0 && targetSize.height() > 0;
+}
+
+// 목적: Qt-free Editor command의 현재 state 오류 result 생성
+// 입력: code: 오류 분류, message: log와 diagnostics용 설명
+// 출력: ClientError를 보유한 실패 result
+[[nodiscard]] client::EditorResult makeClientFailure(types::ErrorCode code, const QString& message)
+{
+    return client::EditorResult::failure(toClientError({code, message}));
+}
 
 // 목적: catalog photo record의 current locator를 preview source descriptor로 변환
 // 입력: photo: stable identity와 optional source binding을 포함한 catalog record
@@ -126,6 +143,177 @@ EditorOrchestrator::~EditorOrchestrator()
     cancelActivePreview();
 }
 
+// 목적: 현재 Editor session의 immutable Qt-free state 조회
+// 입력: 없음
+// 출력: selection, Develop state, source capability와 history snapshot
+client::EditorSnapshot EditorOrchestrator::editorSnapshot() const
+{
+    return toClientEditorSnapshot(state(), m_editInProgress);
+}
+
+// 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
+// 입력: command: 선택할 fixed-width Photo identity
+// 출력: 선택 후 snapshot 또는 validation·Catalog·Develop load 오류
+client::EditorResult EditorOrchestrator::selectPhoto(const client::SelectEditorPhotoCommand& command)
+{
+    if (command.photoId.value <= 0)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument, QStringLiteral("Editor PhotoId must be positive."));
+    }
+
+    const EditorStateResult selected = selectCatalogPhoto(types::PhotoId{command.photoId.value}, m_previewTargetSize);
+    return selected.hasError() ? client::EditorResult::failure(toClientError(selected.error()))
+                               : client::EditorResult::success(toClientEditorSnapshot(selected.value(), false));
+}
+
+// 목적: 현재 Editor selection과 진행 중 Adjustment를 정리
+// 입력: 없음
+// 출력: 선택되지 않은 snapshot
+client::EditorResult EditorOrchestrator::clearEditorSelection()
+{
+    clearSelection();
+    return client::EditorResult::success(editorSnapshot());
+}
+
+// 목적: 현재 Photo의 Develop parameter를 검증하고 session state에 반영
+// 입력: command: Qt-free Develop parameter 전체 값
+// 출력: 변경 후 snapshot 또는 selection·source·validation 오류
+client::EditorResult EditorOrchestrator::updateDevelopParams(const client::UpdateDevelopParamsCommand& command)
+{
+    const EditorState currentState = state();
+    if (!currentState.hasSelection)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument, QStringLiteral("No Editor photo is selected."));
+    }
+    if (!currentState.sourceProcessingAllowed || currentState.source.path.isEmpty())
+    {
+        return makeClientFailure(types::ErrorCode::Conflict,
+                                 QStringLiteral("The selected photo source does not allow Develop changes."));
+    }
+
+    const develop::DevelopParamsValidationResult validation =
+        develop::validateDevelopParams(fromClientDevelopParams(command.params));
+    if (validation.hasError())
+    {
+        return client::EditorResult::failure(toClientError(validation.error()));
+    }
+    if (validation.value() == m_currentParams)
+    {
+        return client::EditorResult::success(editorSnapshot());
+    }
+    if (!updateDevelopParams(validation.value(), m_previewTargetSize))
+    {
+        return makeClientFailure(types::ErrorCode::Unknown,
+                                 QStringLiteral("Editor Develop state could not be updated."));
+    }
+    return client::EditorResult::success(editorSnapshot());
+}
+
+// 목적: 연속 Develop parameter 조작을 하나의 undo 단위로 시작
+// 입력: 없음
+// 출력: Adjustment가 활성화된 snapshot 또는 현재 state 오류
+client::EditorResult EditorOrchestrator::beginAdjustment()
+{
+    const EditorState currentState = state();
+    if (!currentState.hasSelection)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument, QStringLiteral("No Editor photo is selected."));
+    }
+    if (!currentState.sourceProcessingAllowed || currentState.source.path.isEmpty())
+    {
+        return makeClientFailure(types::ErrorCode::Conflict,
+                                 QStringLiteral("The selected photo source does not allow an Adjustment."));
+    }
+    if (m_editInProgress)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict, QStringLiteral("An Adjustment is already active."));
+    }
+
+    beginEdit();
+    return client::EditorResult::success(editorSnapshot());
+}
+
+// 목적: 현재 연속 Adjustment를 종료하고 undo 단위를 확정
+// 입력: 없음
+// 출력: Adjustment가 종료된 snapshot 또는 현재 state 오류
+client::EditorResult EditorOrchestrator::endAdjustment()
+{
+    if (!m_editInProgress)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict, QStringLiteral("No Adjustment is active."));
+    }
+
+    endEdit();
+    return client::EditorResult::success(editorSnapshot());
+}
+
+// 목적: 현재 Photo의 마지막 Develop Adjustment를 되돌림
+// 입력: 없음
+// 출력: 되돌린 snapshot 또는 selection·history 상태 오류
+client::EditorResult EditorOrchestrator::undoDevelop()
+{
+    const EditorState currentState = state();
+    if (!currentState.hasSelection)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument, QStringLiteral("No Editor photo is selected."));
+    }
+    if (m_editInProgress)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict,
+                                 QStringLiteral("The active Adjustment must finish before undo."));
+    }
+    if (!currentState.sourceProcessingAllowed || !currentState.canUndo)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict, QStringLiteral("No Develop Adjustment can be undone."));
+    }
+
+    const std::optional<EditorState> undone = undo(m_previewTargetSize);
+    return undone.has_value()
+               ? client::EditorResult::success(toClientEditorSnapshot(*undone, false))
+               : makeClientFailure(types::ErrorCode::Unknown, QStringLiteral("Develop undo did not produce a state."));
+}
+
+// 목적: 현재 Photo에서 마지막으로 되돌린 Develop Adjustment를 다시 적용
+// 입력: 없음
+// 출력: 다시 적용한 snapshot 또는 selection·history 상태 오류
+client::EditorResult EditorOrchestrator::redoDevelop()
+{
+    const EditorState currentState = state();
+    if (!currentState.hasSelection)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument, QStringLiteral("No Editor photo is selected."));
+    }
+    if (m_editInProgress)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict,
+                                 QStringLiteral("The active Adjustment must finish before redo."));
+    }
+    if (!currentState.sourceProcessingAllowed || !currentState.canRedo)
+    {
+        return makeClientFailure(types::ErrorCode::Conflict, QStringLiteral("No Develop Adjustment can be redone."));
+    }
+
+    const std::optional<EditorState> redone = redo(m_previewTargetSize);
+    return redone.has_value()
+               ? client::EditorResult::success(toClientEditorSnapshot(*redone, false))
+               : makeClientFailure(types::ErrorCode::Unknown, QStringLiteral("Develop redo did not produce a state."));
+}
+
+// 목적: dirty Develop state를 optimistic persisted revision으로 저장
+// 입력: 없음
+// 출력: 저장된 baseline과 revision snapshot 또는 conflict·database 오류
+client::EditorResult EditorOrchestrator::saveDevelopState()
+{
+    const bool adjustmentWasActive = m_editInProgress;
+    const EditorStateResult saved = saveCurrentPhoto();
+    if (saved.hasError() && adjustmentWasActive != m_editInProgress)
+    {
+        emit editorSnapshotChanged();
+    }
+    return saved.hasError() ? client::EditorResult::failure(toClientError(saved.error()))
+                            : client::EditorResult::success(toClientEditorSnapshot(saved.value(), false));
+}
+
 // 목적: 현재 editor session의 immutable state snapshot 반환
 // 입력: 없음
 // 출력: 선택 사진, params, revision과 history 상태
@@ -206,7 +394,7 @@ EditorStateResult EditorOrchestrator::selectCatalogPhoto(types::PhotoId photoId,
         m_persistedRevisions.insert(photoKey, resolved.value().persistedRevision);
     }
 
-    if (m_sourceProcessingAllowed && !m_currentSource.path.isEmpty())
+    if (m_sourceProcessingAllowed && !m_currentSource.path.isEmpty() && hasPreviewTarget(targetSize))
     {
         scheduleFinalPreview(targetSize, PreviewProgression::Progressive, PreviewTiming::Debounced);
     }
@@ -217,7 +405,7 @@ EditorStateResult EditorOrchestrator::selectCatalogPhoto(types::PhotoId photoId,
     }
 
     const EditorState currentState = state();
-    emit stateChanged(currentState);
+    publishStateChanged(currentState);
     return EditorStateResult::success(currentState);
 }
 
@@ -258,7 +446,7 @@ EditorStateResult EditorOrchestrator::saveCurrentPhoto()
     m_currentSource = makeSourceDescriptor(saved.value().photo);
     m_sourceResolution = makeSourceResolutionCapabilities(saved.value().photo);
     const EditorState currentState = state();
-    emit stateChanged(currentState);
+    publishStateChanged(currentState);
     return EditorStateResult::success(currentState);
 }
 
@@ -280,7 +468,7 @@ void EditorOrchestrator::clearSelection()
     m_previewTargetSize = {};
     m_sourceProcessingAllowed = false;
     m_sourceResolution = {};
-    emit stateChanged(state());
+    publishStateChanged(state());
 }
 
 // 목적: 현재 사진의 develop params를 갱신하고 debounce된 preview 예약
@@ -305,29 +493,36 @@ bool EditorOrchestrator::updateDevelopParams(const types::DevelopParams& params,
     if (m_editInProgress)
     {
         m_editPreviewChanged = true;
-        scheduleInteractivePreview(targetSize);
+        if (hasPreviewTarget(targetSize))
+        {
+            scheduleInteractivePreview(targetSize);
+        }
     }
-    else
+    else if (hasPreviewTarget(targetSize))
     {
         scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
     }
 
-    emit stateChanged(state());
+    publishStateChanged(state());
     return true;
 }
 
 // 목적: 변경된 preview viewport 크기를 반영해 resize가 끝난 뒤 final preview 예약
 // 입력: targetSize: layout 적용 후 preview viewport 크기
-// 출력: 유효한 선택에서 실제 target 크기가 변경됐으면 true
+// 출력: 실제 target 크기가 저장됐으면 true, 유효한 선택이 있으면 preview도 예약
 bool EditorOrchestrator::updatePreviewTargetSize(const QSize& targetSize)
 {
-    if (targetSize.width() <= 0 || targetSize.height() <= 0 || m_currentSource.path.isEmpty() ||
-        !m_sourceProcessingAllowed || targetSize == m_previewTargetSize)
+    if (!hasPreviewTarget(targetSize) || targetSize == m_previewTargetSize)
     {
         return false;
     }
 
     m_previewTargetSize = targetSize;
+    if (m_currentSource.path.isEmpty() || !m_sourceProcessingAllowed)
+    {
+        return true;
+    }
+
     if (m_previewDebounceTimer.isActive())
     {
         return true;
@@ -344,6 +539,14 @@ bool EditorOrchestrator::updatePreviewTargetSize(const QSize& targetSize)
     return true;
 }
 
+// 목적: Activity client가 지정한 현재 preview request를 실제 owner에서 취소
+// 입력: requestId: 현재 Editor session의 accepted preview identity
+// 출력: current request를 취소했으면 true
+bool EditorOrchestrator::cancelPreviewRequest(types::RequestId requestId)
+{
+    return requestId != 0 && requestId == m_activePreviewRequestId && cancelActivePreview();
+}
+
 // 목적: 연속 parameter 조작을 하나의 undo 단계로 시작
 // 입력: 없음
 // 출력: 없음
@@ -354,6 +557,7 @@ void EditorOrchestrator::beginEdit()
         m_editInProgress = true;
         m_editPreviewChanged = false;
         m_developHistory.beginEdit(currentHistoryKey());
+        emit editorSnapshotChanged();
     }
 }
 
@@ -362,7 +566,13 @@ void EditorOrchestrator::beginEdit()
 // 출력: 없음
 void EditorOrchestrator::endEdit()
 {
+    if (!m_editInProgress)
+    {
+        return;
+    }
+
     finishEdit(true);
+    emit editorSnapshotChanged();
 }
 
 // 목적: 현재 사진의 마지막 develop 변경을 되돌리고 preview 예약
@@ -384,9 +594,12 @@ std::optional<EditorState> EditorOrchestrator::undo(const QSize& targetSize)
     }
 
     m_currentParams = *params;
-    scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
+    if (hasPreviewTarget(targetSize))
+    {
+        scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
+    }
     const EditorState currentState = state();
-    emit stateChanged(currentState);
+    publishStateChanged(currentState);
     return currentState;
 }
 
@@ -409,9 +622,12 @@ std::optional<EditorState> EditorOrchestrator::redo(const QSize& targetSize)
     }
 
     m_currentParams = *params;
-    scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
+    if (hasPreviewTarget(targetSize))
+    {
+        scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
+    }
     const EditorState currentState = state();
-    emit stateChanged(currentState);
+    publishStateChanged(currentState);
     return currentState;
 }
 
@@ -429,7 +645,8 @@ void EditorOrchestrator::finishEdit(bool submitFinalPreview)
     m_editInProgress = false;
     m_interactiveThrottleTimer.stop();
     m_interactivePreviewPending = false;
-    const bool shouldSubmitFinal = submitFinalPreview && m_editPreviewChanged && !m_currentSource.path.isEmpty();
+    const bool shouldSubmitFinal = submitFinalPreview && m_editPreviewChanged && !m_currentSource.path.isEmpty() &&
+                                   hasPreviewTarget(m_previewTargetSize);
     m_editPreviewChanged = false;
 
     if (shouldSubmitFinal)
@@ -511,7 +728,7 @@ void EditorOrchestrator::submitPendingInteractivePreview()
 // 출력: accepted request 저장 또는 previewFailed signal
 void EditorOrchestrator::submitPreview()
 {
-    if (m_currentSource.path.isEmpty() || !m_sourceProcessingAllowed)
+    if (m_currentSource.path.isEmpty() || !m_sourceProcessingAllowed || !hasPreviewTarget(m_previewTargetSize))
     {
         return;
     }
@@ -535,21 +752,27 @@ void EditorOrchestrator::submitPreview()
     }
 
     m_activePreviewRequestId = submitted.value();
+    emit previewStarted(m_activePreviewRequestId);
 }
 
 // 목적: 현재 accepted preview request의 향후 결과 publish 취소
 // 입력: 없음
-// 출력: active request cancellation 가능
-void EditorOrchestrator::cancelActivePreview()
+// 출력: active owner request를 취소했으면 true
+bool EditorOrchestrator::cancelActivePreview()
 {
     if (m_activePreviewRequestId == 0)
     {
-        return;
+        return false;
     }
 
     const types::RequestId requestId = m_activePreviewRequestId;
     m_activePreviewRequestId = 0;
-    (void)m_previewOrchestrator->cancelPreview(requestId);
+    const bool cancelled = m_previewOrchestrator->cancelPreview(requestId);
+    if (cancelled)
+    {
+        emit previewCancelled(requestId);
+    }
+    return cancelled;
 }
 
 // 목적: preview 결과가 현재 editor selection과 revision에 일치하는지 확인
@@ -592,12 +815,21 @@ void EditorOrchestrator::handleSourceBindingUpdated(const CatalogSourceUpdate& u
         cancelActivePreview();
         ++m_previewSequence;
     }
-    else if (!wasProcessingAllowed && !m_currentSource.path.isEmpty())
+    else if (!wasProcessingAllowed && !m_currentSource.path.isEmpty() && hasPreviewTarget(m_previewTargetSize))
     {
         scheduleFinalPreview(m_previewTargetSize, PreviewProgression::Progressive, PreviewTiming::Immediate);
     }
 
-    emit stateChanged(state());
+    publishStateChanged(state());
+}
+
+// 목적: transitional Qt state와 Qt-free snapshot invalidation을 한 state transition에서 publish
+// 입력: currentState: 변경이 끝난 현재 Editor state
+// 출력: 기존 GUI signal과 client event adapter 알림
+void EditorOrchestrator::publishStateChanged(const EditorState& currentState)
+{
+    emit stateChanged(currentState);
+    emit editorSnapshotChanged();
 }
 
 // 목적: 현재 선택 사진의 persisted 또는 session baseline 대비 dirty 여부 계산

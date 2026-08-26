@@ -93,6 +93,37 @@ TEST_F(CatalogPhotoRepositoryTest, StoresAndQueriesPhotosInDisplayOrder)
     EXPECT_EQ(types::SupportedFileKind::Raw, listed.value().photos[1].kind);
 }
 
+TEST_F(CatalogPhotoRepositoryTest, QueriesDistinctSourceFoldersWithPhotoCounts)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    const QVector<CatalogEntry> entries{
+        makeEntry(QStringLiteral("C:/photos/first/one.jpg"),
+                  QStringLiteral("one.jpg"),
+                  types::SupportedFileKind::RasterImage),
+        makeEntry(QStringLiteral("C:/photos/first/two.jpg"),
+                  QStringLiteral("two.jpg"),
+                  types::SupportedFileKind::RasterImage),
+        makeEntry(QStringLiteral("C:/photos/second/three.jpg"),
+                  QStringLiteral("three.jpg"),
+                  types::SupportedFileKind::RasterImage),
+    };
+    ASSERT_TRUE(repository.upsert(entries).hasValue());
+
+    const CatalogFolderQueryResult folders = repository.queryFolders();
+
+    ASSERT_TRUE(folders.hasValue());
+    ASSERT_EQ(2, folders.value().size());
+    EXPECT_EQ(QStringLiteral("C:/photos/first"), folders.value()[0].path);
+    EXPECT_EQ(2, folders.value()[0].photoCount);
+    EXPECT_EQ(QStringLiteral("C:/photos/second"), folders.value()[1].path);
+    EXPECT_EQ(1, folders.value()[1].photoCount);
+}
+
 TEST_F(CatalogPhotoRepositoryTest, NavigatesDuplicateDisplayNamesWithStableBidirectionalCursor)
 {
     QTemporaryDir directory;

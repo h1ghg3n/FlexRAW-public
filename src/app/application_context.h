@@ -6,6 +6,7 @@
 
 namespace flexraw::core::orchestration
 {
+class CatalogThumbnailOrchestrator;
 class EditorOrchestrator;
 class ExportOrchestrator;
 class PreviewOrchestrator;
@@ -29,7 +30,7 @@ class ManagedCatalogSession;
 class ApplicationContext final
 {
 public:
-    // 목적: production preview/export placement, editor session과 MainWindow 객체 그래프 조립
+    // 목적: production preview/export/Catalog thumbnail, editor session과 MainWindow 객체 그래프 조립
     // 입력: 없음
     // 출력: 실행 가능한 application context
     ApplicationContext();
@@ -46,6 +47,7 @@ public:
 
 private:
     std::unique_ptr<core::orchestration::PreviewOrchestrator> m_previewOrchestrator;
+    std::unique_ptr<core::orchestration::CatalogThumbnailOrchestrator> m_catalogThumbnailOrchestrator;
     std::unique_ptr<platform::ISystemMemoryProbe> m_systemMemoryProbe;
     std::unique_ptr<core::orchestration::ExportOrchestrator> m_exportOrchestrator;
     std::unique_ptr<ManagedCatalogSession> m_managedCatalogSession;

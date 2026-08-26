@@ -1,13 +1,16 @@
 #pragma once
 
 #include <optional>
+#include <variant>
 
 #include <QMetaType>
 #include <QString>
 #include <QVector>
 
 #include "catalog_entry.h"
+#include "catalog_folder_summary.h"
 #include "catalog_photo_page.h"
+#include "catalog_project.h"
 #include "develop_params.h"
 #include "error.h"
 #include "operation_types.h"
@@ -55,7 +58,11 @@ struct CatalogIssue
 };
 
 using CatalogSessionResult = types::Result<CatalogSessionState, types::CoreError>;
+using CatalogFolderListResult = types::Result<QVector<catalog::CatalogFolderSummary>, types::CoreError>;
 using CatalogPhotoPageResult = types::Result<catalog::CatalogPhotoPage, types::CoreError>;
+using CatalogProjectResult = types::Result<catalog::CatalogProjectRecord, types::CoreError>;
+using CatalogProjectListResult = types::Result<QVector<catalog::CatalogProjectRecord>, types::CoreError>;
+using CatalogProjectMutationResult = types::Result<std::monostate, types::CoreError>;
 using CatalogPhotoStateResult = types::Result<CatalogPhotoState, types::CoreError>;
 using CatalogPhotoRegistrationResult = types::Result<types::PhotoId, types::CoreError>;
 using CatalogImportResult = types::Result<CatalogImportSummary, types::CoreError>;
