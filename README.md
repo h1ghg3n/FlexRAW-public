@@ -22,6 +22,18 @@ CPU 사용량은 현재 4코어 고정이며, 추후 지원할 예정입니다.
 현재 버전은 `0.1.0`입니다. Desktop은 Windows x64를 우선 지원하며, 워커는 Windows x64, Linux x64와
 Jetson ARM64에서 native build와 실제 RAW end-to-end 경로를 확인했습니다.
 
+현재 개발은 Milestone 단위로 진행하며, **M1.3 Qt-free Client Boundary**를 진행 중입니다.
+
+| Milestone | 상태 |
+|---|---|
+| M1.1 Persistent Editor | DONE |
+| M1.2 Catalog Navigation & Project | DONE |
+| M1.3 Qt-free Client Boundary | IN PROGRESS |
+| M1.4 MCP Contract Proof | PLANNED |
+| M1.5 Export & Acceptance | PLANNED |
+
+현재 M1.3의 세부 진행 위치와 다음 범위는 [`ROADMAP.md`](ROADMAP.md)를 참고하십시오.
+
 Remote 내보내기는 RAW나 결과물을 TCP로 전송하는 방식이 아니라 Desktop과 Worker가 함께 접근할 수 있는 네트워크 스토리지 연결을 필요로 합니다.
 그래서 현재 프로토콜에는 TLS와 인증/인가가 없기 때문에 loopback 또는 신뢰할 수 있는 내부
 네트워크에서만 사용하는 것을 전제로 합니다. 프로젝트 폴더, 고급 색 관리, frame/watermark를 포함한 일부 기능은 아직 개발 중입니다.
