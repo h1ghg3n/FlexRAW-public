@@ -1,177 +1,144 @@
 # FlexRAW
 
-FlexRAW는 로컬 환경에서 RAW 사진을 보정하고, 필요한 경우 별도의 Worker로 내보내기 작업을 나눠 처리할 수 있는
-RAW 이미지 보정 프로그램입니다. Desktop 모드에서는 SQLite 기반 카탈로그, 비파괴 보정, 프리뷰와 단일/그룹
-내보내기를 지원합니다. 내보내기는 Local, Remote 또는 Auto 방식으로 실행할 수 있습니다.
-CPU 사용량은 현재 4코어 고정이며, 추후 지원할 예정입니다.
+FlexRAW는 로컬 환경에서 RAW 사진을 관리하고 비파괴 보정과 내보내기를 수행하는 C++20 기반 사진 편집기입니다.
+Windows Desktop을 우선 지원하며, 동일한 processing path를 사용하는 별도 Render Worker와 local STDIO MCP consumer도
+함께 제공합니다.
 
-![FlexRAW Desktop 카탈로그 및 편집 화면](sample.png)
+> 현재 버전: **0.1.0-alpha.5**
+> 현재 checkpoint: **M1.7 Local Product Acceptance & Freeze 완료**
 
-## 주요 기능
+현재 공개본은 기본 workflow와 architecture boundary를 검토할 수 있는 source snapshot입니다. 완성된 상용 사진 보정
+제품이나 모든 camera·운영체제를 지원하는 배포판을 의미하지는 않습니다.
 
-- 원본 파일을 직접 수정하지 않고 보정값과 사진 identity를 카탈로그에 저장합니다.
-- 노출, 대비, 하이라이트/그림자, White Balance, 채도, 명료도, 디헤이즈, 날카롭게 하기, 노이즈 감소와 톤 커브를
-  조정할 수 있습니다.
-- 연속된 조작에서는 빠른 interactive preview를 사용하고, 조작이 끝나면 final preview를 다시 생성합니다.
-- JPEG, PNG, TIFF 형식의 단일, 다중 선택과 folder batch 내보내기를 지원합니다.
-- Local/Remote/Auto placement를 이용해 Desktop과 별도 Worker의 여유 slot에 내보내기 작업을 배치합니다.
-- Worker는 bounded queue, cancellation, backpressure와 실행 전 resource admission을 사용합니다.
+![FlexRAW Windows Release Editor](images/flexraw-editor.png)
 
-## 현재 상태
+*Windows Release Editor에서 Relative adjustment control로 Exposure를 보정한 화면입니다. 표시 image는
+[NASA Earth Observatory의 Blue Marble: Next Generation — Alps, July 2004](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/)이며,
+NASA Earth Observatory를 출처로 표시합니다. NASA의
+[Images and Media Usage Guidelines](https://www.nasa.gov/nasa-brand-center/images-and-media/)를 따릅니다.*
 
-현재 버전은 `0.1.0`입니다. Desktop은 Windows x64를 우선 지원하며, 워커는 Windows x64, Linux x64와
-Jetson ARM64에서 native build와 실제 RAW end-to-end 경로를 확인했습니다.
+## 현재 제공하는 기능
 
-현재 개발은 Milestone 단위로 진행하며, **M1.3 Qt-free Client Boundary**를 진행 중입니다.
+- folder에서 RAW와 JPEG/PNG/TIFF 사진을 찾아 Catalog에 등록하고 bounded page로 탐색할 수 있습니다.
+- embedded thumbnail을 먼저 표시한 뒤 standard preview로 교체하며, visible/adjacent 범위만 thumbnail로 유지합니다.
+- exposure, contrast, highlights, shadows, whites, blacks, white balance, vibrance, saturation을 조정할 수 있습니다.
+- clarity, dehaze, sharpening, luminance/color noise reduction과 parametric/point tone curve를 지원합니다.
+- 사진별 undo/redo, 연속 조작 coalescing, persisted revision과 explicit save를 지원합니다.
+- Project 생성·이름 변경·삭제와 multi-selection membership 추가·제거를 지원합니다.
+- missing/replacement source를 확인하고 replacement 수용, 새 Photo 등록 또는 relink를 수행할 수 있습니다.
+- JPEG/PNG/TIFF Export에서 크기, output color space, metadata와 atomic write를 지원합니다.
+- Local/Remote/Auto placement, progress, cancellation과 exact terminal을 제공합니다.
+- application-level Worker profile, one-shot health 확인과 Export 기본값을 Settings에서 관리할 수 있습니다.
+- Classic slider와 중앙 복귀형 Relative rate control을 모든 숫자 보정 항목에서 선택할 수 있습니다.
 
-| Milestone | 상태 |
-|---|---|
-| M1.1 Persistent Editor | DONE |
-| M1.2 Catalog Navigation & Project | DONE |
-| M1.3 Qt-free Client Boundary | IN PROGRESS |
-| M1.4 MCP Contract Proof | PLANNED |
-| M1.5 Export & Acceptance | PLANNED |
+## 실행 구성
 
-현재 M1.3의 세부 진행 위치와 다음 범위는 [`ROADMAP.md`](ROADMAP.md)를 참고하십시오.
+| 실행 파일 | 역할 | 현재 범위 |
+|---|---|---|
+| `flexraw.exe` | Qt Widgets Desktop | Windows가 primary 검증 대상입니다. |
+| `flexraw-mcp.exe` | local STDIO MCP consumer | bounded Catalog/Project read와 opt-in write tool을 제공합니다. |
+| `flexraw-worker` | TCP Render Worker | Windows, WSL x64와 Jetson ARM64에서 build 및 RAW E2E를 확인했습니다. |
 
-Remote 내보내기는 RAW나 결과물을 TCP로 전송하는 방식이 아니라 Desktop과 Worker가 함께 접근할 수 있는 네트워크 스토리지 연결을 필요로 합니다.
-그래서 현재 프로토콜에는 TLS와 인증/인가가 없기 때문에 loopback 또는 신뢰할 수 있는 내부
-네트워크에서만 사용하는 것을 전제로 합니다. 프로젝트 폴더, 고급 색 관리, frame/watermark를 포함한 일부 기능은 아직 개발 중입니다.
+Desktop과 MCP는 같은 Qt-free Product Contract와 `ProductRuntime` owner type을 사용하지만 현재는 별도 process로 실행됩니다.
+Worker는 Product Contract가 아니라 server-facing Runtime port와 versioned wire protocol을 사용합니다.
 
-## 빌드
+## Architecture 요약
 
-공개 프리셋은 Visual Studio 2022와 vcpkg manifest mode로 윈도우 데스크탑 실행파일을 빌드합니다.
-Visual Studio의 `Desktop development with C++` workload, CMake 3.25 이상과 vcpkg를 설치한 뒤,
-`VCPKG_ROOT`를 vcpkg 설치 디렉터리로 설정해주세요.
+```text
+Qt Desktop                         Local STDIO MCP
+MainWindow + Qt Adapter            MCP Adapter
+        |                              |
+        +------ Qt-free Product Contract ------+
+                         ^
+                         |
+              Product Runtime (현재 Qt-based)
+              Catalog / Editor authority
+                         |
+             Orchestration -> domain modules
+          catalog / raw / develop / color / preview / export
+
+Render Worker
+TCP Server Adapter -> Worker Runtime port -> bounded Worker Runtime
+                                             |
+                                      resolved render pipeline
+```
+
+Adapter는 business state를 복제하지 않으며, concrete object graph와 lifetime은 각 executable의 Composition Root가
+소유합니다. Preview와 Export는 서로 다른 lifecycle을 사용하지만 RAW decode, develop, color와 encode 의미를 공유합니다.
+자세한 내용은 [architecture.md](architecture.md)를 참고해 주세요.
+
+## 현재 지원하지 않는 범위
+
+다음 기능은 아직 구현 또는 제품 검증 범위에 포함되지 않습니다.
+
+- automatic save와 disk thumbnail cache
+- crop/rotate/straighten, HSL/color grading, local mask와 layer
+- monitor별 display ICC와 full-resolution precision editing tier
+- Lensfun correction, HDR/panorama와 ML inference
+- Worker discovery, multi-worker scheduling, authentication/TLS와 public Internet 운영
+- Linux/macOS Desktop frontend와 GUI+MCP combined executable
+- 독립 installable processing engine package
+
+미구현 기능을 directory 이름이나 placeholder만으로 지원한다고 주장하지 않습니다. 실제 구현 범위와 다음 개발 gate는
+[ROADMAP.md](ROADMAP.md)를 참고해 주세요.
+
+## Build
+
+Windows에서는 Visual Studio 2022, CMake 3.25 이상과 vcpkg가 필요합니다. `VCPKG_ROOT`를 vcpkg 설치 directory로
+설정한 뒤 다음 명령을 사용할 수 있습니다.
+
+```powershell
+.\scripts\build-msvc.ps1 -Configuration Release -Test
+```
+
+동일한 동작을 CMake 명령으로 실행하려면 다음과 같이 진행해 주세요.
 
 ```powershell
 cmake --preset windows-msvc-release
-cmake --build --preset release
-ctest --preset release
+cmake --build --preset release --config Release --parallel 8 -- /nr:false
+ctest --preset release --parallel 8
 ```
 
-배포 가능한 application은 `build/release/Release/flexraw.exe`에 생성됩니다. 기본 공개 preset은 Render Worker와
-benchmark executable을 build하지 않으며, 이 target들은 명시적인 CMake option으로 사용할 수 있습니다.
-
-## 빠른 사용
-
-`flexraw.exe`를 실행한 뒤 `File` 메뉴에서 카탈로그나 folder를 열고 사진을 선택합니다. 오른쪽 panel에서 보정값을
-조정한 뒤 `Export`에서 출력 형식과 Local/Remote/Auto 실행 방식을 선택할 수 있습니다.
-
-`Ctrl+Alt+C`를 누르면 앱 내부 Console Mode로 전환됩니다. 아래 명령은 PowerShell이 아니라 Console Mode 입력창에서
-사용합니다.
+Release Desktop 실행 파일은 기본적으로 다음 위치에 생성됩니다.
 
 ```text
-diagnose raw --input "C:\Photos\sample.ARW"
+build/release/Release/flexraw.exe
 ```
 
-```text
-export raw --input "C:\Photos\sample.ARW" --output "C:\Exports\sample.jpg" --format jpeg --quality 95 --color-space srgb --metadata exclude
-```
+첫 configure에서는 vcpkg dependency build 때문에 시간이 오래 걸릴 수 있습니다. Worker, MCP-only, portable contract와
+benchmark용 preset은 [CMakePresets.json](CMakePresets.json)에서 확인할 수 있습니다.
 
-```text
-export batch --input-folder "C:\Photos" --output-folder "C:\Exports" --format jpeg --quality 95 --workers 4 --metadata exclude
-```
+## Worker 사용 범위
 
-사용 가능한 명령 목록은 `help`, graphical UI로 돌아갈 때는 `gui`를 입력합니다. Console Mode의 내보내기는 현재
-Local 실행만 지원합니다.
+Remote Export는 RAW byte를 TCP로 업로드하거나 결과물을 다운로드하지 않습니다. Desktop과 Worker가 같은 logical storage를
+각자의 local path로 mount한 trusted environment를 전제로 합니다. Wire에는 storage root 기준의 portable relative path만
+전달합니다.
 
-## Worker 모드
+현재 protocol에는 authentication과 TLS가 없으므로 loopback 또는 신뢰할 수 있는 내부 network에서만 사용해 주세요.
+Internet에 직접 노출해서는 안 됩니다.
 
-기본 public 프리셋은 Desktop만 build합니다. Windows Worker-only build가 필요한 경우 다음처럼 별도 build directory를
-사용할 수 있습니다.
+## MCP 사용 범위
 
-```powershell
-cmake -S . -B build/worker/windows-release `
-  -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-  -DFLEXRAW_BUILD_DESKTOP=OFF `
-  -DFLEXRAW_BUILD_WORKER=ON `
-  -DFLEXRAW_BUILD_TESTS=ON `
-  -DFLEXRAW_BUILD_UI_TESTS=OFF `
-  -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON `
-  -DVCPKG_MANIFEST_FEATURES=tests
+MCP는 explicit Catalog 하나를 열어 bounded Catalog/Project read, Editor state 조회와 Source Resolution event poll을
+제공합니다. Project membership 변경, Editor 선택·Exposure 변경과 Source Resolution 취소는 process startup에서
+`--allow-write`를 지정한 경우에만 광고합니다.
 
-cmake --build build/worker/windows-release --config Release --parallel
-ctest --test-dir build/worker/windows-release -C Release --output-on-failure
-```
+Preview frame, Export, Worker 제어와 generic filesystem access는 현재 MCP tool surface에 포함되지 않습니다.
 
-Worker는 source/output root가 이미 존재해야 하며, 다음은 안전한 loopback 실행 예시입니다.
+## 공개 source 경계
 
-```powershell
-.\build\worker\windows-release\Release\flexraw-worker.exe `
-  --source-root "C:\FlexRAW\Shared\Originals" `
-  --output-root "C:\FlexRAW\Shared\Exports" `
-  --listen-address 127.0.0.1 `
-  --port 47331 `
-  --concurrency 2 `
-  --queue-capacity 4
-```
-
-다른 장치의 Worker를 사용할 때는 두 장치에서 같은 상대경로를 가리키도록 storage를 mount해야 합니다. Desktop은
-`.flexraw-storage.json` marker로 storage identity를 확인하고, wire에는 portable relative path만 전달합니다. 현재
-Worker는 manual endpoint 방식이며 LAN discovery나 Internet 공개를 위한 security 기능은 포함하지 않습니다.
-
-## 구조
-
-Desktop, 카탈로그/편집기/프리뷰, 내보내기 배치, 원격 렌더링(네트워크 스토리지 한정), 서버 런타임,
-스레딩과 CMake target 경계는 [`architecture.md`](architecture.md)에서 설명합니다.
+- 검토된 하나의 source commit을 기준으로 공개합니다.
+- credential, 개인 local path, private RAW와 재배포 권리가 없는 asset은 포함하지 않습니다.
+- Binary release는 source 공개와 별도로 clean staging artifact와 third-party notice를 다시 검증해야 합니다.
+- 공개 screenshot은 NASA Earth Observatory image를 사용하며 원본 image file은 repository에 포함하지 않습니다.
 
 ## License
 
-파일이나 디렉터리에 별도 표시가 없는 한, 이 미러에서 공개되는 FlexRAW 소스에는
-**GNU Affero General Public License, version 3 or any later version**
-(`AGPL-3.0-or-later`)이 적용된다. GNU AGPL v3 전문은 [`LICENSE`](LICENSE)에 있다.
+별도 표시가 없는 FlexRAW 소스에는 **GNU Affero General Public License, version 3 or any later version**
+(`AGPL-3.0-or-later`)이 적용됩니다. GNU AGPL v3 전문은 [LICENSE](LICENSE)에서 확인할 수 있습니다.
 
-서드파티 라이브러리, 도구, 데이터, 플러그인과 모델 출력물에는 각각의 라이센스가 유지된다. FlexRAW 프로젝트 라이센스는
-이들의 라이센스 조건을 변경하거나 대체하지 않는다. 검토를 거친 의존성 목록은
-[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)에서 확인할 수 있습니다.
+Third-party library, tool, data와 model artifact에는 각각의 license가 유지됩니다. 자세한 dependency inventory는
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)를 확인해 주세요.
 
-## 별도 상업 라이센스
-
-저작권자는 FlexRAW가 소유한 코드를 별도의 private/commercial license로 제공할 수 있다. 이 공개 repository는
-위에 명시된 AGPL 권리만 부여하며 상업 조건을 부여하지 않습니다.
-
-별도 상업 라이센싱은 third-party license를 변경하지 않습니다. 특히 proprietary 배포 build는 실제 upstream
-허가를 독립적으로 확인하지 못한 경우 Exiv2를 교체하거나 제외해야 하며, 해당 product에 유효한 Qt licensing 경로
-하나를 선택해야 합니다.
-
-## 공개 바운더리
-
-- 비공개 이력, credential, 로컬 경로, 비공개 테스트 사진이나 접근이 제한된 asset을 복사하지 않는다.
-- 변경 중인 working tree를 복사하지 않고 검토된 단일 commit에서 source를 공개한다.
-- 정확한 release profile과 final package를 기준으로 binary notice bundle을 다시 생성한다.
-- 모든 public binary release에 완전한 Corresponding Source와 source 접근 정보를 포함한다.
-- Exiv2는 직접 link되는 `GPL-2.0-or-later` dependency다. 공개 FlexRAW build는 AGPLv3 application과 호환되는
-  GPLv3 경로를 사용하며, Exiv2 자체에는 기존 license가 그대로 유지된다.
-
-
----
-
-## License (English)
-
-Unless a file or directory states otherwise, FlexRAW source published in this mirror is licensed under
-the **GNU Affero General Public License, version 3 or any later version**
-(`AGPL-3.0-or-later`). The full GNU AGPL v3 text is in [`LICENSE`](LICENSE).
-
-Third-party libraries, tools, data, plugins, and model artifacts retain their own licenses. FlexRAW's
-project license does not relicense them. See
-[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the audited dependency inventory.
-
-### Separate Commercial Licensing
-
-The copyright holders may offer FlexRAW-owned code under a separate private/commercial license. This
-public repository grants only the AGPL rights stated above; it does not grant commercial terms.
-
-Separate commercial licensing does not change third-party licenses. In particular, a proprietary
-distributed build must replace or exclude Exiv2 unless an actual upstream grant is independently
-verified, and must select one valid Qt licensing path for that product.
-
-### Publication Boundary
-
-- Do not copy private history, credentials, local paths, private test photographs, or controlled assets.
-- Publish source from one reviewed commit rather than copying a changing working tree.
-- Regenerate the binary notice bundle from the exact release profile and final package.
-- Include complete corresponding source and source-access information for every public binary release.
-- Exiv2 is a directly linked `GPL-2.0-or-later` dependency. Public FlexRAW builds use its GPLv3-compatible
-  route with the AGPLv3 application; Exiv2 itself remains under its own license.
+저작권자는 FlexRAW가 소유한 code를 별도의 private/commercial license로 제공할 수 있습니다. 이 repository는 위에 명시한
+AGPL 권리만 부여하며 별도의 commercial 조건을 부여하지 않습니다.
