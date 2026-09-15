@@ -33,7 +33,9 @@
 #include "export_dialog.h"
 #include "export_orchestrator.h"
 #include "export_pipeline.h"
-#include "export_settings.h"
+#include "qt_export_client_adapter.h"
+#include "qt_export_settings_adapter.h"
+#include "qt_worker_profile_settings_adapter.h"
 #include "remote_export_execution_adapter.h"
 #include "remote_render_executor.h"
 #include "shared_storage_locator.h"
@@ -297,7 +299,10 @@ TEST(ExportDialogTest, SubmitsCurrentEditorStateAndPersistsSuccessfulOptions)
     RecordingExportPipeline* const pipelineProbe = pipeline.get();
     core::orchestration::ExportOrchestrator orchestrator(std::move(pipeline));
     const core::orchestration::EditorState editorState = makeEditorState(sourcePath);
-    ExportDialog dialog(orchestrator, editorState, settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, editorState, workerProfiles, exportDefaults);
 
     QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
     QComboBox* formatCombo = dialog.findChild<QComboBox*>(QStringLiteral("exportFormatCombo"));
@@ -330,6 +335,8 @@ TEST(ExportDialogTest, SubmitsCurrentEditorStateAndPersistsSuccessfulOptions)
 
     exportButton->click();
     eventLoop.exec();
+    ASSERT_TRUE(waitForCondition(
+        [&] { return statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive); }));
 
     const std::optional<core::orchestration::ExportFileRequest> recorded = pipelineProbe->request();
     ASSERT_TRUE(recorded.has_value());
@@ -346,13 +353,13 @@ TEST(ExportDialogTest, SubmitsCurrentEditorStateAndPersistsSuccessfulOptions)
     EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive));
     EXPECT_FALSE(exportButton->isEnabled());
 
-    settings::ExportSettings exportSettings(settings);
-    const core::export_::RasterExportOptions restored = exportSettings.loadRasterDefaults();
-    EXPECT_EQ(recorded->options.format, restored.format);
-    EXPECT_EQ(recorded->options.pngCompression, restored.pngCompression);
-    EXPECT_EQ(recorded->options.maximumDimension, restored.maximumDimension);
-    EXPECT_EQ(recorded->options.outputColorSpace, restored.outputColorSpace);
-    EXPECT_EQ(recorded->options.includeMetadata, restored.includeMetadata);
+    const core::client::ExportDefaultsResult restored = exportDefaults.exportDefaults();
+    ASSERT_TRUE(restored.hasValue());
+    EXPECT_EQ(core::client::ExportRasterFormat::Png, restored.value().rasterOptions.format);
+    EXPECT_EQ(recorded->options.pngCompression, restored.value().rasterOptions.pngCompression);
+    EXPECT_EQ(recorded->options.maximumDimension, restored.value().rasterOptions.maximumDimension);
+    EXPECT_EQ(core::client::ExportOutputColorSpace::DisplayP3, restored.value().rasterOptions.outputColorSpace);
+    EXPECT_EQ(recorded->options.includeMetadata, restored.value().rasterOptions.includeMetadata);
 }
 
 TEST(ExportDialogTest, ShowsSelectedPhotosAsOutputRowsAndSubmitsOneItemList)
@@ -371,7 +378,10 @@ TEST(ExportDialogTest, ShowsSelectedPhotosAsOutputRowsAndSubmitsOneItemList)
         {makeEditorState(firstSource).source, {}, core::types::DevelopParams{}},
         {makeEditorState(secondSource).source, {}, core::types::DevelopParams{}},
     };
-    ExportDialog dialog(orchestrator, std::move(sources), settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, std::move(sources), workerProfiles, exportDefaults);
 
     QTableWidget* outputTable = dialog.findChild<QTableWidget*>(QStringLiteral("exportOutputTable"));
     QLineEdit* firstOutputEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
@@ -410,7 +420,10 @@ TEST(ExportDialogTest, SwitchesFormatSpecificControlsAndOutputExtension)
     const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("current.arw"));
     QSettings settings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
     core::orchestration::ExportOrchestrator orchestrator(std::make_unique<RecordingExportPipeline>());
-    ExportDialog dialog(orchestrator, makeEditorState(sourcePath), settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, makeEditorState(sourcePath), workerProfiles, exportDefaults);
     QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
     QComboBox* formatCombo = dialog.findChild<QComboBox*>(QStringLiteral("exportFormatCombo"));
     QSpinBox* jpegQuality = dialog.findChild<QSpinBox*>(QStringLiteral("exportJpegQualitySpinBox"));
@@ -450,7 +463,10 @@ TEST(ExportDialogTest, CancelsActiveRequestAndAllowsRetry)
     auto pipeline = std::make_unique<CancellableExportPipeline>();
     CancellableExportPipeline* const pipelineProbe = pipeline.get();
     core::orchestration::ExportOrchestrator orchestrator(std::move(pipeline));
-    ExportDialog dialog(orchestrator, makeEditorState(sourcePath), settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, makeEditorState(sourcePath), workerProfiles, exportDefaults);
     QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
     QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
     QPushButton* cancelButton = dialog.findChild<QPushButton*>(QStringLiteral("exportCancelButton"));
@@ -499,27 +515,36 @@ TEST(ExportDialogTest, SubmitsRemoteRequestAndRestoresDesktopOutputPath)
     core::orchestration::ExportOrchestrator orchestrator(
         std::make_unique<RecordingExportPipeline>(), std::move(remoteAdapter), nullptr, configuration);
     const core::orchestration::EditorState editorState = makeEditorState(sourcePath);
-    ExportDialog dialog(orchestrator, editorState, settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    const core::client::WorkerProfileListResult initialProfiles = workerProfiles.listWorkerProfiles();
+    ASSERT_TRUE(initialProfiles.hasValue());
+    ASSERT_EQ(1U, initialProfiles.value().size());
+    const core::client::WorkerProfileSnapshot& initialProfile = initialProfiles.value().front();
+    const core::client::WorkerProfileResult updatedProfile =
+        workerProfiles.updateWorkerProfile(core::client::UpdateWorkerProfileCommand{
+            initialProfile.id, initialProfile.displayName, "192.168.0.42", 49200, true, {}, {}});
+    ASSERT_TRUE(updatedProfile.hasValue());
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, editorState, workerProfiles, exportDefaults);
 
     QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
     QComboBox* executionCombo = dialog.findChild<QComboBox*>(QStringLiteral("exportExecutionCombo"));
-    QLineEdit* hostEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportRemoteHostEdit"));
-    QSpinBox* portSpinBox = dialog.findChild<QSpinBox*>(QStringLiteral("exportRemotePortSpinBox"));
+    QComboBox* profileCombo = dialog.findChild<QComboBox*>(QStringLiteral("exportWorkerProfileCombo"));
     QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
     QLabel* statusLabel = dialog.findChild<QLabel*>(QStringLiteral("exportStatusLabel"));
     ASSERT_NE(nullptr, outputPathEdit);
     ASSERT_NE(nullptr, executionCombo);
-    ASSERT_NE(nullptr, hostEdit);
-    ASSERT_NE(nullptr, portSpinBox);
+    ASSERT_NE(nullptr, profileCombo);
     EXPECT_EQ(nullptr, dialog.findChild<QLineEdit*>(QStringLiteral("exportExpectedSourceStorageIdEdit")));
     EXPECT_EQ(nullptr, dialog.findChild<QLineEdit*>(QStringLiteral("exportExpectedOutputStorageIdEdit")));
     ASSERT_NE(nullptr, exportButton);
     ASSERT_NE(nullptr, statusLabel);
 
     outputPathEdit->setText(outputPath);
-    executionCombo->setCurrentIndex(executionCombo->findData(static_cast<int>(settings::ExportExecutionMode::Remote)));
-    hostEdit->setText(QStringLiteral("192.0.2.42"));
-    portSpinBox->setValue(49200);
+    executionCombo->setCurrentIndex(
+        executionCombo->findData(static_cast<int>(core::client::ExportPlacementPolicy::RemoteOnly)));
+    profileCombo->setCurrentIndex(profileCombo->findData(QString::fromStdString(updatedProfile.value().id.value)));
     QEventLoop eventLoop;
     QTimer::singleShot(5000, &eventLoop, &QEventLoop::quit);
     QObject::connect(
@@ -527,12 +552,14 @@ TEST(ExportDialogTest, SubmitsRemoteRequestAndRestoresDesktopOutputPath)
 
     exportButton->click();
     eventLoop.exec();
+    ASSERT_TRUE(waitForCondition(
+        [&] { return statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive); }));
 
     const std::optional<worker::client::RemoteRenderEndpoint> endpoint = remoteProbe->endpoint();
     const std::optional<worker::client::RemoteRenderRequest> request = remoteProbe->request();
     ASSERT_TRUE(endpoint.has_value());
     ASSERT_TRUE(request.has_value());
-    EXPECT_EQ(QStringLiteral("192.0.2.42"), endpoint->host);
+    EXPECT_EQ(QStringLiteral("192.168.0.42"), endpoint->host);
     EXPECT_EQ(49200, endpoint->port);
     EXPECT_EQ(QStringLiteral("current.arw"), request->sourceRelativePath);
     EXPECT_EQ(QStringLiteral("remote-output.jpg"), request->outputRelativePath);
@@ -541,16 +568,21 @@ TEST(ExportDialogTest, SubmitsRemoteRequestAndRestoresDesktopOutputPath)
     EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive));
     EXPECT_FALSE(exportButton->isEnabled());
 
-    settings::ExportSettings exportSettings(settings);
-    const settings::ExportExecutionDefaults restored = exportSettings.loadExecutionDefaults();
-    EXPECT_EQ(settings::ExportExecutionMode::Remote, restored.mode);
-    EXPECT_EQ(QStringLiteral("192.0.2.42"), restored.remoteHost);
-    EXPECT_EQ(49200, restored.remotePort);
-    EXPECT_EQ(storageId.toString(QUuid::WithoutBraces), restored.expectedSourceStorageId);
-    EXPECT_EQ(storageId.toString(QUuid::WithoutBraces), restored.expectedOutputStorageId);
+    const core::client::ExportDefaultsResult restored = exportDefaults.exportDefaults();
+    ASSERT_TRUE(restored.hasValue());
+    EXPECT_EQ(core::client::ExportPlacementPolicy::RemoteOnly, restored.value().execution.placementPolicy);
+    ASSERT_TRUE(restored.value().execution.preferredWorkerProfileId.has_value());
+    EXPECT_EQ(updatedProfile.value().id, *restored.value().execution.preferredWorkerProfileId);
+    const core::client::WorkerProfileListResult restoredProfiles = workerProfiles.listWorkerProfiles();
+    ASSERT_TRUE(restoredProfiles.hasValue());
+    ASSERT_EQ(1U, restoredProfiles.value().size());
+    EXPECT_EQ(storageId.toString(QUuid::WithoutBraces).toStdString(),
+              restoredProfiles.value().front().expectedSourceStorageId);
+    EXPECT_EQ(storageId.toString(QUuid::WithoutBraces).toStdString(),
+              restoredProfiles.value().front().expectedOutputStorageId);
 }
 
-TEST(ExportDialogTest, AutoWithoutStorageMarkerFallsBackToLocalInsteadOfBlockingInUi)
+TEST(ExportDialogTest, AutoWithDisabledProfileFallsBackToLocalInsteadOfBlockingInUi)
 {
     QTemporaryDir directory;
     ASSERT_TRUE(directory.isValid());
@@ -568,7 +600,17 @@ TEST(ExportDialogTest, AutoWithoutStorageMarkerFallsBackToLocalInsteadOfBlocking
     configuration.enforceLocalResourceReserve = false;
     core::orchestration::ExportOrchestrator orchestrator(
         std::move(pipeline), std::move(remoteAdapter), nullptr, configuration);
-    ExportDialog dialog(orchestrator, makeEditorState(sourcePath), settings);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    const core::client::WorkerProfileListResult initialProfiles = workerProfiles.listWorkerProfiles();
+    ASSERT_TRUE(initialProfiles.hasValue());
+    ASSERT_EQ(1U, initialProfiles.value().size());
+    ASSERT_TRUE(workerProfiles
+                    .setWorkerProfileEnabled(
+                        core::client::SetWorkerProfileEnabledCommand{initialProfiles.value().front().id, false})
+                    .hasValue());
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, makeEditorState(sourcePath), workerProfiles, exportDefaults);
 
     QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
     QComboBox* executionCombo = dialog.findChild<QComboBox*>(QStringLiteral("exportExecutionCombo"));
@@ -580,7 +622,8 @@ TEST(ExportDialogTest, AutoWithoutStorageMarkerFallsBackToLocalInsteadOfBlocking
     ASSERT_NE(nullptr, statusLabel);
 
     outputPathEdit->setText(outputPath);
-    executionCombo->setCurrentIndex(executionCombo->findData(static_cast<int>(settings::ExportExecutionMode::Auto)));
+    executionCombo->setCurrentIndex(
+        executionCombo->findData(static_cast<int>(core::client::ExportPlacementPolicy::Auto)));
     QEventLoop eventLoop;
     QTimer::singleShot(5000, &eventLoop, &QEventLoop::quit);
     QObject::connect(
@@ -588,12 +631,15 @@ TEST(ExportDialogTest, AutoWithoutStorageMarkerFallsBackToLocalInsteadOfBlocking
 
     exportButton->click();
     eventLoop.exec();
+    ASSERT_TRUE(waitForCondition(
+        [&] { return statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive); }));
 
     ASSERT_TRUE(localProbe->request().has_value());
     EXPECT_FALSE(remoteProbe->request().has_value());
     EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("completed"), Qt::CaseInsensitive));
-    settings::ExportSettings exportSettings(settings);
-    EXPECT_EQ(settings::ExportExecutionMode::Auto, exportSettings.loadExecutionDefaults().mode);
+    const core::client::ExportDefaultsResult restored = exportDefaults.exportDefaults();
+    ASSERT_TRUE(restored.hasValue());
+    EXPECT_EQ(core::client::ExportPlacementPolicy::Auto, restored.value().execution.placementPolicy);
 }
 
 }  // namespace

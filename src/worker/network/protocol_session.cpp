@@ -8,6 +8,7 @@
 #include <QTcpSocket>
 
 #include "frame_codec.h"
+#include "health_payload_codec.h"
 #include "render_payload_codec.h"
 
 namespace flexraw::worker::network
@@ -37,22 +38,36 @@ constexpr qint64 MaximumReadBytesPerTurn = protocol::ProtocolHeaderBytes * 64;
     return {core::types::ErrorCode::InvalidArgument, error.message};
 }
 
+// 목적: wire correlation identity를 Runtime-owned job identity로 명시적으로 변환
+// 입력: jobId: protocol frame의 fixed-width JobId
+// 출력: 같은 numeric identity를 보존한 Runtime 값
+[[nodiscard]] runtime::RenderJobId toRuntimeJobId(const protocol::JobId jobId) noexcept
+{
+    return {jobId};
+}
+
+// 목적: Runtime terminal identity를 wire response correlation 값으로 명시적으로 변환
+// 입력: jobId: Runtime-owned fixed-width job identity
+// 출력: 같은 numeric identity를 보존한 protocol JobId
+[[nodiscard]] protocol::JobId toProtocolJobId(const runtime::RenderJobId jobId) noexcept
+{
+    return jobId.value;
+}
+
 }  // namespace
 
 // 목적: 연결된 socket을 session-scoped render protocol adapter로 구성
-// 입력: sessionId/socket: 연결 identity와 소유 대상, resolver/scheduler: shared runtime, configuration: I/O 한도
+// 입력: sessionId/socket: 연결 identity와 소유 대상, runtime: shared Runtime port, configuration: I/O 한도
 // 출력: readyRead/disconnect/timeout을 처리하는 session
 ProtocolSession::ProtocolSession(const runtime::WorkerSessionId sessionId,
                                  QTcpSocket* const socket,
-                                 const runtime::WorkerPathResolver& resolver,
-                                 runtime::JobScheduler& scheduler,
+                                 runtime::IRenderWorkerRuntime& runtime,
                                  ProtocolSessionConfiguration configuration,
                                  QObject* const parent)
     : QObject(parent),
       m_sessionId(sessionId),
       m_socket(socket),
-      m_resolver(resolver),
-      m_scheduler(scheduler),
+      m_runtime(runtime),
       m_configuration(std::move(configuration))
 {
     Q_ASSERT(m_sessionId != 0);
@@ -175,17 +190,20 @@ bool ProtocolSession::handleFrame(const protocol::ProtocolFrame& frame)
         return handleRenderRequest(frame);
     case protocol::MessageType::CancelRequest:
         return handleCancelRequest(frame);
+    case protocol::MessageType::HealthRequest:
+        return handleHealthRequest(frame);
     case protocol::MessageType::JobAccepted:
     case protocol::MessageType::RenderSucceeded:
     case protocol::MessageType::RenderFailed:
     case protocol::MessageType::ServerBusy:
     case protocol::MessageType::ResourceBusy:
+    case protocol::MessageType::HealthResponse:
         return false;
     }
     return false;
 }
 
-// 목적: render payload decode/path resolve/scheduler submit과 accepted/busy 응답 수행
+// 목적: render payload decode/Runtime submit과 accepted/busy 응답 수행
 // 입력: frame: RenderRequest message와 session JobId
 // 출력: semantic 처리를 계속할 수 있으면 true
 bool ProtocolSession::handleRenderRequest(const protocol::ProtocolFrame& frame)
@@ -200,21 +218,18 @@ bool ProtocolSession::handleRenderRequest(const protocol::ProtocolFrame& frame)
     {
         return sendFailure(frame.jobId, makePayloadCoreError(decoded.error()));
     }
-    const runtime::WorkerPathResolver::ResolveResult resolved = m_resolver.resolve(decoded.value());
-    if (resolved.hasError())
-    {
-        return sendFailure(frame.jobId, makePathCoreError(resolved.error()));
-    }
-
     QPointer<ProtocolSession> session(this);
     QCoreApplication* const dispatchContext = QCoreApplication::instance();
     if (dispatchContext == nullptr)
     {
         return false;
     }
-    runtime::ScheduledRenderJob job{{m_sessionId, frame.jobId}, decoded.value().outputRelativePath, resolved.value()};
-    const runtime::SubmitStatus submitStatus =
-        m_scheduler.submit(std::move(job), [session, dispatchContext](runtime::RenderJobOutcome outcome) mutable {
+    const runtime::RenderRequestPayload& payload = decoded.value();
+    runtime::RenderWorkerCommand command{
+        {m_sessionId, toRuntimeJobId(frame.jobId)},
+        {payload.sourceRelativePath, payload.outputRelativePath, payload.developParams, payload.outputOptions}};
+    const runtime::RenderWorkerSubmitResult submitted =
+        m_runtime.submit(std::move(command), [session, dispatchContext](runtime::RenderJobOutcome outcome) mutable {
             QMetaObject::invokeMethod(
                 dispatchContext,
                 [session, outcome = std::move(outcome)]() mutable {
@@ -225,8 +240,12 @@ bool ProtocolSession::handleRenderRequest(const protocol::ProtocolFrame& frame)
                 },
                 Qt::QueuedConnection);
         });
+    if (submitted.hasError())
+    {
+        return sendFailure(frame.jobId, makePathCoreError(submitted.error()));
+    }
 
-    switch (submitStatus)
+    switch (submitted.value())
     {
     case runtime::SubmitStatus::Accepted:
         m_activeJobIds.insert(frame.jobId);
@@ -255,22 +274,46 @@ bool ProtocolSession::handleCancelRequest(const protocol::ProtocolFrame& frame)
     {
         return true;
     }
-    return m_scheduler.cancel({m_sessionId, frame.jobId});
+    // Runtime terminal이 Qt delivery queue를 먼저 이긴 경우에도 이미 예약된 terminal을 보존한다.
+    static_cast<void>(m_runtime.cancel({m_sessionId, toRuntimeJobId(frame.jobId)}));
+    return true;
+}
+
+// 목적: Runtime read-only snapshot을 bounded health response로 투영
+// 입력: frame: empty payload HealthRequest와 correlation identity
+// 출력: payload 방향과 response write가 유효하면 true
+bool ProtocolSession::handleHealthRequest(const protocol::ProtocolFrame& frame)
+{
+    if (!frame.payload.isEmpty())
+    {
+        return false;
+    }
+    const runtime::WorkerRuntimeSnapshot snapshot = m_runtime.snapshot();
+    const protocol::HealthResponsePayload payload{
+        snapshot.accepting ? protocol::HealthServiceState::Ready : protocol::HealthServiceState::ShuttingDown,
+        snapshot.queued,
+        snapshot.running,
+        snapshot.maximumConcurrency,
+        snapshot.queueCapacity,
+    };
+    const protocol::EncodeHealthPayloadResult encoded = protocol::encodeHealthResponsePayload(payload);
+    return encoded.hasValue() && sendFrame({protocol::MessageType::HealthResponse, frame.jobId, encoded.value()});
 }
 
 // 목적: session event-loop에서 active identity를 제거하고 terminal response 전송
-// 입력: outcome: scheduler가 완료한 job 결과
+// 입력: outcome: Runtime이 완료한 job 결과
 // 출력: RenderSucceeded, RenderFailed 또는 ResourceBusy frame
 void ProtocolSession::handleOutcome(runtime::RenderJobOutcome outcome)
 {
-    if (outcome.key.sessionId != m_sessionId || m_activeJobIds.erase(outcome.key.jobId) == 0 || m_closing)
+    const protocol::JobId jobId = toProtocolJobId(outcome.key.jobId);
+    if (outcome.key.sessionId != m_sessionId || m_activeJobIds.erase(jobId) == 0 || m_closing)
     {
         return;
     }
 
     if (outcome.result.hasError())
     {
-        if (!sendResourceBusy(outcome.key.jobId, outcome.result.error()))
+        if (!sendResourceBusy(jobId, outcome.result.error()))
         {
             close();
             return;
@@ -282,14 +325,13 @@ void ProtocolSession::handleOutcome(runtime::RenderJobOutcome outcome)
         const runtime::RenderSucceededPayload payload{
             outcome.outputRelativePath, renderResult.value().artifact.byteSize, renderResult.value().stats};
         const runtime::EncodePayloadResult encoded = runtime::encodeRenderSucceededPayload(payload);
-        if (encoded.hasError() ||
-            !sendFrame({protocol::MessageType::RenderSucceeded, outcome.key.jobId, encoded.value()}))
+        if (encoded.hasError() || !sendFrame({protocol::MessageType::RenderSucceeded, jobId, encoded.value()}))
         {
             close();
             return;
         }
     }
-    else if (!sendFailure(outcome.key.jobId, renderResult.error().cause, renderResult.error().stats))
+    else if (!sendFailure(jobId, renderResult.error().cause, renderResult.error().stats))
     {
         close();
         return;
@@ -351,14 +393,14 @@ bool ProtocolSession::sendResourceBusy(const protocol::JobId jobId, const runtim
     return encoded.hasValue() && sendFrame({protocol::MessageType::ResourceBusy, jobId, encoded.value()});
 }
 
-// 목적: 모든 active scheduler job에 cancellation 요청
+// 목적: 모든 active Runtime job에 cancellation 요청
 // 입력: 없음
 // 출력: 없음
 void ProtocolSession::cancelActiveJobs()
 {
     for (const protocol::JobId jobId : m_activeJobIds)
     {
-        static_cast<void>(m_scheduler.cancel({m_sessionId, jobId}));
+        static_cast<void>(m_runtime.cancel({m_sessionId, toRuntimeJobId(jobId)}));
     }
     m_activeJobIds.clear();
 }

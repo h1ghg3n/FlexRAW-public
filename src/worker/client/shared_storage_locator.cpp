@@ -206,8 +206,8 @@ using ParseMarkerResult = core::types::Result<ParsedStorageMarker, SharedStorage
 // 출력: canonical local root, normalized storage UUID와 portable relative path 또는 typed 오류
 LocateSharedStorageResult SharedStorageLocator::locateSource(const QString& sourcePath)
 {
-    const QString cleanedPath = QDir::cleanPath(sourcePath.trimmed());
-    if (sourcePath.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedPath))
+    const QString cleanedPath = QDir::cleanPath(sourcePath);
+    if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed() || !QDir::isAbsolutePath(cleanedPath))
     {
         return LocateSharedStorageResult::failure(makeError(SharedStorageLocatorErrorCode::InvalidPath,
                                                             QStringLiteral("Remote source path must be absolute.")));
@@ -233,8 +233,8 @@ LocateSharedStorageResult SharedStorageLocator::locateSource(const QString& sour
 // 출력: canonical local root, normalized storage UUID와 portable relative path 또는 typed 오류
 LocateSharedStorageResult SharedStorageLocator::locateOutput(const QString& outputPath)
 {
-    const QString cleanedPath = QDir::cleanPath(outputPath.trimmed());
-    if (outputPath.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedPath))
+    const QString cleanedPath = QDir::cleanPath(outputPath);
+    if (outputPath.isEmpty() || outputPath != outputPath.trimmed() || !QDir::isAbsolutePath(cleanedPath))
     {
         return LocateSharedStorageResult::failure(makeError(SharedStorageLocatorErrorCode::InvalidPath,
                                                             QStringLiteral("Remote output path must be absolute.")));
@@ -269,8 +269,9 @@ LocateSharedStorageResult SharedStorageLocator::locateOutput(const QString& outp
 EnsureSharedStorageMarkerResult SharedStorageLocator::ensureMarkerForDirectory(const QString& directoryPath,
                                                                                const QString& storageRootPath)
 {
-    const QString cleanedDirectory = QDir::cleanPath(directoryPath.trimmed());
-    if (directoryPath.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedDirectory))
+    const QString cleanedDirectory = QDir::cleanPath(directoryPath);
+    if (directoryPath.isEmpty() || directoryPath != directoryPath.trimmed() ||
+        !QDir::isAbsolutePath(cleanedDirectory) || storageRootPath != storageRootPath.trimmed())
     {
         return EnsureSharedStorageMarkerResult::failure(makeError(
             SharedStorageLocatorErrorCode::InvalidPath, QStringLiteral("Shared storage directory must be absolute.")));
@@ -284,8 +285,8 @@ EnsureSharedStorageMarkerResult SharedStorageLocator::ensureMarkerForDirectory(c
             SharedStorageLocatorErrorCode::InvalidPath, QStringLiteral("Shared storage directory does not exist.")));
     }
 
-    const QString requestedRoot = storageRootPath.trimmed().isEmpty() ? QStorageInfo(canonicalDirectory).rootPath()
-                                                                      : QDir::cleanPath(storageRootPath.trimmed());
+    const QString requestedRoot =
+        storageRootPath.isEmpty() ? QStorageInfo(canonicalDirectory).rootPath() : QDir::cleanPath(storageRootPath);
     const QFileInfo rootInfo(requestedRoot);
     const QString canonicalRoot = rootInfo.canonicalFilePath();
     if (!rootInfo.exists() || !rootInfo.isDir() || canonicalRoot.isEmpty())

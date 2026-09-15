@@ -38,7 +38,8 @@ WorkerApplicationContext::WorkerApplicationContext(runtime::WorkerPathResolver r
       m_pipelineRunner(m_pipeline),
       m_runner(m_pipelineRunner, *m_resourceAdmission, std::move(configuration.admission)),
       m_scheduler(m_runner, configuration.maximumConcurrency, configuration.queueCapacity),
-      m_server(m_resolver, m_scheduler, std::move(configuration.server))
+      m_runtimePort(m_resolver, m_scheduler),
+      m_server(m_runtimePort, std::move(configuration.server))
 {}
 
 // 목적: socket 접수를 중단하고 active render를 취소한 뒤 owned worker thread 종료

@@ -1,14 +1,19 @@
+#include <algorithm>
 #include <atomic>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFileInfo>
+#include <QImage>
 #include <QSemaphore>
 #include <QTemporaryDir>
 #include <QThread>
@@ -20,6 +25,7 @@
 #include "export_orchestrator.h"
 #include "export_pipeline.h"
 #include "test_application.h"
+#include "test_path_identity_service.h"
 
 namespace flexraw::core::orchestration
 {
@@ -58,6 +64,16 @@ namespace
         types::SupportedFileKind::RasterImage,
     };
     return ExportFileRequest{source, sourcePath + QStringLiteral(".out.jpg"), {}, {}, {}};
+}
+
+// 목적: FileExportPipeline path preparation test용 작은 raster source 생성
+// 입력: path: 저장할 PNG file 경로
+// 출력: image plugin 저장 성공 여부
+[[nodiscard]] bool writeRasterSource(const QString& path)
+{
+    QImage image(QSize(2, 2), QImage::Format_RGB32);
+    image.fill(Qt::darkGreen);
+    return image.save(path);
 }
 
 // 목적: fake pipeline 성공 report 생성
@@ -108,6 +124,18 @@ public:
     mutable std::atomic_int callCount{0};
 };
 
+class UnavailablePathIdentityService final : public platform::IPathIdentityService
+{
+public:
+    // 목적: OS별 path identity를 확정할 수 없는 Platform 경계 재현
+    // 입력: absolutePath: 판정을 거부할 미사용 절대 경로
+    // 출력: identity unavailable을 뜻하는 nullopt
+    [[nodiscard]] std::optional<platform::TransientPathKey> comparisonKey(const std::filesystem::path&) const override
+    {
+        return std::nullopt;
+    }
+};
+
 struct CancellationProbe
 {
     QSemaphore blockedJobStarted;
@@ -148,6 +176,96 @@ public:
 
 private:
     std::shared_ptr<CancellationProbe> m_probe;
+};
+
+class FirstPreparationBlockingPipeline final : public IExportPipeline
+{
+public:
+    // 목적: 첫 preparation만 test가 해제할 때까지 차단하고 이후 request는 즉시 준비
+    // 입력: request: single-file Export intent, cancellationToken: 첫 request 취소 상태
+    // 출력: 취소된 첫 preparation 또는 실행 가능한 단일 item
+    [[nodiscard]] ExportPreparationResult prepare(const ExportRequest& request,
+                                                  const types::CancellationToken& cancellationToken) const override
+    {
+        const int callIndex = m_preparationCalls.fetch_add(1, std::memory_order_relaxed);
+        if (callIndex == 0)
+        {
+            m_firstPreparationStarted.release();
+            m_firstPreparationRelease.acquire();
+            if (cancellationToken.isCancellationRequested())
+            {
+                return ExportPreparationResult::failure(
+                    {types::ErrorCode::Cancelled, QStringLiteral("Fake preparation cancelled.")});
+            }
+        }
+
+        const auto* const fileRequest = std::get_if<ExportFileRequest>(&request);
+        if (fileRequest == nullptr)
+        {
+            return ExportPreparationResult::failure(
+                {types::ErrorCode::InvalidArgument, QStringLiteral("Fake pipeline requires a file request.")});
+        }
+        return ExportPreparationResult::success(PreparedExport{{PreparedExportItem{*fileRequest, std::nullopt}}});
+    }
+
+    // 목적: 준비가 끝난 독립 request를 즉시 성공시켜 callback drain 순서 증명
+    // 입력: item: 준비된 file intent, cancellationToken: cooperative cancellation 상태
+    // 출력: 취소 또는 성공 item result
+    [[nodiscard]] ExportItemResult executeItem(const PreparedExportItem& item,
+                                               const types::CancellationToken& cancellationToken) const override
+    {
+        m_executionCalls.fetch_add(1, std::memory_order_relaxed);
+        if (cancellationToken.isCancellationRequested())
+        {
+            return {item.request.source.path,
+                    item.request.outputPath,
+                    false,
+                    {types::ErrorCode::Cancelled, QStringLiteral("Fake execution cancelled.")},
+                    ExportItemFailureKind::Execution};
+        }
+        return {item.request.source.path, item.request.outputPath, true, {}, ExportItemFailureKind::None};
+    }
+
+    // 목적: item API만 사용하는 test fake에서 legacy entry point 호출 방지
+    // 입력: request/token/progress: 사용하지 않음
+    // 출력: 호출되면 식별 가능한 failure
+    [[nodiscard]] ExportPipelineResult execute(const ExportRequest&,
+                                               const types::CancellationToken&,
+                                               const ExportProgressCallback&) const override
+    {
+        return ExportPipelineResult::failure(
+            {types::ErrorCode::Unknown, QStringLiteral("Legacy execute must not be used by this test.")});
+    }
+
+    // 목적: 첫 preparation이 worker에서 시작됐는지 조회
+    // 입력: 없음
+    // 출력: started semaphore 참조
+    [[nodiscard]] QSemaphore& firstPreparationStarted() const
+    {
+        return m_firstPreparationStarted;
+    }
+
+    // 목적: 차단된 첫 preparation을 취소 결과 반환 지점까지 진행
+    // 입력: 없음
+    // 출력: release semaphore 증가
+    void releaseFirstPreparation() const
+    {
+        m_firstPreparationRelease.release();
+    }
+
+    // 목적: 실제 item execution 횟수 조회
+    // 입력: 없음
+    // 출력: thread-safe execution count
+    [[nodiscard]] int executionCalls() const
+    {
+        return m_executionCalls.load(std::memory_order_relaxed);
+    }
+
+private:
+    mutable std::atomic_int m_preparationCalls{0};
+    mutable std::atomic_int m_executionCalls{0};
+    mutable QSemaphore m_firstPreparationStarted;
+    mutable QSemaphore m_firstPreparationRelease;
 };
 
 TEST(ExportOrchestratorTest, RejectsNullPipeline)
@@ -258,7 +376,7 @@ TEST(FileExportPipelineTest, UsesDefaultDevelopForUnregisteredFolderSelectionWhe
         {},
         true,
     };
-    FileExportPipeline pipeline;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
     types::CancellationSource cancellation;
 
     const ExportPreparationResult prepared = pipeline.prepare(ExportItemListRequest{{item}}, cancellation.token());
@@ -268,6 +386,138 @@ TEST(FileExportPipelineTest, UsesDefaultDevelopForUnregisteredFolderSelectionWhe
     EXPECT_TRUE(prepared.value().items.constFirst().request.catalogPath.isEmpty());
     ASSERT_TRUE(prepared.value().items.constFirst().request.developParams.has_value());
     EXPECT_EQ(types::DevelopParams{}, *prepared.value().items.constFirst().request.developParams);
+}
+
+TEST(FileExportPipelineTest, RejectsItemOutputThatTargetsAnotherItemSource)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstSource = QDir(directory.path()).filePath(QStringLiteral("first.png"));
+    const QString secondSource = QDir(directory.path()).filePath(QStringLiteral("second.png"));
+    ASSERT_TRUE(writeRasterSource(firstSource));
+    ASSERT_TRUE(writeRasterSource(secondSource));
+    ExportFileRequest first = std::get<ExportFileRequest>(makeFileRequest(firstSource));
+    ExportFileRequest second = std::get<ExportFileRequest>(makeFileRequest(secondSource));
+    first.outputPath = secondSource;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared =
+        pipeline.prepare(ExportItemListRequest{{first, second}}, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasError());
+    EXPECT_EQ(types::ErrorCode::Conflict, prepared.error().code);
+}
+
+TEST(FileExportPipelineTest, RejectsBatchGeneratedOutputThatTargetsScannedSource)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    ASSERT_TRUE(writeRasterSource(QDir(directory.path()).filePath(QStringLiteral("photo.png"))));
+    ASSERT_TRUE(writeRasterSource(QDir(directory.path()).filePath(QStringLiteral("photo-png.png"))));
+    ExportBatchRequest request;
+    request.inputFolderPath = directory.path();
+    request.outputFolderPath = directory.path();
+    request.options.format = export_::RasterExportFormat::Png;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(request, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasError());
+    EXPECT_EQ(types::ErrorCode::Conflict, prepared.error().code);
+}
+
+TEST(FileExportPipelineTest, RejectsHardLinkOutputAliasWhenSupported)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("source.png"));
+    const QString outputAliasPath = QDir(directory.path()).filePath(QStringLiteral("alias.png"));
+    ASSERT_TRUE(writeRasterSource(sourcePath));
+    std::error_code linkError;
+    std::filesystem::create_hard_link(QFileInfo(sourcePath).filesystemAbsoluteFilePath(),
+                                      QFileInfo(outputAliasPath).filesystemAbsoluteFilePath(),
+                                      linkError);
+    if (linkError)
+    {
+        GTEST_SKIP() << "Hard link creation is unavailable: " << linkError.message();
+    }
+    ExportFileRequest request = std::get<ExportFileRequest>(makeFileRequest(sourcePath));
+    request.outputPath = outputAliasPath;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(request, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasError());
+    EXPECT_EQ(types::ErrorCode::Conflict, prepared.error().code);
+}
+
+TEST(FileExportPipelineTest, RejectsProspectiveOutputCollisionUnderCaseInsensitivePolicy)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstSource = QDir(directory.path()).filePath(QStringLiteral("first.png"));
+    const QString secondSource = QDir(directory.path()).filePath(QStringLiteral("second.png"));
+    ASSERT_TRUE(writeRasterSource(firstSource));
+    ASSERT_TRUE(writeRasterSource(secondSource));
+    ExportFileRequest first = std::get<ExportFileRequest>(makeFileRequest(firstSource));
+    ExportFileRequest second = std::get<ExportFileRequest>(makeFileRequest(secondSource));
+    first.outputPath = QDir(directory.path()).filePath(QStringLiteral("Result.JPG"));
+    second.outputPath = QDir(directory.path()).filePath(QStringLiteral("result.jpg"));
+    FileExportPipeline pipeline(::flexraw::test::caseInsensitiveTestPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared =
+        pipeline.prepare(ExportItemListRequest{{first, second}}, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasError());
+    EXPECT_EQ(types::ErrorCode::Conflict, prepared.error().code);
+}
+
+TEST(FileExportPipelineTest, AllowsCaseDistinctProspectiveOutputsUnderExactPolicy)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstSource = QDir(directory.path()).filePath(QStringLiteral("first.png"));
+    const QString secondSource = QDir(directory.path()).filePath(QStringLiteral("second.png"));
+    ASSERT_TRUE(writeRasterSource(firstSource));
+    ASSERT_TRUE(writeRasterSource(secondSource));
+    ExportFileRequest first = std::get<ExportFileRequest>(makeFileRequest(firstSource));
+    ExportFileRequest second = std::get<ExportFileRequest>(makeFileRequest(secondSource));
+    first.outputPath = QDir(directory.path()).filePath(QStringLiteral("Result.JPG"));
+    second.outputPath = QDir(directory.path()).filePath(QStringLiteral("result.jpg"));
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared =
+        pipeline.prepare(ExportItemListRequest{{first, second}}, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasValue());
+    ASSERT_EQ(2, prepared.value().items.size());
+}
+
+TEST(FileExportPipelineTest, FailsClosedWhenProspectivePathIdentityIsUnavailable)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("source.png"));
+    ASSERT_TRUE(writeRasterSource(sourcePath));
+    const UnavailablePathIdentityService pathIdentityService;
+    FileExportPipeline pipeline(pathIdentityService);
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(makeFileRequest(sourcePath), cancellation.token());
+
+    ASSERT_TRUE(prepared.hasError());
+    EXPECT_EQ(types::ErrorCode::Unknown, prepared.error().code);
 }
 
 TEST(ExportOrchestratorTest, RejectsInvalidExportOptionsBeforeQueueing)
@@ -320,6 +570,57 @@ TEST(ExportOrchestratorTest, CancelsOneRequestWithoutSuppressingIndependentCompl
     ASSERT_EQ(1U, completedRequests.size());
     EXPECT_EQ(independent.value(), completedRequests.front());
     EXPECT_TRUE(waitForCondition([&]() { return probe->cancelledJobFinished.tryAcquire(1); }));
+}
+
+TEST(ExportOrchestratorTest, CancellationDuringPreparationDrainsWithoutLateEvents)
+{
+    (void)test::application();
+    auto pipeline = std::make_unique<FirstPreparationBlockingPipeline>();
+    FirstPreparationBlockingPipeline* const pipelineProbe = pipeline.get();
+    ExportOrchestrator orchestrator(std::move(pipeline), 1);
+    std::vector<ExportProgress> progressEvents;
+    std::vector<ExportResult> completedEvents;
+    std::vector<ExportIssue> failedEvents;
+    std::vector<types::RequestId> cancelledEvents;
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportProgressed, [&](const ExportProgress& progress) {
+        progressEvents.push_back(progress);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportCompleted, [&](const ExportResult& result) {
+        completedEvents.push_back(result);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportFailed, [&](const ExportIssue& issue) {
+        failedEvents.push_back(issue);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportCancelled, [&](const types::RequestId requestId) {
+        cancelledEvents.push_back(requestId);
+    });
+
+    const ExportSubmissionResult cancelled = orchestrator.submitExport(makeFileRequest(QStringLiteral("blocked.jpg")));
+    ASSERT_TRUE(cancelled.hasValue());
+    ASSERT_TRUE(waitForCondition([&]() { return pipelineProbe->firstPreparationStarted().tryAcquire(1); }));
+    ASSERT_TRUE(orchestrator.cancelExport(cancelled.value()));
+    const ExportSubmissionResult independent =
+        orchestrator.submitExport(makeFileRequest(QStringLiteral("independent.jpg")));
+    ASSERT_TRUE(independent.hasValue());
+
+    pipelineProbe->releaseFirstPreparation();
+    ASSERT_TRUE(waitForCondition([&]() {
+        return std::ranges::any_of(completedEvents,
+                                   [&](const ExportResult& result) { return result.requestId == independent.value(); });
+    }));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+
+    EXPECT_EQ(1, pipelineProbe->executionCalls());
+    EXPECT_EQ(1, std::ranges::count(cancelledEvents, cancelled.value()));
+    EXPECT_EQ(0, std::ranges::count_if(progressEvents, [&](const ExportProgress& progress) {
+                  return progress.requestId == cancelled.value();
+              }));
+    EXPECT_EQ(0, std::ranges::count_if(completedEvents, [&](const ExportResult& result) {
+                  return result.requestId == cancelled.value();
+              }));
+    EXPECT_EQ(0, std::ranges::count_if(failedEvents, [&](const ExportIssue& issue) {
+                  return issue.requestId == cancelled.value();
+              }));
 }
 
 TEST(ExportOrchestratorTest, CancelsActivePipelineBeforeWaitingForShutdown)

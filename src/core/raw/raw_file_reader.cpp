@@ -44,15 +44,13 @@ namespace
 // 출력: 검증된 QFileInfo 또는 구조화된 오류
 [[nodiscard]] types::Result<QFileInfo, types::CoreError> validateRawFilePath(const QString& filePath)
 {
-    const QString normalizedPath = filePath.trimmed();
-
-    if (normalizedPath.isEmpty())
+    if (filePath.isEmpty() || filePath != filePath.trimmed())
     {
-        return types::Result<QFileInfo, types::CoreError>::failure(
-            types::CoreError{types::ErrorCode::InvalidArgument, QStringLiteral("RAW file path is empty.")});
+        return types::Result<QFileInfo, types::CoreError>::failure(types::CoreError{
+            types::ErrorCode::InvalidArgument, QStringLiteral("RAW file path is empty or contains outer whitespace.")});
     }
 
-    const QFileInfo fileInfo(normalizedPath);
+    const QFileInfo fileInfo(filePath);
 
     if (!fileInfo.exists())
     {

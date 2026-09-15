@@ -1,14 +1,10 @@
 #include <functional>
-#include <stdexcept>
 
 #include <QCoreApplication>
-#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
-#include <QFile>
 #include <QHostAddress>
 #include <QTcpSocket>
-#include <QTemporaryDir>
 #include <QThread>
 
 #include <gtest/gtest.h>
@@ -35,50 +31,44 @@ namespace
     return predicate();
 }
 
-class NoopRenderJobRunner final : public runtime::IRenderJobRunner
+class NoopRenderWorkerRuntime final : public runtime::IRenderWorkerRuntime
 {
 public:
-    // 목적: WorkerServer connection lifecycle test용 즉시 취소 결과 반환
-    // 입력: request/cancellationToken: 사용하지 않는 runner contract
-    // 출력: 고정 Cancelled failure
-    [[nodiscard]] runtime::RenderJobExecutionResult execute(
-        const core::render::ResolvedRenderRequest& request,
-        const core::types::CancellationToken& cancellationToken) const override
+    // 목적: network-only target이 concrete Worker Runtime 없이 server를 조립할 수 있게 하는 fake port
+    // 입력: command/completion: connection lifecycle test에서 사용하지 않는 Runtime 값
+    // 출력: 호출 시 신규 작업을 받지 않는 고정 상태
+    [[nodiscard]] runtime::RenderWorkerSubmitResult submit(runtime::RenderWorkerCommand command,
+                                                           runtime::RenderJobCompletion completion) override
     {
-        static_cast<void>(request);
-        static_cast<void>(cancellationToken);
-        return runtime::RenderJobExecutionResult::success(core::render::ResolvedRenderPipelineResult::failure(
-            {{core::types::ErrorCode::Cancelled, QStringLiteral("not used")}, {}}));
+        static_cast<void>(command);
+        static_cast<void>(completion);
+        return runtime::RenderWorkerSubmitResult::success(runtime::SubmitStatus::ShuttingDown);
+    }
+
+    // 목적: connection lifecycle test에서 들어올 수 있는 cancellation을 무해하게 처리
+    // 입력: key: 사용하지 않는 Runtime identity
+    // 출력: active 작업이 없으므로 false
+    [[nodiscard]] bool cancel(const runtime::RenderJobKey key) override
+    {
+        static_cast<void>(key);
+        return false;
+    }
+
+    // 목적: network-only health projection에 deterministic Runtime 관측값 제공
+    // 입력: 없음
+    // 출력: 신규 접수를 받지 않는 빈 snapshot
+    [[nodiscard]] runtime::WorkerRuntimeSnapshot snapshot() const override
+    {
+        return {0, 0, 1, 2, {}, false};
     }
 };
 
-// 목적: temporary root pair로 WorkerPathResolver 생성
-// 입력: sourceRoot/outputRoot: 기존 directory
-// 출력: resolver 또는 setup 예외
-[[nodiscard]] runtime::WorkerPathResolver makeServerResolver(const QTemporaryDir& sourceRoot,
-                                                             const QTemporaryDir& outputRoot)
-{
-    runtime::WorkerPathResolver::CreateResult result =
-        runtime::WorkerPathResolver::create({sourceRoot.path(), outputRoot.path()});
-    if (result.hasError())
-    {
-        throw std::runtime_error(result.error().message.toStdString());
-    }
-    return result.value();
-}
-
 TEST(WorkerServerTest, EnforcesConnectionLimitAndClosesActiveSession)
 {
-    QTemporaryDir sourceRoot;
-    QTemporaryDir outputRoot;
-    ASSERT_TRUE(sourceRoot.isValid());
-    ASSERT_TRUE(outputRoot.isValid());
-    const runtime::WorkerPathResolver resolver = makeServerResolver(sourceRoot, outputRoot);
-    NoopRenderJobRunner runner;
-    runtime::JobScheduler scheduler(runner, 1, 0);
+    NoopRenderWorkerRuntime runtime;
     WorkerServerConfiguration configuration;
     configuration.maximumConnections = 1;
-    WorkerServer server(resolver, scheduler, configuration);
+    WorkerServer server(runtime, configuration);
     ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
 
     QTcpSocket first;
@@ -98,16 +88,10 @@ TEST(WorkerServerTest, EnforcesConnectionLimitAndClosesActiveSession)
 
 TEST(WorkerServerTest, DisconnectsIdleSessionAfterConfiguredTimeout)
 {
-    QTemporaryDir sourceRoot;
-    QTemporaryDir outputRoot;
-    ASSERT_TRUE(sourceRoot.isValid());
-    ASSERT_TRUE(outputRoot.isValid());
-    const runtime::WorkerPathResolver resolver = makeServerResolver(sourceRoot, outputRoot);
-    NoopRenderJobRunner runner;
-    runtime::JobScheduler scheduler(runner, 1, 0);
+    NoopRenderWorkerRuntime runtime;
     WorkerServerConfiguration configuration;
     configuration.session.inactivityTimeoutMilliseconds = 20;
-    WorkerServer server(resolver, scheduler, configuration);
+    WorkerServer server(runtime, configuration);
     ASSERT_TRUE(server.listen(QHostAddress::LocalHost, 0));
 
     QTcpSocket client;

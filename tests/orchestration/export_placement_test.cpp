@@ -115,6 +115,7 @@ void observe(ExportOrchestrator& orchestrator, ExportObservation& observation)
 enum class LocalBehavior : std::uint8_t
 {
     Succeed,
+    FailOddItems,
     BlockUntilReleased,
     BlockUntilCancelled,
 };
@@ -192,6 +193,14 @@ public:
                     item.request.outputPath,
                     false,
                     {types::ErrorCode::Cancelled, QStringLiteral("Fake Local execution cancelled.")},
+                    ExportItemFailureKind::Execution};
+        }
+        if (m_behavior == LocalBehavior::FailOddItems && item.request.source.path.endsWith(QStringLiteral("1.arw")))
+        {
+            return {item.request.source.path,
+                    item.request.outputPath,
+                    false,
+                    {types::ErrorCode::DecodeFailed, QStringLiteral("Fake Local execution failed.")},
                     ExportItemFailureKind::Execution};
         }
         return {item.request.source.path, item.request.outputPath, true, {}, ExportItemFailureKind::None};
@@ -562,6 +571,53 @@ TEST(ExportPlacementTest, RemoteOnlyNeverFallsBackToLocal)
     EXPECT_EQ(2U, observation.completed->report.scheduling.remoteExecuted);
 }
 
+TEST(ExportPlacementTest, RemoteOnlyProjectsPreExecutionFailureAsDispatchExhausted)
+{
+    (void)test::application();
+    auto pipeline = std::make_unique<ScriptedExportPipeline>(1);
+    ScriptedExportPipeline* const local = pipeline.get();
+    auto remotePort = std::make_unique<ScriptedRemotePort>(
+        std::vector<RemoteStep>{{RemoteOutcome::ServerBusy, false, false, false, {}}});
+    ScriptedRemotePort* const remote = remotePort.get();
+    ExportOrchestrator orchestrator(std::move(pipeline), std::move(remotePort), nullptr, makeConfiguration(1, 1));
+    ExportObservation observation;
+    observe(orchestrator, observation);
+
+    ASSERT_TRUE(
+        orchestrator.submitExport(makeBatchRequest(), makePlacement(ExportPlacementPolicy::RemoteOnly)).hasValue());
+    ASSERT_TRUE(waitForCondition([&]() { return observation.completed.has_value(); }));
+
+    EXPECT_FALSE(observation.failed.has_value());
+    EXPECT_EQ(0, local->callCount());
+    EXPECT_EQ(1, remote->callCount());
+    ASSERT_EQ(1, observation.completed->report.failedCount);
+    ASSERT_EQ(1, observation.completed->report.items.size());
+    EXPECT_EQ(ExportItemFailureKind::DispatchExhausted, observation.completed->report.items.constFirst().failureKind);
+}
+
+TEST(ExportPlacementTest, MixedItemResultsRemainOneCompletedAggregate)
+{
+    (void)test::application();
+    auto pipeline = std::make_unique<ScriptedExportPipeline>(2, LocalBehavior::FailOddItems);
+    ExportOrchestrator orchestrator(std::move(pipeline), {}, nullptr, makeConfiguration(2, 1));
+    ExportObservation observation;
+    observe(orchestrator, observation);
+
+    ASSERT_TRUE(
+        orchestrator.submitExport(makeBatchRequest(), makePlacement(ExportPlacementPolicy::LocalOnly)).hasValue());
+    ASSERT_TRUE(waitForCondition([&]() { return observation.completed.has_value(); }));
+
+    EXPECT_FALSE(observation.failed.has_value());
+    EXPECT_TRUE(observation.cancelled.empty());
+    EXPECT_EQ(2, observation.completed->report.totalCount);
+    EXPECT_EQ(1, observation.completed->report.succeededCount);
+    EXPECT_EQ(1, observation.completed->report.failedCount);
+    ASSERT_EQ(2, observation.completed->report.items.size());
+    EXPECT_TRUE(observation.completed->report.items[0].succeeded);
+    EXPECT_FALSE(observation.completed->report.items[1].succeeded);
+    EXPECT_EQ(ExportItemFailureKind::Execution, observation.completed->report.items[1].failureKind);
+}
+
 TEST(ExportPlacementTest, AutoWithoutUsableRemoteProfileContinuesLocally)
 {
     (void)test::application();
@@ -714,6 +770,59 @@ TEST(ExportPlacementTest, CancelsRemoteDispatchingAndRunningWithoutRequeue)
         EXPECT_FALSE(observation.completed.has_value());
         EXPECT_EQ(0, local->callCount());
     }
+}
+
+TEST(ExportPlacementTest, AggregateCancellationDrainsRunningItemAndDropsQueuedItems)
+{
+    (void)test::application();
+    auto pipeline = std::make_unique<ScriptedExportPipeline>(3, LocalBehavior::BlockUntilReleased);
+    ScriptedExportPipeline* const local = pipeline.get();
+    ExportOrchestrator orchestrator(std::move(pipeline), {}, nullptr, makeConfiguration(1, 1));
+    std::vector<ExportProgress> progressEvents;
+    std::vector<ExportResult> completedEvents;
+    std::vector<ExportIssue> failedEvents;
+    std::vector<types::RequestId> cancelledEvents;
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportProgressed, [&](const ExportProgress& progress) {
+        progressEvents.push_back(progress);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportCompleted, [&](const ExportResult& result) {
+        completedEvents.push_back(result);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportFailed, [&](const ExportIssue& issue) {
+        failedEvents.push_back(issue);
+    });
+    QObject::connect(&orchestrator, &ExportOrchestrator::exportCancelled, [&](const types::RequestId requestId) {
+        cancelledEvents.push_back(requestId);
+    });
+
+    const ExportSubmissionResult cancelled =
+        orchestrator.submitExport(makeBatchRequest(), makePlacement(ExportPlacementPolicy::LocalOnly));
+    ASSERT_TRUE(cancelled.hasValue());
+    ASSERT_TRUE(waitForCondition([&]() { return local->callCount() == 1; }));
+    ASSERT_TRUE(orchestrator.cancelExport(cancelled.value()));
+
+    const ExportSubmissionResult independent =
+        orchestrator.submitExport(makeBatchRequest(), makePlacement(ExportPlacementPolicy::LocalOnly));
+    ASSERT_TRUE(independent.hasValue());
+    ASSERT_TRUE(waitForCondition([&]() { return local->callCount() == 2; }));
+    local->release(3);
+    ASSERT_TRUE(waitForCondition([&]() {
+        return std::ranges::any_of(completedEvents,
+                                   [&](const ExportResult& result) { return result.requestId == independent.value(); });
+    }));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+
+    EXPECT_EQ(4, local->callCount());
+    EXPECT_EQ(1, std::ranges::count(cancelledEvents, cancelled.value()));
+    EXPECT_EQ(0, std::ranges::count_if(progressEvents, [&](const ExportProgress& progress) {
+                  return progress.requestId == cancelled.value();
+              }));
+    EXPECT_EQ(0, std::ranges::count_if(completedEvents, [&](const ExportResult& result) {
+                  return result.requestId == cancelled.value();
+              }));
+    EXPECT_EQ(0, std::ranges::count_if(failedEvents, [&](const ExportIssue& issue) {
+                  return issue.requestId == cancelled.value();
+              }));
 }
 
 TEST(ExportPlacementTest, LocalQueueKeepsStableOrderAndSlotLimit)

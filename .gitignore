@@ -1,14 +1,15 @@
 build/
-out/
+.claude/
 vcpkg_installed/
-.vs/
-.vscode/
-.idea/
-
 *.user
 *.suo
+.vs/
+out/
 CMakeSettings.json
 
-.env
-.env.*
-*.local
+# Personal / environment-specific notes (not part of project docs)
+documents/jetson_restore_r36.5.md
+documents/jetson_board_conflict.md
+
+# Local Codex agent notes
+codex.md

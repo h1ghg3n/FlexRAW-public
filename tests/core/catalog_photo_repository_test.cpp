@@ -2,7 +2,10 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QTemporaryDir>
+#include <QUuid>
 
 #include <gtest/gtest.h>
 
@@ -91,6 +94,37 @@ TEST_F(CatalogPhotoRepositoryTest, StoresAndQueriesPhotosInDisplayOrder)
     EXPECT_EQ(types::SupportedFileKind::RasterImage, listed.value().photos[0].kind);
     EXPECT_EQ(QStringLiteral("b.CR3"), listed.value().photos[1].displayName);
     EXPECT_EQ(types::SupportedFileKind::Raw, listed.value().photos[1].kind);
+}
+
+TEST_F(CatalogPhotoRepositoryTest, QueriesDistinctSourceFoldersWithPhotoCounts)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    const QVector<CatalogEntry> entries{
+        makeEntry(QStringLiteral("C:/photos/first/one.jpg"),
+                  QStringLiteral("one.jpg"),
+                  types::SupportedFileKind::RasterImage),
+        makeEntry(QStringLiteral("C:/photos/first/two.jpg"),
+                  QStringLiteral("two.jpg"),
+                  types::SupportedFileKind::RasterImage),
+        makeEntry(QStringLiteral("C:/photos/second/three.jpg"),
+                  QStringLiteral("three.jpg"),
+                  types::SupportedFileKind::RasterImage),
+    };
+    ASSERT_TRUE(repository.upsert(entries).hasValue());
+
+    const CatalogFolderQueryResult folders = repository.queryFolders();
+
+    ASSERT_TRUE(folders.hasValue());
+    ASSERT_EQ(2, folders.value().size());
+    EXPECT_EQ(QStringLiteral("C:/photos/first"), folders.value()[0].path);
+    EXPECT_EQ(2, folders.value()[0].photoCount);
+    EXPECT_EQ(QStringLiteral("C:/photos/second"), folders.value()[1].path);
+    EXPECT_EQ(1, folders.value()[1].photoCount);
 }
 
 TEST_F(CatalogPhotoRepositoryTest, NavigatesDuplicateDisplayNamesWithStableBidirectionalCursor)
@@ -453,6 +487,74 @@ TEST_F(CatalogPhotoRepositoryTest, RegistersReplacementWithNewIdAndLeavesOrigina
     ASSERT_EQ(1, preservedHistory.value().size());
     ASSERT_TRUE(newParams.hasValue());
     EXPECT_FALSE(newParams.value().has_value());
+}
+
+TEST_F(CatalogPhotoRepositoryTest, RollsBackOriginalBindingWhenReplacementInsertFails)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    const QString sourcePath = QStringLiteral("C:/photos/rollback.CR3");
+    const CatalogEntry entry = makeEntry(sourcePath, QStringLiteral("rollback.CR3"), types::SupportedFileKind::Raw);
+    ASSERT_TRUE(repository.upsert({entry}).hasValue());
+    const CatalogPhotoRecordResult initial = repository.findBySourcePath(sourcePath);
+    ASSERT_TRUE(initial.hasValue());
+    ASSERT_TRUE(initial.value().has_value());
+    const types::PhotoId originalId = initial.value()->id;
+    const types::SourceFingerprint originalFingerprint = makeFingerprint('a', 1024, 1234);
+    ASSERT_TRUE(repository.establishSourceFingerprint(originalId, originalFingerprint).hasValue());
+    CatalogDevelopRepository developRepository(*database.value());
+    types::DevelopParams originalParams;
+    originalParams.exposureEv = 0.75F;
+    ASSERT_TRUE(developRepository.saveParams(originalId, originalParams).hasValue());
+    ASSERT_TRUE(developRepository.appendHistory(originalId, originalParams).hasValue());
+    ASSERT_TRUE(repository.recordSourceState(originalId, SourceBindingState::ReplacementDetected).hasValue());
+
+    const QString connectionName =
+        QStringLiteral("catalog-photo-rollback-%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    {
+        QSqlDatabase failureInjection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+        failureInjection.setDatabaseName(catalogPath);
+        ASSERT_TRUE(failureInjection.open());
+        QSqlQuery trigger(failureInjection);
+        ASSERT_TRUE(
+            trigger.exec(QStringLiteral("CREATE TRIGGER fail_replacement_insert BEFORE INSERT ON photos "
+                                        "BEGIN SELECT RAISE(ABORT, 'injected replacement insert failure'); END")));
+        failureInjection.close();
+    }
+    QSqlDatabase::removeDatabase(connectionName);
+
+    const CatalogPhotoCreateResult registered =
+        repository.registerReplacementAsNew(originalId, entry, makeFingerprint('b', 2048, 5678));
+    const CatalogPhotoRecordResult original = repository.findById(originalId);
+    const CatalogPhotoRecordResult sourceLookup = repository.findBySourcePath(sourcePath);
+    const CatalogPhotoQueryResult photos = repository.queryPage(CatalogPhotoPageRequest{});
+    const CatalogDevelopParamsResult preservedParams = developRepository.loadParams(originalId);
+    const CatalogDevelopHistoryResult preservedHistory = developRepository.listHistory(originalId);
+
+    ASSERT_TRUE(registered.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, registered.error().code);
+    ASSERT_TRUE(original.hasValue());
+    ASSERT_TRUE(original.value().has_value());
+    ASSERT_TRUE(original.value()->source.has_value());
+    EXPECT_EQ(sourcePath, original.value()->source->path);
+    EXPECT_EQ(SourceBindingState::ReplacementDetected, original.value()->sourceState);
+    EXPECT_EQ(originalFingerprint.sizeBytes, original.value()->fingerprint.sizeBytes);
+    EXPECT_EQ(originalFingerprint.modifiedAtMs, original.value()->fingerprint.modifiedAtMs);
+    EXPECT_EQ(originalFingerprint.sha256, original.value()->fingerprint.sha256);
+    ASSERT_TRUE(sourceLookup.hasValue());
+    ASSERT_TRUE(sourceLookup.value().has_value());
+    EXPECT_EQ(originalId.value, sourceLookup.value()->id.value);
+    ASSERT_TRUE(photos.hasValue());
+    ASSERT_EQ(1, photos.value().photos.size());
+    ASSERT_TRUE(preservedParams.hasValue());
+    ASSERT_TRUE(preservedParams.value().has_value());
+    EXPECT_EQ(originalParams, *preservedParams.value());
+    ASSERT_TRUE(preservedHistory.hasValue());
+    ASSERT_EQ(1, preservedHistory.value().size());
 }
 
 TEST_F(CatalogPhotoRepositoryTest, RelinksOriginalPhotoWithoutChangingIdentity)

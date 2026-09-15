@@ -591,7 +591,7 @@ TEST(ResourceAdmissionIntegrationTest, UsesRealRouterAdapterFromSchedulerWorkerT
     std::mutex outcomeMutex;
     std::optional<runtime::RenderJobOutcome> outcome;
 
-    const runtime::SubmitStatus status = scheduler.submit({{1, 1}, QStringLiteral("output.jpg"), makeRenderRequest()},
+    const runtime::SubmitStatus status = scheduler.submit({{1, {1}}, QStringLiteral("output.jpg"), makeRenderRequest()},
                                                           [&](runtime::RenderJobOutcome completed) {
                                                               const std::scoped_lock lock(outcomeMutex);
                                                               outcome = std::move(completed);

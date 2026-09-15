@@ -15,6 +15,8 @@ endif()
 add_library(flexraw_platform_current STATIC)
 
 target_sources(flexraw_platform_current PRIVATE
+    current_path_identity_service.cpp
+    current_path_identity_service.h
     current_process_memory_probe.cpp
     current_process_memory_probe.h
     current_system_memory_probe.cpp

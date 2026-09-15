@@ -17,10 +17,14 @@ target_link_libraries(flexraw_app
     PUBLIC
         flexraw_ui_mainwindow
     PRIVATE
+        flexraw_product_runtime
         flexraw_core_orchestration
         flexraw_core_preview
         flexraw_platform_current
+        flexraw_ui_export
         flexraw_ui_facade
+        flexraw_ui_settings
         flexraw_worker_export_adapter
+        flexraw_worker_health_adapter
         Qt6::Core
 )

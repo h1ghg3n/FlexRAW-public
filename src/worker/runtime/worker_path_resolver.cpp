@@ -27,10 +27,10 @@ namespace
 // 출력: canonical directory path 또는 root 오류
 [[nodiscard]] core::types::Result<QString, WorkerPathError> validateRoot(const QString& path, const QString& label)
 {
-    if (path.trimmed().isEmpty())
+    if (path.isEmpty() || path != path.trimmed())
     {
-        return core::types::Result<QString, WorkerPathError>::failure(
-            makePathError(WorkerPathErrorCode::InvalidRoot, label + QStringLiteral(" root is empty.")));
+        return core::types::Result<QString, WorkerPathError>::failure(makePathError(
+            WorkerPathErrorCode::InvalidRoot, label + QStringLiteral(" root is empty or contains outer whitespace.")));
     }
 
     const QFileInfo rootInfo(QDir::cleanPath(path));
@@ -186,10 +186,10 @@ WorkerPathResolver::CreateResult WorkerPathResolver::create(const WorkerRootConf
     return CreateResult::success(WorkerPathResolver(sourceRoot.value(), outputRoot.value()));
 }
 
-// 목적: wire request의 상대 경로를 Worker root 안의 local render request로 해석
-// 입력: payload: portable relative path와 processing value
+// 목적: Runtime request의 상대 경로를 Worker root 안의 local render request로 해석
+// 입력: payload: transport에서 분리된 relative path와 processing value
 // 출력: canonical source/output path를 가진 request 또는 escape/value 오류
-WorkerPathResolver::ResolveResult WorkerPathResolver::resolve(const RenderRequestPayload& payload) const
+WorkerPathResolver::ResolveResult WorkerPathResolver::resolve(const RenderWorkerRequest& payload) const
 {
     const core::develop::DevelopParamsValidationResult developValidation =
         core::develop::validateDevelopParams(payload.developParams);

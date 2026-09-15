@@ -65,6 +65,11 @@ public:
     // 출력: 사진별 단조 증가 DevelopRevision, history가 없으면 0
     [[nodiscard]] types::DevelopRevision revision(const QString& photoPath) const;
 
+    // 목적: 지정 사진의 session-local develop state와 undo/redo history 폐기
+    // 입력: photoPath: 폐기할 사진별 history identity
+    // 출력: 없음; 다른 사진 history는 유지
+    void discardPhoto(const QString& photoPath);
+
 private:
     struct PhotoHistory
     {

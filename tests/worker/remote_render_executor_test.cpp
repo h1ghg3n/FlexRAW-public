@@ -1,8 +1,9 @@
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -205,16 +206,50 @@ TEST(RemoteRenderExecutorTest, NotifiesAcceptedExactlyOnceBeforeTerminalSuccess)
     const RemoteRenderExecutor executor;
     const core::types::CancellationSource cancellation;
     std::atomic<int> acceptedCount{0};
+    std::atomic_bool executeReturned{false};
+    std::atomic_bool acceptedBeforeReturn{false};
+    std::thread::id executeThread;
+    std::thread::id acceptedThread;
     std::future<RemoteRenderResult> future = std::async(std::launch::async, [&] {
-        return executor.execute(makeEndpoint(server.port()),
-                                makeRequest(),
-                                cancellation.token(),
-                                [&acceptedCount] { acceptedCount.fetch_add(1, std::memory_order_relaxed); });
+        executeThread = std::this_thread::get_id();
+        RemoteRenderResult result =
+            executor.execute(makeEndpoint(server.port()), makeRequest(), cancellation.token(), [&] {
+                acceptedThread = std::this_thread::get_id();
+                acceptedBeforeReturn.store(!executeReturned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                acceptedCount.fetch_add(1, std::memory_order_relaxed);
+            });
+        executeReturned.store(true, std::memory_order_relaxed);
+        return result;
     });
 
     ASSERT_TRUE(waitForFuture(future));
     const RemoteRenderResult result = future.get();
     ASSERT_TRUE(result.hasValue());
+    EXPECT_EQ(1, acceptedCount.load(std::memory_order_relaxed));
+    EXPECT_TRUE(acceptedBeforeReturn.load(std::memory_order_relaxed));
+    EXPECT_EQ(executeThread, acceptedThread);
+}
+
+TEST(RemoteRenderExecutorTest, RejectsDuplicateAcceptedWithoutSecondCallback)
+{
+    ScriptedRenderServer server([](QTcpSocket& socket, const protocol::ProtocolFrame& requestFrame) {
+        ASSERT_TRUE(sendFrames(socket,
+                               {{protocol::MessageType::JobAccepted, requestFrame.jobId, {}},
+                                {protocol::MessageType::JobAccepted, requestFrame.jobId, {}}}));
+    });
+    const RemoteRenderExecutor executor;
+    const core::types::CancellationSource cancellation;
+    std::atomic_int acceptedCount{0};
+    std::future<RemoteRenderResult> future = std::async(std::launch::async, [&] {
+        return executor.execute(makeEndpoint(server.port()), makeRequest(), cancellation.token(), [&acceptedCount] {
+            acceptedCount.fetch_add(1, std::memory_order_relaxed);
+        });
+    });
+
+    ASSERT_TRUE(waitForFuture(future));
+    const RemoteRenderResult result = future.get();
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(RemoteRenderErrorCode::ProtocolViolation, result.error().code);
     EXPECT_EQ(1, acceptedCount.load(std::memory_order_relaxed));
 }
 

@@ -1,7 +1,12 @@
 #include "export_dialog.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include <QByteArray>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -16,8 +21,6 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
-#include <QSet>
-#include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
 #include <QTableWidget>
@@ -28,14 +31,132 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "editor_client_projection.h"
 #include "export.h"
-#include "export_orchestrator.h"
+#include "log.h"
 #include "shared_storage_locator.h"
 
 namespace flexraw::ui::export_
 {
 namespace
 {
+
+// 목적: Qt string을 byte length가 보존된 UTF-8 client string으로 변환
+// 입력: value: source/output/catalog locator 또는 display text
+// 출력: Qt-free UTF-8 string
+[[nodiscard]] std::string toClientString(const QString& value)
+{
+    const QByteArray utf8 = value.toUtf8();
+    return {utf8.constData(), static_cast<std::size_t>(utf8.size())};
+}
+
+// 목적: byte length가 보존된 UTF-8 client string을 Qt presentation text로 변환
+// 입력: value: Export result locator
+// 출력: 같은 Unicode text의 QString
+[[nodiscard]] QString fromClientString(const std::string& value)
+{
+    return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+// 목적: current Core source descriptor를 Qt-free Export source snapshot으로 투영
+// 입력: source: Editor/Catalog가 해석한 source path와 kind
+// 출력: product contract source value
+[[nodiscard]] core::client::EditorSourceSnapshot toClientSource(const core::types::FileDescriptor& source)
+{
+    core::client::CatalogFileKind kind = core::client::CatalogFileKind::Unknown;
+    switch (source.kind)
+    {
+    case core::types::SupportedFileKind::Raw:
+        kind = core::client::CatalogFileKind::Raw;
+        break;
+    case core::types::SupportedFileKind::RasterImage:
+        kind = core::client::CatalogFileKind::RasterImage;
+        break;
+    case core::types::SupportedFileKind::Unknown:
+        break;
+    }
+    return {toClientString(source.path), toClientString(source.extension), toClientString(source.displayName), kind};
+}
+
+// 목적: current Qt settings raster option을 Qt-free Export option으로 투영
+// 입력: options: dialog widget에서 수집한 processing option
+// 출력: product contract format/quality/color snapshot
+[[nodiscard]] core::client::ExportRasterOptions toClientOptions(const core::export_::RasterExportOptions& options)
+{
+    core::client::ExportRasterOptions projected;
+    switch (options.format)
+    {
+    case core::export_::RasterExportFormat::Jpeg:
+        projected.format = core::client::ExportRasterFormat::Jpeg;
+        break;
+    case core::export_::RasterExportFormat::Png:
+        projected.format = core::client::ExportRasterFormat::Png;
+        break;
+    case core::export_::RasterExportFormat::Tiff:
+        projected.format = core::client::ExportRasterFormat::Tiff;
+        break;
+    }
+    projected.jpegQuality = options.jpegQuality;
+    projected.pngCompression = options.pngCompression;
+    projected.tiffCompression = options.tiffCompression == core::export_::TiffCompression::None
+                                    ? core::client::ExportTiffCompression::None
+                                    : core::client::ExportTiffCompression::Lzw;
+    projected.maximumDimension = options.maximumDimension;
+    switch (options.outputColorSpace)
+    {
+    case core::export_::RasterOutputColorSpace::Srgb:
+        projected.outputColorSpace = core::client::ExportOutputColorSpace::Srgb;
+        break;
+    case core::export_::RasterOutputColorSpace::AdobeRgb:
+        projected.outputColorSpace = core::client::ExportOutputColorSpace::AdobeRgb;
+        break;
+    case core::export_::RasterOutputColorSpace::DisplayP3:
+        projected.outputColorSpace = core::client::ExportOutputColorSpace::DisplayP3;
+        break;
+    }
+    projected.includeMetadata = options.includeMetadata;
+    return projected;
+}
+
+// 목적: frontend-neutral Export default option을 current raster processing option으로 투영
+// 입력: options: application-wide product default snapshot
+// 출력: 기존 Export dialog control과 processing service가 사용하는 option
+[[nodiscard]] core::export_::RasterExportOptions fromClientOptions(const core::client::ExportRasterOptions& options)
+{
+    core::export_::RasterExportOptions projected;
+    switch (options.format)
+    {
+    case core::client::ExportRasterFormat::Jpeg:
+        projected.format = core::export_::RasterExportFormat::Jpeg;
+        break;
+    case core::client::ExportRasterFormat::Png:
+        projected.format = core::export_::RasterExportFormat::Png;
+        break;
+    case core::client::ExportRasterFormat::Tiff:
+        projected.format = core::export_::RasterExportFormat::Tiff;
+        break;
+    }
+    projected.jpegQuality = options.jpegQuality;
+    projected.pngCompression = options.pngCompression;
+    projected.tiffCompression = options.tiffCompression == core::client::ExportTiffCompression::None
+                                    ? core::export_::TiffCompression::None
+                                    : core::export_::TiffCompression::Lzw;
+    projected.maximumDimension = options.maximumDimension;
+    switch (options.outputColorSpace)
+    {
+    case core::client::ExportOutputColorSpace::Srgb:
+        projected.outputColorSpace = core::export_::RasterOutputColorSpace::Srgb;
+        break;
+    case core::client::ExportOutputColorSpace::AdobeRgb:
+        projected.outputColorSpace = core::export_::RasterOutputColorSpace::AdobeRgb;
+        break;
+    case core::client::ExportOutputColorSpace::DisplayP3:
+        projected.outputColorSpace = core::export_::RasterOutputColorSpace::DisplayP3;
+        break;
+    }
+    projected.includeMetadata = options.includeMetadata;
+    return projected;
+}
 
 // 목적: raster format을 canonical output file 확장자로 변환
 // 입력: format: JPEG, PNG 또는 TIFF format
@@ -60,13 +181,12 @@ namespace
 // 출력: 같은 directory와 base name을 유지한 format 일치 path
 [[nodiscard]] QString pathForFormat(const QString& path, const core::export_::RasterExportFormat format)
 {
-    const QString trimmedPath = path.trimmed();
-    if (trimmedPath.isEmpty())
+    if (path.isEmpty() || path != path.trimmed())
     {
-        return {};
+        return path;
     }
 
-    const QFileInfo info(QDir::cleanPath(trimmedPath));
+    const QFileInfo info(QDir::cleanPath(path));
     const QString extension = extensionForFormat(format);
     if (info.suffix().compare(extension, Qt::CaseInsensitive) == 0 ||
         (format == core::export_::RasterExportFormat::Jpeg &&
@@ -96,41 +216,47 @@ namespace
 }  // namespace
 
 // 목적: 현재 Editor snapshot을 통합 Local/Remote/Auto export 실행 경계에 연결
-// 입력: exportOrchestrator: placement authority, editorState: 현재 photo, settings: 기본값 저장소
+// 입력: Export command/event contract, editorState: 현재 photo, settings: 기본값 저장소
 // 출력: marker 결합을 보조하되 correctness는 Core에 위임하는 raster export dialog
-ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrchestrator,
+ExportDialog::ExportDialog(core::client::IExportClient& exportClient,
+                           core::client::IExportEventSource& exportEventSource,
                            const core::orchestration::EditorState& editorState,
-                           QSettings& settings,
+                           core::client::IWorkerProfileClient& workerProfileClient,
+                           core::client::IExportDefaultsClient& exportDefaultsClient,
                            QWidget* parent)
-    : ExportDialog(exportOrchestrator,
+    : ExportDialog(exportClient,
+                   exportEventSource,
                    QVector<ExportDialogSource>{{editorState.source, {}, editorState.params}},
-                   settings,
+                   workerProfileClient,
+                   exportDefaultsClient,
                    parent)
 {}
 
 // 목적: 선택된 여러 photo source를 editable output 목록과 통합 placement 경계에 연결
-// 입력: exportOrchestrator: placement authority, sources: source별 develop resolution 정보, settings: 기본값 저장소
+// 입력: Export command/event contract, sources: source별 develop resolution 정보, settings: 기본값 저장소
 // 출력: item 단위 scheduling을 제출하고 marker correctness를 Core에 위임하는 dialog
-ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrchestrator,
+ExportDialog::ExportDialog(core::client::IExportClient& exportClient,
+                           core::client::IExportEventSource& exportEventSource,
                            QVector<ExportDialogSource> sources,
-                           QSettings& settings,
+                           core::client::IWorkerProfileClient& workerProfileClient,
+                           core::client::IExportDefaultsClient& exportDefaultsClient,
                            QWidget* parent)
     : QDialog(parent),
-      m_exportOrchestrator(&exportOrchestrator),
+      m_exportClient(&exportClient),
+      m_workerProfileClient(&workerProfileClient),
+      m_exportDefaultsClient(&exportDefaultsClient),
       m_sources(std::move(sources)),
       m_source(m_sources.isEmpty() ? core::types::FileDescriptor{} : m_sources.constFirst().source),
       m_developParams(m_sources.isEmpty() || !m_sources.constFirst().developParams.has_value()
                           ? core::types::DevelopParams{}
                           : *m_sources.constFirst().developParams),
-      m_exportSettings(settings),
       m_sourceLabel(new QLabel(this)),
       m_outputTable(new QTableWidget(this)),
       m_browseButton(new QToolButton(this)),
       m_formatCombo(new QComboBox(this)),
       m_executionCombo(new QComboBox(this)),
       m_remoteSettingsWidget(new QWidget(this)),
-      m_remoteHostEdit(new QLineEdit(m_remoteSettingsWidget)),
-      m_remotePortSpinBox(new QSpinBox(m_remoteSettingsWidget)),
+      m_workerProfileCombo(new QComboBox(m_remoteSettingsWidget)),
       m_jpegQualityLabel(new QLabel(tr("JPEG quality"), this)),
       m_jpegQualitySpinBox(new QSpinBox(this)),
       m_pngCompressionLabel(new QLabel(tr("PNG compression"), this)),
@@ -177,18 +303,15 @@ ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrches
     m_formatCombo->addItem(tr("TIFF"), static_cast<int>(core::export_::RasterExportFormat::Tiff));
 
     m_executionCombo->setObjectName(QStringLiteral("exportExecutionCombo"));
-    m_executionCombo->addItem(tr("Local"), static_cast<int>(settings::ExportExecutionMode::Local));
-    m_executionCombo->addItem(tr("Remote"), static_cast<int>(settings::ExportExecutionMode::Remote));
-    m_executionCombo->addItem(tr("Auto"), static_cast<int>(settings::ExportExecutionMode::Auto));
+    m_executionCombo->addItem(tr("Local"), static_cast<int>(core::client::ExportPlacementPolicy::LocalOnly));
+    m_executionCombo->addItem(tr("Remote"), static_cast<int>(core::client::ExportPlacementPolicy::RemoteOnly));
+    m_executionCombo->addItem(tr("Auto"), static_cast<int>(core::client::ExportPlacementPolicy::Auto));
     m_remoteSettingsWidget->setObjectName(QStringLiteral("exportRemoteSettingsWidget"));
-    m_remoteHostEdit->setObjectName(QStringLiteral("exportRemoteHostEdit"));
-    m_remotePortSpinBox->setObjectName(QStringLiteral("exportRemotePortSpinBox"));
-    m_remotePortSpinBox->setRange(1, 65535);
+    m_workerProfileCombo->setObjectName(QStringLiteral("exportWorkerProfileCombo"));
     auto* remoteSettingsLayout = new QFormLayout(m_remoteSettingsWidget);
     remoteSettingsLayout->setContentsMargins(0, 0, 0, 0);
     remoteSettingsLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    remoteSettingsLayout->addRow(tr("Worker host"), m_remoteHostEdit);
-    remoteSettingsLayout->addRow(tr("Worker port"), m_remotePortSpinBox);
+    remoteSettingsLayout->addRow(tr("Worker profile"), m_workerProfileCombo);
 
     m_jpegQualitySpinBox->setObjectName(QStringLiteral("exportJpegQualitySpinBox"));
     m_jpegQualitySpinBox->setRange(1, 100);
@@ -211,8 +334,24 @@ ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrches
                                      static_cast<int>(core::export_::RasterOutputColorSpace::DisplayP3));
     m_includeMetadataCheckBox->setObjectName(QStringLiteral("exportMetadataCheckBox"));
 
-    const core::export_::RasterExportOptions defaults = m_exportSettings.loadRasterDefaults();
-    m_executionDefaults = m_exportSettings.loadExecutionDefaults();
+    const core::client::WorkerProfileListResult profileResult = m_workerProfileClient->listWorkerProfiles();
+    const bool profileLoadFailed = profileResult.hasError();
+    if (profileResult.hasValue())
+    {
+        m_workerProfiles = profileResult.value();
+    }
+    core::client::ExportDefaultsSnapshot defaultSnapshot;
+    const core::client::ExportDefaultsResult defaultsResult = m_exportDefaultsClient->exportDefaults();
+    if (defaultsResult.hasValue())
+    {
+        defaultSnapshot = defaultsResult.value();
+    }
+    else
+    {
+        LOG_WARN("export", "Unable to load Export defaults: {}", defaultsResult.error().technicalMessage);
+    }
+    const core::export_::RasterExportOptions defaults = fromClientOptions(defaultSnapshot.rasterOptions);
+    m_executionDefaults = defaultSnapshot.execution;
     m_formatCombo->setCurrentIndex(m_formatCombo->findData(static_cast<int>(defaults.format)));
     m_jpegQualitySpinBox->setValue(defaults.jpegQuality);
     m_pngCompressionSpinBox->setValue(defaults.pngCompression);
@@ -238,9 +377,21 @@ ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrches
         m_outputPathEdits.push_back(outputPathEdit);
     }
     m_outputPathEdit = m_outputPathEdits.isEmpty() ? nullptr : m_outputPathEdits.constFirst();
-    m_executionCombo->setCurrentIndex(m_executionCombo->findData(static_cast<int>(m_executionDefaults.mode)));
-    m_remoteHostEdit->setText(m_executionDefaults.remoteHost);
-    m_remotePortSpinBox->setValue(m_executionDefaults.remotePort);
+    m_executionCombo->setCurrentIndex(
+        m_executionCombo->findData(static_cast<int>(m_executionDefaults.placementPolicy)));
+    m_workerProfileCombo->addItem(tr("Select a Worker profile"), QString{});
+    for (const core::client::WorkerProfileSnapshot& profile : m_workerProfiles)
+    {
+        const QString name = QString::fromUtf8(profile.displayName.c_str());
+        m_workerProfileCombo->addItem(profile.enabled ? name : tr("%1 (Disabled)").arg(name),
+                                      QString::fromStdString(profile.id.value));
+    }
+    if (m_executionDefaults.preferredWorkerProfileId.has_value())
+    {
+        const int profileIndex =
+            m_workerProfileCombo->findData(QString::fromStdString(m_executionDefaults.preferredWorkerProfileId->value));
+        m_workerProfileCombo->setCurrentIndex(profileIndex >= 0 ? profileIndex : 0);
+    }
 
     auto* formLayout = new QFormLayout();
     formLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -256,7 +407,7 @@ ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrches
     formLayout->addRow(QString(), m_includeMetadataCheckBox);
 
     m_statusLabel->setObjectName(QStringLiteral("exportStatusLabel"));
-    m_statusLabel->setText(tr("Ready."));
+    m_statusLabel->setText(profileLoadFailed ? tr("Worker profiles are unavailable.") : tr("Ready."));
     m_statusLabel->setWordWrap(true);
     m_elapsedLabel->setObjectName(QStringLiteral("exportElapsedLabel"));
     m_elapsedLabel->setText(tr("Elapsed: 0.0 s"));
@@ -286,22 +437,7 @@ ExportDialog::ExportDialog(core::orchestration::ExportOrchestrator& exportOrches
     connect(m_executionCombo, &QComboBox::currentIndexChanged, this, &ExportDialog::updateExecutionControls);
     connect(m_exportButton, &QPushButton::clicked, this, &ExportDialog::startExport);
     connect(m_cancelButton, &QPushButton::clicked, this, &ExportDialog::cancelOrClose);
-    connect(m_exportOrchestrator,
-            &core::orchestration::ExportOrchestrator::exportProgressed,
-            this,
-            &ExportDialog::handleProgress);
-    connect(m_exportOrchestrator,
-            &core::orchestration::ExportOrchestrator::exportCompleted,
-            this,
-            &ExportDialog::handleCompleted);
-    connect(m_exportOrchestrator,
-            &core::orchestration::ExportOrchestrator::exportFailed,
-            this,
-            &ExportDialog::handleFailed);
-    connect(m_exportOrchestrator,
-            &core::orchestration::ExportOrchestrator::exportCancelled,
-            this,
-            &ExportDialog::handleCancelled);
+    subscribeToExportEvents(exportEventSource);
     updateFormatControls();
     updateExecutionControls();
 }
@@ -313,9 +449,9 @@ ExportDialog::~ExportDialog()
 {
     if (m_activeRequestId.has_value())
     {
-        const core::types::RequestId requestId = *m_activeRequestId;
+        const core::client::ExportRequestId requestId = *m_activeRequestId;
         m_activeRequestId.reset();
-        (void)m_exportOrchestrator->cancelExport(requestId);
+        (void)m_exportClient->cancelExport(requestId);
     }
 }
 
@@ -326,9 +462,9 @@ void ExportDialog::closeEvent(QCloseEvent* event)
 {
     if (m_activeRequestId.has_value())
     {
-        const core::types::RequestId requestId = *m_activeRequestId;
+        const core::client::ExportRequestId requestId = *m_activeRequestId;
         m_activeRequestId.reset();
-        (void)m_exportOrchestrator->cancelExport(requestId);
+        (void)m_exportClient->cancelExport(requestId);
     }
     QDialog::closeEvent(event);
 }
@@ -375,31 +511,47 @@ void ExportDialog::startExport()
         return;
     }
 
-    settings::ExportExecutionDefaults execution = collectExecutionDefaults();
-    if (execution.mode != settings::ExportExecutionMode::Local)
+    core::client::ExportExecutionDefaults execution = collectExecutionDefaults();
+    std::optional<core::client::WorkerProfileSnapshot> workerProfile = selectedWorkerProfile();
+    if (execution.placementPolicy != core::client::ExportPlacementPolicy::LocalOnly)
     {
-        discoverMissingStorageBinding(execution, validatedPath.value());
+        if (execution.placementPolicy == core::client::ExportPlacementPolicy::RemoteOnly &&
+            (!workerProfile.has_value() || !workerProfile->enabled))
+        {
+            m_statusLabel->setText(tr("Export cannot start: select an enabled Worker profile."));
+            return;
+        }
+        if (workerProfile.has_value() && workerProfile->enabled)
+        {
+            discoverMissingStorageBinding(*workerProfile, validatedPath.value());
+        }
     }
 
-    core::orchestration::ExportFileRequest request{
-        m_source,
-        validatedPath.value(),
+    core::client::ExportFileRequest request{
+        toClientSource(m_source),
+        toClientString(validatedPath.value()),
         {},
-        m_developParams,
-        options,
+        core::orchestration::toClientDevelopParams(m_developParams),
+        toClientOptions(options),
     };
-    const core::orchestration::ExportPlacementOptions placement = collectPlacementOptions(execution);
-    const core::orchestration::ExportSubmissionResult submitted =
-        m_exportOrchestrator->submitExport(std::move(request), placement);
+    const core::client::SubmitExportCommand command{core::client::ExportRequest{std::move(request)},
+                                                    collectPlacementOptions(execution)};
+    const core::client::ExportSubmissionResult submitted = m_exportClient->submitExport(command);
     if (submitted.hasError())
     {
-        m_statusLabel->setText(tr("Export cannot start: %1").arg(submitted.error().message));
+        LOG_WARN("export", "GUI Export submission failed: {}", submitted.error().technicalMessage);
+        m_statusLabel->setText(tr("Export cannot start: %1").arg(exportErrorText(submitted.error())));
         return;
     }
 
-    m_exportSettings.saveExecutionDefaults(execution);
+    const core::client::ExportExecutionDefaultsResult savedDefaults =
+        m_exportDefaultsClient->saveExportExecutionDefaults(execution);
+    if (savedDefaults.hasError())
+    {
+        LOG_WARN("export", "Unable to save Export execution defaults: {}", savedDefaults.error().technicalMessage);
+    }
     m_executionDefaults = execution;
-    beginRequest(submitted.value(), execution.mode, options, validatedPath.value());
+    beginRequest(submitted.value().requestId, execution.placementPolicy, options, validatedPath.value());
 }
 
 // 목적: output 표의 여러 행을 하나의 item-list ExportRequest로 제출
@@ -408,10 +560,9 @@ void ExportDialog::startExport()
 void ExportDialog::startItemListExport()
 {
     const core::export_::RasterExportOptions options = collectOptions();
-    QVector<core::orchestration::ExportFileRequest> items;
-    QSet<QString> normalizedOutputPaths;
+    std::vector<core::client::ExportFileRequest> items;
     int existingOutputCount = 0;
-    items.reserve(m_sources.size());
+    items.reserve(static_cast<std::size_t>(m_sources.size()));
 
     for (qsizetype index = 0; index < m_sources.size(); ++index)
     {
@@ -432,22 +583,19 @@ void ExportDialog::startItemListExport()
             return;
         }
 
-        const QString outputIdentity =
-            QDir::cleanPath(QFileInfo(validatedPath.value()).absoluteFilePath()).toCaseFolded();
-        if (normalizedOutputPaths.contains(outputIdentity))
-        {
-            m_statusLabel->setText(tr("Export cannot start: output file paths must be unique."));
-            return;
-        }
-        normalizedOutputPaths.insert(outputIdentity);
         existingOutputCount += QFileInfo::exists(validatedPath.value()) ? 1 : 0;
 
         const ExportDialogSource& source = m_sources.at(index);
-        items.push_back({source.source,
-                         validatedPath.value(),
-                         source.catalogPath,
-                         source.developParams,
-                         options,
+        std::optional<core::client::EditorDevelopParams> developParams;
+        if (source.developParams.has_value())
+        {
+            developParams = core::orchestration::toClientDevelopParams(*source.developParams);
+        }
+        items.push_back({toClientSource(source.source),
+                         toClientString(validatedPath.value()),
+                         toClientString(source.catalogPath),
+                         std::move(developParams),
+                         toClientOptions(options),
                          source.useDefaultDevelopParamsWhenCatalogPhotoMissing});
     }
 
@@ -462,25 +610,41 @@ void ExportDialog::startItemListExport()
         return;
     }
 
-    settings::ExportExecutionDefaults execution = collectExecutionDefaults();
-    if (execution.mode != settings::ExportExecutionMode::Local)
+    core::client::ExportExecutionDefaults execution = collectExecutionDefaults();
+    std::optional<core::client::WorkerProfileSnapshot> workerProfile = selectedWorkerProfile();
+    if (execution.placementPolicy != core::client::ExportPlacementPolicy::LocalOnly)
     {
-        discoverMissingStorageBinding(execution, items.constFirst().outputPath);
+        if (execution.placementPolicy == core::client::ExportPlacementPolicy::RemoteOnly &&
+            (!workerProfile.has_value() || !workerProfile->enabled))
+        {
+            m_statusLabel->setText(tr("Export cannot start: select an enabled Worker profile."));
+            return;
+        }
+        if (workerProfile.has_value() && workerProfile->enabled)
+        {
+            discoverMissingStorageBinding(*workerProfile, fromClientString(items.front().outputLocator));
+        }
     }
 
-    const core::orchestration::ExportPlacementOptions placement = collectPlacementOptions(execution);
-    core::orchestration::ExportItemListRequest request{std::move(items)};
-    const core::orchestration::ExportSubmissionResult submitted =
-        m_exportOrchestrator->submitExport(std::move(request), placement);
+    core::client::ExportItemListRequest request{std::move(items)};
+    const core::client::SubmitExportCommand command{core::client::ExportRequest{std::move(request)},
+                                                    collectPlacementOptions(execution)};
+    const core::client::ExportSubmissionResult submitted = m_exportClient->submitExport(command);
     if (submitted.hasError())
     {
-        m_statusLabel->setText(tr("Export cannot start: %1").arg(submitted.error().message));
+        LOG_WARN("export", "GUI item-list Export submission failed: {}", submitted.error().technicalMessage);
+        m_statusLabel->setText(tr("Export cannot start: %1").arg(exportErrorText(submitted.error())));
         return;
     }
 
-    m_exportSettings.saveExecutionDefaults(execution);
+    const core::client::ExportExecutionDefaultsResult savedDefaults =
+        m_exportDefaultsClient->saveExportExecutionDefaults(execution);
+    if (savedDefaults.hasError())
+    {
+        LOG_WARN("export", "Unable to save Export execution defaults: {}", savedDefaults.error().technicalMessage);
+    }
     m_executionDefaults = execution;
-    beginRequest(submitted.value(), execution.mode, options, {});
+    beginRequest(submitted.value().requestId, execution.placementPolicy, options, {});
 }
 
 // 목적: active export를 취소하거나 terminal dialog를 닫음
@@ -496,7 +660,7 @@ void ExportDialog::cancelOrClose()
 
     m_cancelButton->setEnabled(false);
     m_statusLabel->setText(tr("Cancelling export..."));
-    (void)m_exportOrchestrator->cancelExport(*m_activeRequestId);
+    (void)m_exportClient->cancelExport(*m_activeRequestId);
 }
 
 // 목적: 현재 format filter를 사용해 output file 선택 dialog 표시
@@ -559,12 +723,52 @@ void ExportDialog::updateFormatControls()
 // 출력: Remote 또는 Auto mode에서 endpoint editor 표시
 void ExportDialog::updateExecutionControls()
 {
-    m_remoteSettingsWidget->setVisible(selectedExecutionMode() != settings::ExportExecutionMode::Local);
+    m_remoteSettingsWidget->setVisible(selectedPlacementPolicy() != core::client::ExportPlacementPolicy::LocalOnly);
+}
+
+// 목적: Qt-free Export event source를 current dialog request presentation에 연결
+// 입력: eventSource: application-scoped Export lifecycle source
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void ExportDialog::subscribeToExportEvents(core::client::IExportEventSource& eventSource)
+{
+    const core::client::ExportSubscriptionResult subscribed =
+        eventSource.subscribeToExports([this](const core::client::ExportEvent& event) { handleExportEvent(event); });
+    if (subscribed.hasError())
+    {
+        LOG_ERROR("export", "Unable to subscribe to Export events: {}", subscribed.error().technicalMessage);
+        m_statusLabel->setText(tr("Export status updates are unavailable."));
+        m_exportButton->setEnabled(false);
+        return;
+    }
+    m_exportSubscription = subscribed.value();
+}
+
+// 목적: immutable Export event에서 current request progress와 exact terminal만 처리
+// 입력: event: initial snapshot 또는 accepted/progress/completed/failed/cancelled transition
+// 출력: matching request presentation 갱신
+void ExportDialog::handleExportEvent(const core::client::ExportEvent& event)
+{
+    if (event.progress.has_value())
+    {
+        handleProgress(*event.progress);
+    }
+    if (event.completed.has_value())
+    {
+        handleCompleted(*event.completed);
+    }
+    if (event.failed.has_value())
+    {
+        handleFailed(*event.failed);
+    }
+    if (event.cancelled.has_value())
+    {
+        handleCancelled(event.cancelled->requestId);
+    }
 }
 
 // 목적: widget 값을 Core raster export option으로 조립
 // 입력: 없음
-// 출력: ExportOrchestrator validation에 전달할 RasterExportOptions
+// 출력: Export client command로 투영할 RasterExportOptions
 core::export_::RasterExportOptions ExportDialog::collectOptions() const
 {
     core::export_::RasterExportOptions options;
@@ -580,33 +784,29 @@ core::export_::RasterExportOptions ExportDialog::collectOptions() const
     return options;
 }
 
-// 목적: widget endpoint와 기존 내부 storage 결합을 저장 가능한 실행 기본값으로 조립
+// 목적: widget 값을 저장 가능한 placement mode와 preferred Worker identity로 조립
 // 입력: 없음
 // 출력: 현재 ExportExecutionDefaults snapshot
-settings::ExportExecutionDefaults ExportDialog::collectExecutionDefaults() const
+core::client::ExportExecutionDefaults ExportDialog::collectExecutionDefaults() const
 {
-    settings::ExportExecutionDefaults defaults = m_executionDefaults;
-    const QString host = m_remoteHostEdit->text().trimmed();
-    const int port = m_remotePortSpinBox->value();
-    if (host.compare(defaults.remoteHost, Qt::CaseInsensitive) != 0 || port != defaults.remotePort)
+    core::client::ExportExecutionDefaults defaults;
+    defaults.placementPolicy = selectedPlacementPolicy();
+    const QString selectedId = m_workerProfileCombo->currentData().toString();
+    if (!selectedId.isEmpty())
     {
-        defaults.expectedSourceStorageId.clear();
-        defaults.expectedOutputStorageId.clear();
+        defaults.preferredWorkerProfileId = core::client::WorkerProfileId{selectedId.toStdString()};
     }
-    defaults.mode = selectedExecutionMode();
-    defaults.remoteHost = host;
-    defaults.remotePort = port;
     return defaults;
 }
 
-// 목적: 비어 있는 endpoint storage binding을 현재 source/output marker로 best-effort 보완
-// 입력: defaults: endpoint 결합 설정, outputPath: Desktop absolute output path
-// 출력: 두 marker를 모두 찾은 경우에만 expected storage ID 갱신
-void ExportDialog::discoverMissingStorageBinding(settings::ExportExecutionDefaults& defaults,
+// 목적: 비어 있는 profile storage binding을 현재 source/output marker로 best-effort 보완
+// 입력: profile: 선택된 Worker snapshot, outputPath: Desktop absolute output path
+// 출력: 두 marker를 찾으면 profile 저장소와 현재 snapshot 갱신
+void ExportDialog::discoverMissingStorageBinding(core::client::WorkerProfileSnapshot& profile,
                                                  const QString& outputPath) const
 {
-    if (!QUuid::fromString(defaults.expectedSourceStorageId).isNull() &&
-        !QUuid::fromString(defaults.expectedOutputStorageId).isNull())
+    if (!QUuid::fromString(QString::fromStdString(profile.expectedSourceStorageId)).isNull() &&
+        !QUuid::fromString(QString::fromStdString(profile.expectedOutputStorageId)).isNull())
     {
         return;
     }
@@ -617,46 +817,66 @@ void ExportDialog::discoverMissingStorageBinding(settings::ExportExecutionDefaul
         worker::client::SharedStorageLocator::locateOutput(outputPath);
     if (sourceStorage.hasValue() && outputStorage.hasValue())
     {
-        defaults.expectedSourceStorageId = sourceStorage.value().storageId.toString(QUuid::WithoutBraces);
-        defaults.expectedOutputStorageId = outputStorage.value().storageId.toString(QUuid::WithoutBraces);
+        profile.expectedSourceStorageId = sourceStorage.value().storageId.toString(QUuid::WithoutBraces).toStdString();
+        profile.expectedOutputStorageId = outputStorage.value().storageId.toString(QUuid::WithoutBraces).toStdString();
+        const core::client::WorkerProfileResult updated =
+            m_workerProfileClient->updateWorkerProfile(core::client::UpdateWorkerProfileCommand{
+                profile.id,
+                profile.displayName,
+                profile.host,
+                profile.port,
+                profile.enabled,
+                profile.expectedSourceStorageId,
+                profile.expectedOutputStorageId,
+            });
+        if (updated.hasValue())
+        {
+            profile = updated.value();
+        }
     }
 }
 
-// 목적: UI 실행 mode와 endpoint 설정을 Core placement option으로 변환
-// 입력: defaults: 저장 가능한 mode/endpoint/storage snapshot
-// 출력: LocalOnly, RemoteOnly 또는 Auto placement 계약
-core::orchestration::ExportPlacementOptions ExportDialog::collectPlacementOptions(
-    const settings::ExportExecutionDefaults& defaults) const
+// 목적: UI 실행 mode와 preferred Worker identity를 Qt-free placement option으로 변환
+// 입력: defaults: 저장 가능한 mode와 optional profile identity
+// 출력: endpoint detail을 포함하지 않는 LocalOnly, RemoteOnly 또는 Auto placement 계약
+core::client::ExportPlacementOptions ExportDialog::collectPlacementOptions(
+    const core::client::ExportExecutionDefaults& defaults) const
 {
-    core::orchestration::ExportPlacementOptions placement;
-    switch (defaults.mode)
+    core::client::ExportPlacementOptions placement;
+    placement.workerProfileId = defaults.preferredWorkerProfileId;
+    switch (defaults.placementPolicy)
     {
-    case settings::ExportExecutionMode::Local:
-        placement.policy = core::orchestration::ExportPlacementPolicy::LocalOnly;
-        return placement;
-    case settings::ExportExecutionMode::Remote:
-        placement.policy = core::orchestration::ExportPlacementPolicy::RemoteOnly;
+    case core::client::ExportPlacementPolicy::LocalOnly:
+        placement.policy = core::client::ExportPlacementPolicy::LocalOnly;
+        placement.workerProfileId.reset();
         break;
-    case settings::ExportExecutionMode::Auto:
-        placement.policy = core::orchestration::ExportPlacementPolicy::Auto;
+    case core::client::ExportPlacementPolicy::RemoteOnly:
+        placement.policy = core::client::ExportPlacementPolicy::RemoteOnly;
+        break;
+    case core::client::ExportPlacementPolicy::Auto:
+        placement.policy = core::client::ExportPlacementPolicy::Auto;
         break;
     }
-
-    placement.remoteTarget = core::orchestration::ExportRemoteTarget{
-        defaults.remoteHost,
-        static_cast<std::uint16_t>(defaults.remotePort),
-        defaults.expectedSourceStorageId,
-        defaults.expectedOutputStorageId,
-    };
     return placement;
+}
+
+// 목적: combo에서 현재 선택된 stable identity를 Worker profile snapshot으로 해석
+// 입력: 없음
+// 출력: 저장된 profile과 일치하면 snapshot, placeholder·missing이면 nullopt
+std::optional<core::client::WorkerProfileSnapshot> ExportDialog::selectedWorkerProfile() const
+{
+    const std::string selectedId = m_workerProfileCombo->currentData().toString().toStdString();
+    const auto match = std::ranges::find(
+        m_workerProfiles, core::client::WorkerProfileId{selectedId}, &core::client::WorkerProfileSnapshot::id);
+    return match == m_workerProfiles.end() ? std::nullopt : std::optional<core::client::WorkerProfileSnapshot>{*match};
 }
 
 // 목적: execution combo의 현재 선택을 typed mode로 변환
 // 입력: 없음
 // 출력: Local, Remote 또는 Auto 실행 mode
-settings::ExportExecutionMode ExportDialog::selectedExecutionMode() const
+core::client::ExportPlacementPolicy ExportDialog::selectedPlacementPolicy() const
 {
-    return static_cast<settings::ExportExecutionMode>(m_executionCombo->currentData().toInt());
+    return static_cast<core::client::ExportPlacementPolicy>(m_executionCombo->currentData().toInt());
 }
 
 // 목적: export 실행 여부에 따라 output option control과 action 상태 갱신
@@ -680,8 +900,8 @@ void ExportDialog::setOptionControlsEnabled(const bool enabled)
 // 목적: accepted request의 elapsed timer와 running presentation 시작
 // 입력: requestId: 선택 executor가 발급한 identity, mode/options/outputPath: terminal 처리용 snapshot
 // 출력: active request 추적과 Running 상태 표시
-void ExportDialog::beginRequest(const core::types::RequestId requestId,
-                                const settings::ExportExecutionMode mode,
+void ExportDialog::beginRequest(const core::client::ExportRequestId requestId,
+                                const core::client::ExportPlacementPolicy placementPolicy,
                                 core::export_::RasterExportOptions options,
                                 QString outputPath)
 {
@@ -694,15 +914,15 @@ void ExportDialog::beginRequest(const core::types::RequestId requestId,
     m_exportButton->setEnabled(false);
     m_cancelButton->setText(tr("Cancel"));
     m_cancelButton->setEnabled(true);
-    switch (mode)
+    switch (placementPolicy)
     {
-    case settings::ExportExecutionMode::Local:
+    case core::client::ExportPlacementPolicy::LocalOnly:
         m_statusLabel->setText(tr("Running local export..."));
         break;
-    case settings::ExportExecutionMode::Remote:
+    case core::client::ExportPlacementPolicy::RemoteOnly:
         m_statusLabel->setText(tr("Running remote export..."));
         break;
-    case settings::ExportExecutionMode::Auto:
+    case core::client::ExportPlacementPolicy::Auto:
         m_statusLabel->setText(tr("Running automatic export..."));
         break;
     }
@@ -726,7 +946,7 @@ void ExportDialog::finishRequest(const bool allowRetry)
 // 목적: current request progress를 사용자용 running 상태에 반영
 // 입력: progress: request identity와 item 누적 상태
 // 출력: 일치하는 request의 status text 갱신
-void ExportDialog::handleProgress(const core::orchestration::ExportProgress& progress)
+void ExportDialog::handleProgress(const core::client::ExportProgress& progress)
 {
     if (!m_activeRequestId.has_value() || progress.requestId != *m_activeRequestId)
     {
@@ -739,19 +959,24 @@ void ExportDialog::handleProgress(const core::orchestration::ExportProgress& pro
 // 목적: current request item report를 성공 또는 실패 presentation으로 변환
 // 입력: result: request identity와 item별 terminal report
 // 출력: 성공 설정 저장 또는 실패 상세 표시
-void ExportDialog::handleCompleted(const core::orchestration::ExportResult& result)
+void ExportDialog::handleCompleted(const core::client::ExportResult& result)
 {
     if (!m_activeRequestId.has_value() || result.requestId != *m_activeRequestId)
     {
         return;
     }
 
-    if (result.report.items.size() == 1 && result.report.items.constFirst().succeeded)
+    if (result.report.items.size() == 1 && result.report.items.front().succeeded)
     {
-        const QString outputPath = result.report.items.constFirst().outputPath.isEmpty()
+        const QString outputPath = result.report.items.front().outputLocator.empty()
                                        ? m_submittedOutputPath
-                                       : result.report.items.constFirst().outputPath;
-        m_exportSettings.saveRasterDefaults(m_submittedOptions);
+                                       : fromClientString(result.report.items.front().outputLocator);
+        const core::client::ExportRasterDefaultsResult savedDefaults =
+            m_exportDefaultsClient->saveRasterExportDefaults(toClientOptions(m_submittedOptions));
+        if (savedDefaults.hasError())
+        {
+            LOG_WARN("export", "Unable to save raster Export defaults: {}", savedDefaults.error().technicalMessage);
+        }
         m_statusLabel->setText(tr("Export completed: %1").arg(outputPath));
         finishRequest(false);
         return;
@@ -761,18 +986,23 @@ void ExportDialog::handleCompleted(const core::orchestration::ExportResult& resu
     {
         if (result.report.failedCount == 0)
         {
-            m_exportSettings.saveRasterDefaults(m_submittedOptions);
+            const core::client::ExportRasterDefaultsResult savedDefaults =
+                m_exportDefaultsClient->saveRasterExportDefaults(toClientOptions(m_submittedOptions));
+            if (savedDefaults.hasError())
+            {
+                LOG_WARN("export", "Unable to save raster Export defaults: {}", savedDefaults.error().technicalMessage);
+            }
             m_statusLabel->setText(tr("Export completed: %1 files.").arg(result.report.succeededCount));
             finishRequest(false);
             return;
         }
 
         QString firstError;
-        for (const core::orchestration::ExportItemResult& item : result.report.items)
+        for (const core::client::ExportItemResult& item : result.report.items)
         {
-            if (!item.succeeded && !item.error.message.isEmpty())
+            if (!item.succeeded && item.error.has_value())
             {
-                firstError = item.error.message;
+                firstError = exportErrorText(*item.error, item.failureKind);
                 break;
             }
         }
@@ -788,9 +1018,9 @@ void ExportDialog::handleCompleted(const core::orchestration::ExportResult& resu
     }
 
     QString errorMessage = tr("Export did not produce a successful output file.");
-    if (!result.report.items.isEmpty() && !result.report.items.constFirst().error.message.isEmpty())
+    if (!result.report.items.empty() && result.report.items.front().error.has_value())
     {
-        errorMessage = result.report.items.constFirst().error.message;
+        errorMessage = exportErrorText(*result.report.items.front().error, result.report.items.front().failureKind);
     }
     m_statusLabel->setText(tr("Export failed: %1").arg(errorMessage));
     finishRequest(true);
@@ -799,21 +1029,22 @@ void ExportDialog::handleCompleted(const core::orchestration::ExportResult& resu
 // 목적: pipeline-level current request 실패를 사용자에게 표시
 // 입력: issue: request identity와 structured error
 // 출력: retry 가능한 Failed 상태 표시
-void ExportDialog::handleFailed(const core::orchestration::ExportIssue& issue)
+void ExportDialog::handleFailed(const core::client::ExportIssue& issue)
 {
     if (!m_activeRequestId.has_value() || issue.requestId != *m_activeRequestId)
     {
         return;
     }
 
-    m_statusLabel->setText(tr("Export failed: %1").arg(issue.error.message));
+    LOG_WARN("export", "GUI Export request failed: {}", issue.error.technicalMessage);
+    m_statusLabel->setText(tr("Export failed: %1").arg(exportErrorText(issue.error)));
     finishRequest(true);
 }
 
 // 목적: current request cancellation terminal event를 사용자에게 표시
 // 입력: requestId: 취소된 request identity
 // 출력: retry 가능한 Cancelled 상태 표시
-void ExportDialog::handleCancelled(const core::types::RequestId requestId)
+void ExportDialog::handleCancelled(const core::client::ExportRequestId requestId)
 {
     if (!m_activeRequestId.has_value() || requestId != *m_activeRequestId)
     {
@@ -822,6 +1053,50 @@ void ExportDialog::handleCancelled(const core::types::RequestId requestId)
 
     m_statusLabel->setText(tr("Export cancelled."));
     finishRequest(true);
+}
+
+// 목적: common ClientError와 Export domain failure를 localized presentation으로 변환
+// 입력: error: diagnostic-only detail을 가진 common error, failureKind: optional Export domain 의미
+// 출력: technicalMessage를 직접 노출하지 않는 사용자용 문자열
+QString ExportDialog::exportErrorText(const core::client::ClientError& error,
+                                      const core::client::ExportFailureKind failureKind) const
+{
+    switch (failureKind)
+    {
+    case core::client::ExportFailureKind::Eligibility:
+        return tr("The selected source or destination is not eligible for this export target.");
+    case core::client::ExportFailureKind::DispatchExhausted:
+        return tr("The Worker could not accept this export after the allowed attempts.");
+    case core::client::ExportFailureKind::Ambiguous:
+        return tr("The Worker result is uncertain. Verify the output before trying again.");
+    case core::client::ExportFailureKind::Execution:
+    case core::client::ExportFailureKind::None:
+        break;
+    }
+
+    switch (error.code)
+    {
+    case core::client::ClientErrorCode::InvalidArgument:
+        return tr("Check the export options and destination.");
+    case core::client::ClientErrorCode::NotFound:
+        return tr("The source, destination, or selected Worker profile is no longer available.");
+    case core::client::ClientErrorCode::PermissionDenied:
+        return tr("Flexraw cannot access the selected source or destination.");
+    case core::client::ClientErrorCode::UnsupportedFormat:
+        return tr("The selected input or output format is not supported.");
+    case core::client::ClientErrorCode::DecodeFailed:
+        return tr("The source image could not be decoded.");
+    case core::client::ClientErrorCode::DatabaseError:
+        return tr("The Catalog state required for export could not be read.");
+    case core::client::ClientErrorCode::Conflict:
+        return tr("The export state changed. Refresh it and try again.");
+    case core::client::ClientErrorCode::Cancelled:
+        return tr("The export was cancelled.");
+    case core::client::ClientErrorCode::ThumbnailUnavailable:
+    case core::client::ClientErrorCode::Unknown:
+        return tr("The export could not be completed.");
+    }
+    return tr("The export could not be completed.");
 }
 
 // 목적: active request 경과시간 label 갱신

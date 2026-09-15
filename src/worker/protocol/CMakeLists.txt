@@ -7,6 +7,8 @@ target_sources(flexraw_worker_protocol PRIVATE
     frame_codec.h
     frame_parser.cpp
     frame_parser.h
+    health_payload_codec.cpp
+    health_payload_codec.h
     job_id.h
     protocol_contracts.h
 )

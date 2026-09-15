@@ -1,7 +1,10 @@
 #include "export.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>
 #include <limits>
+#include <system_error>
 #include <utility>
 
 #include <QByteArray>
@@ -65,10 +68,11 @@ constexpr qsizetype CopyChunkSize = 64 * 1024;
 // 출력: 정규화된 절대 경로 또는 구조화된 오류
 [[nodiscard]] types::Result<QString, types::CoreError> validateOutputPath(const QString& outputPath)
 {
-    if (outputPath.trimmed().isEmpty())
+    if (outputPath.isEmpty() || outputPath != outputPath.trimmed())
     {
         return types::Result<QString, types::CoreError>::failure(
-            makeError(types::ErrorCode::InvalidArgument, QStringLiteral("Raster export path is empty.")));
+            makeError(types::ErrorCode::InvalidArgument,
+                      QStringLiteral("Raster export path is empty or contains outer whitespace.")));
     }
 
     const QFileInfo outputInfo(QDir::cleanPath(outputPath));
@@ -100,6 +104,31 @@ constexpr qsizetype CopyChunkSize = 64 * 1024;
     }
 
     return types::Result<QString, types::CoreError>::success(outputInfo.absoluteFilePath());
+}
+
+// 목적: 존재하지 않는 leaf도 canonical parent 아래의 안정적인 절대 비교 key로 정규화
+// 입력: fileInfo: 비교할 file system entry
+// 출력: separator와 parent alias를 정규화하고 leaf case는 보존한 absolute path key
+[[nodiscard]] QString normalizedExportPathKey(const QFileInfo& fileInfo)
+{
+    std::error_code error;
+    const std::filesystem::path weaklyCanonicalPath =
+        std::filesystem::weakly_canonical(fileInfo.filesystemAbsoluteFilePath(), error);
+    const QFileInfo comparableInfo = error ? fileInfo : QFileInfo(weaklyCanonicalPath);
+    return QDir::cleanPath(QDir::fromNativeSeparators(comparableInfo.absoluteFilePath()));
+}
+
+// 목적: source와 output이 같은 file을 가리키는 경우 원본 보존용 Conflict 생성
+// 입력: sourcePath/outputPath: export 입력과 최종 출력 경로
+// 출력: 충돌하지 않으면 성공, 같은 file이면 Conflict
+[[nodiscard]] RasterExportResult validateDistinctSourceAndOutput(const QString& sourcePath, const QString& outputPath)
+{
+    if (sourcePath.trimmed().isEmpty() || !exportPathsReferToSameFile(sourcePath, outputPath))
+    {
+        return RasterExportResult::success({});
+    }
+    return RasterExportResult::failure(makeError(
+        types::ErrorCode::Conflict, QStringLiteral("Raster export source and output paths refer to the same file.")));
 }
 
 // 목적: 선택한 raster format에 적용되는 인코딩 옵션 범위 검증
@@ -367,11 +396,25 @@ void configureWriter(QImageWriter& writer, const RasterExportOptions& options)
     return format == RasterExportFormat::Jpeg || format == RasterExportFormat::Tiff;
 }
 
+// 목적: 복사한 EXIF를 최종 raster pixel artifact와 일치하도록 정규화
+// 입력: exifData: 원본에서 복사한 EXIF 묶음, outputSize: 실제 encoded pixel 크기
+// 출력: orientation/dimension 갱신과 source thumbnail 제거가 반영된 EXIF 묶음
+void normalizeExifForRasterOutput(Exiv2::ExifData& exifData, const QSize& outputSize)
+{
+    Exiv2::ExifThumb(exifData).erase();
+    exifData["Exif.Image.Orientation"] = static_cast<std::uint16_t>(1);
+    exifData["Exif.Image.ImageWidth"] = static_cast<std::uint32_t>(outputSize.width());
+    exifData["Exif.Image.ImageLength"] = static_cast<std::uint32_t>(outputSize.height());
+    exifData["Exif.Photo.PixelXDimension"] = static_cast<std::uint32_t>(outputSize.width());
+    exifData["Exif.Photo.PixelYDimension"] = static_cast<std::uint32_t>(outputSize.height());
+}
+
 // 목적: 임시 raster 파일에 원본 EXIF metadata를 복사
-// 입력: sourcePath: EXIF를 읽을 원본 경로, outputPath: EXIF를 쓸 임시 출력 경로, includeMetadata: 복사 여부
-// 출력: 성공 표식 또는 Exiv2 metadata 읽기/쓰기 실패 정보
+// 입력: sourcePath: EXIF 원본, outputPath: 임시 출력, outputSize: 최종 pixel 크기, includeMetadata: 복사 여부
+// 출력: pixel 방향에 맞춰 Orientation을 정규화한 성공 표식 또는 Exiv2 metadata 읽기/쓰기 실패 정보
 [[nodiscard]] RasterExportResult copyExifMetadata(const QString& sourcePath,
                                                   const QString& outputPath,
+                                                  const QSize& outputSize,
                                                   const bool includeMetadata)
 {
     if (!includeMetadata || sourcePath.isEmpty())
@@ -395,6 +438,8 @@ void configureWriter(QImageWriter& writer, const RasterExportOptions& options)
     {
         return RasterExportResult::success({});
     }
+
+    normalizeExifForRasterOutput(sourceExifData, outputSize);
 
     try
     {
@@ -497,6 +542,34 @@ RasterExportPathResult validateRasterExportPath(const QString& outputPath)
     return validateOutputPath(outputPath);
 }
 
+// 목적: 두 export 경로가 정규화 또는 실제 file identity 기준으로 같은 대상을 가리키는지 판정
+// 입력: firstPath/secondPath: 비교할 source 또는 output 경로
+// 출력: 같은 경로, symbolic link 또는 hard link 대상이면 true
+bool exportPathsReferToSameFile(const QString& firstPath, const QString& secondPath)
+{
+    if (firstPath.isEmpty() || secondPath.isEmpty() || firstPath != firstPath.trimmed() ||
+        secondPath != secondPath.trimmed())
+    {
+        return false;
+    }
+
+    const QFileInfo firstInfo(QDir::cleanPath(firstPath));
+    const QFileInfo secondInfo(QDir::cleanPath(secondPath));
+    if (normalizedExportPathKey(firstInfo) == normalizedExportPathKey(secondInfo))
+    {
+        return true;
+    }
+    if (!firstInfo.exists() || !secondInfo.exists())
+    {
+        return false;
+    }
+
+    std::error_code error;
+    const bool equivalent = std::filesystem::equivalent(
+        firstInfo.filesystemAbsoluteFilePath(), secondInfo.filesystemAbsoluteFilePath(), error);
+    return !error && equivalent;
+}
+
 // 목적: LibRaw decode bitmap을 raster export용 독립 sRGB QImage로 변환
 // 입력: rawImage: LibRaw가 반환한 bitmap과 남은 orientation
 // 출력: color tag와 orientation이 적용된 image 또는 bitmap 구조 오류
@@ -537,6 +610,12 @@ RasterExportResult writeRasterImage(const QImage& image,
     if (validatedPath.hasError())
     {
         return RasterExportResult::failure(validatedPath.error());
+    }
+
+    const RasterExportResult distinctPaths = validateDistinctSourceAndOutput(metadataSourcePath, validatedPath.value());
+    if (distinctPaths.hasError())
+    {
+        return distinctPaths;
     }
 
     const QFileInfo outputInfo(validatedPath.value());
@@ -581,7 +660,7 @@ RasterExportResult writeRasterImage(const QImage& image,
     encodedFile.close();
     const RasterExportResult metadataResult =
         supportsExifMetadata(options.format)
-            ? copyExifMetadata(metadataSourcePath, encodedFile.fileName(), options.includeMetadata)
+            ? copyExifMetadata(metadataSourcePath, encodedFile.fileName(), outputImage.size(), options.includeMetadata)
             : RasterExportResult::success({});
     if (metadataResult.hasError())
     {
@@ -614,6 +693,12 @@ RasterExportResult writeRawImage(const QString& rawPath,
     if (validatedOptions.hasError())
     {
         return validatedOptions;
+    }
+
+    const RasterExportResult distinctPaths = validateDistinctSourceAndOutput(rawPath, outputPath);
+    if (distinctPaths.hasError())
+    {
+        return distinctPaths;
     }
 
     const raw::RawPreviewImageResult decodedRaw = raw::decodeRawPreviewImage(rawPath);

@@ -1,15 +1,11 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 
-#include <QString>
-
 #include "job_status_contracts.h"
-#include "render_contracts.h"
-#include "render_job_identity.h"
 #include "render_job_runner.h"
+#include "render_worker_runtime_port.h"
 #include "runtime_observation_contracts.h"
 
 namespace flexraw::worker::runtime
@@ -22,30 +18,12 @@ struct ScheduledRenderJob
     core::render::ResolvedRenderRequest request;
 };
 
-struct RenderJobOutcome
-{
-    RenderJobKey key;
-    QString outputRelativePath;
-    RenderJobExecutionResult result;
-};
-
-using RenderJobCompletion = std::function<void(RenderJobOutcome)>;
-
-enum class SubmitStatus
-{
-    Accepted,
-    InvalidJobId,
-    DuplicateJobId,
-    QueueFull,
-    ShuttingDown,
-};
-
 class JobScheduler final
 {
 public:
     // 목적: 명시된 running 상한과 bounded waiting queue를 가진 scheduler 생성
-    // 입력: runner: 동기 runner, maxConcurrency/queueCapacity: resource 한도, statusCallback: optional lifecycle sink
-    // 출력: 독립 QThreadPool을 소유한 scheduler; maxConcurrency가 0이면 invalid_argument
+    // 입력: 동기 runner, resource 한도와 제한된 직렬 status callback
+    // 출력: 독립 QThreadPool scheduler 또는 0 concurrency invalid_argument
     JobScheduler(const IRenderJobRunner& runner,
                  std::uint32_t maxConcurrency,
                  std::uint64_t queueCapacity,
@@ -60,12 +38,12 @@ public:
     JobScheduler& operator=(const JobScheduler&) = delete;
 
     // 목적: job을 즉시 실행하거나 bounded queue에 접수
-    // 입력: job: non-zero session/JobId와 resolved request, completion: 임의 thread 호출을 허용하는 terminal callback
+    // 입력: non-zero identity job과 임의 thread terminal completion
     // 출력: 접수 여부와 duplicate/full/shutdown 거절 사유
     [[nodiscard]] SubmitStatus submit(ScheduledRenderJob job, RenderJobCompletion completion);
 
     // 목적: queued 또는 running job에 cooperative cancellation 요청
-    // 입력: key: session과 wire JobId를 결합한 active identity
+    // 입력: key: WorkerSessionId와 Runtime-owned RenderJobId를 결합한 active identity
     // 출력: active job을 찾아 취소했으면 true
     [[nodiscard]] bool cancel(RenderJobKey key);
 

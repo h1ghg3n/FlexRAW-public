@@ -6,6 +6,7 @@
 #include <QString>
 
 #include "catalog_contracts.h"
+#include "catalog_startup_settings_client.h"
 #include "error.h"
 
 class QSettings;
@@ -37,15 +38,22 @@ struct ManagedCatalogStartupState
 class ManagedCatalogSession final
 {
 public:
-    // 목적: OS 표준 application data와 기본 QSettings를 사용하는 Managed Catalog session 시작
-    // 입력: 없음
+    // 목적: 주입된 Catalog owner와 application startup settings를 사용하는 Managed Catalog session 시작
+    // 입력: orchestrator: 이 session보다 오래 살아야 하는 Catalog resource owner,
+    //       startupSettingsClient: startup 시점 snapshot을 제공하는 settings contract
     // 출력: startup recovery가 완료된 production catalog session
-    ManagedCatalogSession();
+    ManagedCatalogSession(core::orchestration::CatalogOrchestrator& orchestrator,
+                          core::client::ICatalogStartupSettingsClient& startupSettingsClient);
 
-    // 목적: 주입된 settings와 기본 catalog 경로로 test 가능한 Managed Catalog session 시작
-    // 입력: settings: session이 소유할 설정 저장소, defaultCatalogPath: fallback catalog 파일 경로
+    // 목적: 주입된 Catalog owner, settings와 resolved startup 값으로 test 가능한 Managed Catalog session 시작
+    // 입력: orchestrator: session보다 오래 살아야 하는 owner, settings: 소유할 설정,
+    //       defaultCatalogPath: fallback 경로, startupBehavior: startup Catalog 선택 정책
     // 출력: startup recovery가 완료된 catalog session
-    ManagedCatalogSession(std::unique_ptr<QSettings> settings, QString defaultCatalogPath);
+    ManagedCatalogSession(
+        core::orchestration::CatalogOrchestrator& orchestrator,
+        std::unique_ptr<QSettings> settings,
+        QString defaultCatalogPath,
+        core::client::CatalogStartupBehavior startupBehavior = core::client::CatalogStartupBehavior::ReopenLastActive);
 
     // 목적: 현재 active Catalog를 다음 startup 대상으로 기록한 뒤 session resource 정리
     // 입력: 없음
@@ -54,11 +62,6 @@ public:
 
     ManagedCatalogSession(const ManagedCatalogSession&) = delete;
     ManagedCatalogSession& operator=(const ManagedCatalogSession&) = delete;
-
-    // 목적: session이 소유한 CatalogOrchestrator를 downstream consumer에 주입
-    // 입력: 없음
-    // 출력: ManagedCatalogSession lifetime 동안 유효한 Orchestrator 참조
-    [[nodiscard]] core::orchestration::CatalogOrchestrator& orchestrator() noexcept;
 
     // 목적: startup open, fallback과 fatal 상태를 immutable 값으로 조회
     // 입력: 없음
@@ -91,9 +94,11 @@ private:
     // 출력: 열린 session이 있으면 last-active path가 settings에 저장됨
     void rememberActiveCatalog();
 
+    core::orchestration::CatalogOrchestrator& m_orchestrator;
     std::unique_ptr<QSettings> m_settings;
     QString m_defaultCatalogPath;
-    std::unique_ptr<core::orchestration::CatalogOrchestrator> m_orchestrator;
+    core::client::CatalogStartupBehavior m_startupBehavior{core::client::CatalogStartupBehavior::ReopenLastActive};
+    std::optional<core::types::CoreError> m_startupConfigurationError;
     ManagedCatalogStartupState m_startupState;
 };
 

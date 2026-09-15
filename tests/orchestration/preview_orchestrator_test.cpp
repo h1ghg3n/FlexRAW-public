@@ -1,5 +1,6 @@
 #include <atomic>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -114,6 +115,51 @@ public:
         return PreviewPipelineResult::success({image, histogram, clipping, {}});
     }
 };
+
+class DegradedPreviewPipeline final : public IPreviewPipeline
+{
+public:
+    // 목적: 지정된 progressive tier만 실패시키는 deterministic pipeline 구성
+    // 입력: failedTier: 구조화된 오류를 반환할 tier
+    // 출력: 다른 tier는 usable frame을 반환하는 test pipeline
+    explicit DegradedPreviewPipeline(PreviewTier failedTier) : m_failedTier(failedTier) {}
+
+    // 목적: 한 tier 실패 뒤 남은 tier의 degraded success 의미 검증
+    // 입력: request/cancellationToken: 미사용, tier: 성공 또는 실패를 결정할 단계
+    // 출력: 지정 tier 오류 또는 tier별 color frame
+    [[nodiscard]] PreviewPipelineResult render(const PreviewRequest&,
+                                               PreviewTier tier,
+                                               const types::CancellationToken&) override
+    {
+        if (tier == m_failedTier)
+        {
+            return PreviewPipelineResult::failure(
+                {types::ErrorCode::DecodeFailed, QStringLiteral("Intentional degraded preview failure.")});
+        }
+
+        QImage image(1, 1, QImage::Format_RGBA8888);
+        image.fill(tier == PreviewTier::Thumbnail ? Qt::red : Qt::green);
+        develop::ImageHistogram histogram;
+        histogram.pixelCount = 1;
+        develop::ClippingSummary clipping;
+        clipping.pixelCount = 1;
+        return PreviewPipelineResult::success({image, histogram, clipping, {}});
+    }
+
+private:
+    PreviewTier m_failedTier;
+};
+
+class PreviewDegradedSuccessTest : public testing::TestWithParam<PreviewTier>
+{};
+
+// 목적: parameterized degraded Preview 회귀를 stable CTest 이름으로 표시
+// 입력: info: 실패시키는 Preview tier parameter
+// 출력: ThumbnailFailure 또는 StandardFailure
+[[nodiscard]] std::string degradedPreviewCaseName(const testing::TestParamInfo<PreviewTier>& info)
+{
+    return info.param == PreviewTier::Thumbnail ? "ThumbnailFailure" : "StandardFailure";
+}
 
 struct CancellationProbe
 {
@@ -372,6 +418,58 @@ TEST(PreviewOrchestratorTest, StreamsRawThumbnailBeforeStandardAndCompletesOnce)
     EXPECT_EQ(PreviewTier::Standard, frames[1].tier);
     EXPECT_EQ(QColor(Qt::green), frames[1].image.pixelColor(0, 0));
 }
+
+TEST_P(PreviewDegradedSuccessTest, PublishesUsableTierWarningAndCompletedTerminal)
+{
+    (void)test::application();
+    const PreviewTier failedTier = GetParam();
+    PreviewOrchestrator orchestrator(std::make_unique<DegradedPreviewPipeline>(failedTier));
+    PreviewRequest request = makeRasterRequest(QStringLiteral("C:/virtual/degraded.cr3"), 4, 13);
+    request.source.extension = QStringLiteral("cr3");
+    request.source.displayName = QStringLiteral("degraded.cr3");
+    request.source.kind = types::SupportedFileKind::Raw;
+    std::vector<PreviewResult> frames;
+    std::vector<PreviewIssue> warnings;
+    int completedCount = 0;
+    int failedCount = 0;
+    QEventLoop eventLoop;
+    QTimer timeoutTimer;
+    timeoutTimer.setSingleShot(true);
+
+    QObject::connect(&orchestrator, &PreviewOrchestrator::previewUpdated, [&frames](const PreviewResult& result) {
+        frames.push_back(result);
+    });
+    QObject::connect(&orchestrator, &PreviewOrchestrator::previewWarning, [&warnings](const PreviewIssue& issue) {
+        warnings.push_back(issue);
+    });
+    QObject::connect(&orchestrator, &PreviewOrchestrator::previewCompleted, [&](types::RequestId) {
+        ++completedCount;
+        eventLoop.quit();
+    });
+    QObject::connect(&orchestrator, &PreviewOrchestrator::previewFailed, [&](const PreviewIssue&) {
+        ++failedCount;
+        eventLoop.quit();
+    });
+    QObject::connect(&timeoutTimer, &QTimer::timeout, &eventLoop, &QEventLoop::quit);
+
+    const PreviewSubmissionResult submitted = orchestrator.submitPreview(std::move(request));
+    ASSERT_TRUE(submitted.hasValue());
+    timeoutTimer.start(5000);
+    eventLoop.exec();
+
+    EXPECT_EQ(1, completedCount);
+    EXPECT_EQ(0, failedCount);
+    ASSERT_EQ(1U, warnings.size());
+    EXPECT_EQ(types::ErrorCode::DecodeFailed, warnings.front().error.code);
+    ASSERT_EQ(1U, frames.size());
+    EXPECT_EQ(failedTier == PreviewTier::Thumbnail ? PreviewTier::Standard : PreviewTier::Thumbnail,
+              frames.front().tier);
+}
+
+INSTANTIATE_TEST_SUITE_P(ThumbnailAndStandard,
+                         PreviewDegradedSuccessTest,
+                         testing::Values(PreviewTier::Thumbnail, PreviewTier::Standard),
+                         degradedPreviewCaseName);
 
 TEST(PreviewOrchestratorTest, RejectsInvalidRequestBeforeQueueing)
 {

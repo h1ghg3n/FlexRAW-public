@@ -2,8 +2,7 @@
 
 #include <QString>
 
-#include "render_contracts.h"
-#include "render_message_contracts.h"
+#include "render_worker_runtime_port.h"
 #include "result.h"
 
 namespace flexraw::worker::runtime
@@ -13,23 +12,6 @@ struct WorkerRootConfiguration
 {
     QString sourceRoot;
     QString outputRoot;
-};
-
-enum class WorkerPathErrorCode
-{
-    InvalidRoot,
-    InvalidRelativePath,
-    SourceNotFound,
-    SourceOutsideRoot,
-    OutputParentNotFound,
-    OutputOutsideRoot,
-    InvalidRequestValue,
-};
-
-struct WorkerPathError
-{
-    WorkerPathErrorCode code{WorkerPathErrorCode::InvalidRelativePath};
-    QString message;
 };
 
 class WorkerPathResolver final
@@ -43,10 +25,10 @@ public:
     // 출력: root-bound resolver 또는 root configuration 오류
     [[nodiscard]] static CreateResult create(const WorkerRootConfiguration& configuration);
 
-    // 목적: wire request의 상대 경로를 Worker root 안의 local render request로 해석
-    // 입력: payload: portable relative path와 processing value
+    // 목적: Runtime request의 상대 경로를 Worker root 안의 local render request로 해석
+    // 입력: payload: transport에서 분리된 relative path와 processing value
     // 출력: canonical source/output path를 가진 request 또는 escape/value 오류
-    [[nodiscard]] ResolveResult resolve(const RenderRequestPayload& payload) const;
+    [[nodiscard]] ResolveResult resolve(const RenderWorkerRequest& payload) const;
 
     // 목적: 검증된 canonical source root 확인
     // 입력: 없음

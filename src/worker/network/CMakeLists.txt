@@ -13,9 +13,12 @@ target_include_directories(flexraw_worker_network PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(flexraw_worker_network PUBLIC
-    flexraw_worker_protocol
-    flexraw_worker_runtime
-    Qt6::Core
-    Qt6::Network
+target_link_libraries(flexraw_worker_network
+    PUBLIC
+        flexraw_worker_protocol
+        flexraw_worker_runtime_port
+        Qt6::Core
+        Qt6::Network
+    PRIVATE
+        flexraw_worker_render_messages
 )

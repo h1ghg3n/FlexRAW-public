@@ -31,6 +31,8 @@ constexpr qsizetype PayloadSizeOffset = 20;
     case MessageType::RenderFailed:
     case MessageType::ServerBusy:
     case MessageType::ResourceBusy:
+    case MessageType::HealthRequest:
+    case MessageType::HealthResponse:
         return true;
     }
     return false;

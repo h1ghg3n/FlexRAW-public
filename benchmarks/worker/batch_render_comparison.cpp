@@ -310,7 +310,7 @@ struct BatchJobResult
         const QString outputPath = QDir(configuration.outputDirectory).filePath(outputName);
         submittedAt[index] = batchTimer.elapsedNanoseconds();
         flexraw::worker::runtime::ScheduledRenderJob job;
-        job.key = {1, static_cast<flexraw::worker::protocol::JobId>(index + 1)};
+        job.key = {1, {static_cast<std::uint64_t>(index + 1)}};
         job.outputRelativePath = outputName;
         job.request = makeRequest(source.absoluteFilePath(), outputPath);
         const flexraw::worker::runtime::SubmitStatus status = scheduler.submit(

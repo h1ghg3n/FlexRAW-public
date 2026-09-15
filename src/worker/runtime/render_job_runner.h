@@ -1,24 +1,10 @@
 #pragma once
 
-#include <chrono>
-#include <optional>
-
-#include <QString>
-
 #include "operation_types.h"
-#include "resolved_render_pipeline.h"
-#include "result.h"
+#include "render_worker_runtime_port.h"
 
 namespace flexraw::worker::runtime
 {
-
-struct RenderResourceBusy
-{
-    QString message;
-    std::optional<std::chrono::milliseconds> retryAfter;
-};
-
-using RenderJobExecutionResult = core::types::Result<core::render::ResolvedRenderPipelineResult, RenderResourceBusy>;
 
 class IRenderJobRunner
 {

@@ -25,14 +25,13 @@ public:
                                                      const RemoteRenderRequest& request,
                                                      const core::types::CancellationToken& cancellationToken) const = 0;
 
-    // 목적: Worker JobAccepted 관찰이 필요한 caller에 기존 동기 실행과 accepted event 제공
-    // 입력: endpoint/request/token: 실행 값, accepted: Worker scheduler ownership callback
-    // 출력: remote artifact/stats 또는 typed transport/worker 오류
-    [[nodiscard]] virtual RemoteRenderResult execute(
-        const RemoteRenderEndpoint& endpoint,
-        const RemoteRenderRequest& request,
-        const core::types::CancellationToken& cancellationToken,
-        const RemoteRenderAcceptedCallback& accepted) const;
+    // 목적: Worker JobAccepted 관찰이 필요한 caller에 동기 실행과 accepted event 제공
+    // 입력: endpoint/request/token: 실행 값, accepted: 같은 execute thread에서 0~1회 호출하고 저장하지 않는 callback
+    // 출력: callback 완료와 내부 실행이 모두 quiescent한 remote artifact/stats 또는 typed transport/worker 오류
+    [[nodiscard]] virtual RemoteRenderResult execute(const RemoteRenderEndpoint& endpoint,
+                                                     const RemoteRenderRequest& request,
+                                                     const core::types::CancellationToken& cancellationToken,
+                                                     const RemoteRenderAcceptedCallback& accepted) const = 0;
 };
 
 class RemoteRenderExecutor final : public IRemoteRenderExecutor
@@ -46,13 +45,12 @@ public:
                                              const core::types::CancellationToken& cancellationToken) const override;
 
     // 목적: JobAccepted observer를 포함해 manual Worker endpoint에서 동기 render 실행
-    // 입력: endpoint/request/token: 실행 값, accepted: 유효한 JobAccepted 수신 callback
-    // 출력: remote artifact/stats 또는 typed transport/worker 오류
-    [[nodiscard]] RemoteRenderResult execute(
-        const RemoteRenderEndpoint& endpoint,
-        const RemoteRenderRequest& request,
-        const core::types::CancellationToken& cancellationToken,
-        const RemoteRenderAcceptedCallback& accepted) const override;
+    // 입력: endpoint/request/token: 실행 값, accepted: 같은 execute thread에서 0~1회 호출하고 저장하지 않는 callback
+    // 출력: callback 완료와 session 종료 뒤 remote artifact/stats 또는 typed transport/worker 오류
+    [[nodiscard]] RemoteRenderResult execute(const RemoteRenderEndpoint& endpoint,
+                                             const RemoteRenderRequest& request,
+                                             const core::types::CancellationToken& cancellationToken,
+                                             const RemoteRenderAcceptedCallback& accepted) const override;
 };
 
 }  // namespace flexraw::worker::client

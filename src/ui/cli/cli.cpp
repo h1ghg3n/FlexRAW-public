@@ -10,15 +10,19 @@ namespace flexraw::ui::cli
 {
 
 // 목적: 전체 화면 console mode surface 초기화
-// 입력: catalogOrchestrator: active catalog use case, exportOrchestrator: shared export use case, parent: Qt 부모
-// widget 출력: 초기화된 ConsoleModeWidget 객체
-ConsoleModeWidget::ConsoleModeWidget(core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                                     core::orchestration::ExportOrchestrator& exportOrchestrator,
+// 입력: Folder/Export command/event와 Export default contract, parent: Qt 부모 widget
+// 출력: 초기화된 ConsoleModeWidget 객체
+ConsoleModeWidget::ConsoleModeWidget(core::client::IFolderImportClient& folderImportClient,
+                                     core::client::IFolderImportEventSource& folderImportEventSource,
+                                     core::client::IExportClient& exportClient,
+                                     core::client::IExportEventSource& exportEventSource,
+                                     core::client::IExportDefaultsClient& exportDefaultsClient,
                                      QWidget* parent)
     : QWidget(parent),
       m_output(new QPlainTextEdit(this)),
       m_input(new QLineEdit(this)),
-      m_commandController(new ConsoleCommandController(catalogOrchestrator, exportOrchestrator, this))
+      m_commandController(new ConsoleCommandController(
+          folderImportClient, folderImportEventSource, exportClient, exportEventSource, exportDefaultsClient, this))
 {
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(16, 16, 16, 16);

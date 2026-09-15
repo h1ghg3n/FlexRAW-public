@@ -370,9 +370,14 @@ private:
             return handleResourceBusy(frame);
         case protocol::MessageType::RenderRequest:
         case protocol::MessageType::CancelRequest:
+        case protocol::MessageType::HealthRequest:
             return makeFailure(RemoteRenderErrorCode::ProtocolViolation,
                                core::types::ErrorCode::Unknown,
                                QStringLiteral("Render Worker sent a client-only message type."));
+        case protocol::MessageType::HealthResponse:
+            return makeFailure(RemoteRenderErrorCode::ProtocolViolation,
+                               core::types::ErrorCode::Unknown,
+                               QStringLiteral("Render Worker sent a health response to a render request."));
         }
         return makeFailure(RemoteRenderErrorCode::ProtocolViolation,
                            core::types::ErrorCode::Unknown,
@@ -489,18 +494,6 @@ private:
 
 }  // namespace
 
-// 목적: accepted observer를 지원하지 않는 기존 executor implementation의 호환 실행
-// 입력: endpoint/request/token: 실행 값, accepted: 기본 implementation에서는 사용하지 않음
-// 출력: 기존 3-argument execute 결과
-RemoteRenderResult IRemoteRenderExecutor::execute(const RemoteRenderEndpoint& endpoint,
-                                                  const RemoteRenderRequest& request,
-                                                  const core::types::CancellationToken& cancellationToken,
-                                                  const RemoteRenderAcceptedCallback& accepted) const
-{
-    static_cast<void>(accepted);
-    return execute(endpoint, request, cancellationToken);
-}
-
 // 목적: manual Worker endpoint에서 root-relative single-RAW render를 동기 실행
 // 입력: endpoint: TCP 주소와 timeout, request: Worker root 기준 경로와 처리 값, cancellationToken: cooperative 중단
 // 상태 출력: remote artifact/stats 또는 connection, protocol, busy, render failure
@@ -512,8 +505,8 @@ RemoteRenderResult RemoteRenderExecutor::execute(const RemoteRenderEndpoint& end
 }
 
 // 목적: JobAccepted observer를 포함해 manual Worker endpoint에서 동기 render 실행
-// 입력: endpoint/request/token: 실행 값, accepted: 유효한 JobAccepted 수신 callback
-// 출력: remote artifact/stats 또는 typed transport/worker 오류
+// 입력: endpoint/request/token: 실행 값, accepted: 같은 execute thread에서 0~1회 호출하고 저장하지 않는 callback
+// 출력: callback 완료와 session 종료 뒤 remote artifact/stats 또는 typed transport/worker 오류
 RemoteRenderResult RemoteRenderExecutor::execute(const RemoteRenderEndpoint& endpoint,
                                                  const RemoteRenderRequest& request,
                                                  const core::types::CancellationToken& cancellationToken,

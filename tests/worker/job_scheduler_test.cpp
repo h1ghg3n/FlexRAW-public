@@ -1,10 +1,12 @@
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 #include <QSemaphore>
+#include <QThread>
 
 #include <gtest/gtest.h>
 
@@ -207,12 +209,12 @@ public:
 };
 
 // 목적: scheduler test용 최소 resolved render job 생성
-// 입력: jobId: wire identity, sessionId: connection identity
+// 입력: jobId: Runtime identity 값, sessionId: connection identity
 // 출력: identity와 구분 가능한 source/output path를 가진 job
-[[nodiscard]] ScheduledRenderJob makeJob(const protocol::JobId jobId, const WorkerSessionId sessionId = 1)
+[[nodiscard]] ScheduledRenderJob makeJob(const std::uint64_t jobId, const WorkerSessionId sessionId = 1)
 {
     const QString suffix = QString::number(jobId);
-    return {{sessionId, jobId},
+    return {{sessionId, {jobId}},
             QStringLiteral("exports/output-%1.jpg").arg(suffix),
             {QStringLiteral("source-%1.CR3").arg(suffix), QStringLiteral("output-%1.jpg").arg(suffix), {}, {}}};
 }
@@ -252,15 +254,15 @@ TEST(JobSchedulerStatusTest, EmitsQueuedLifecycleInAuthoritativeFifoOrder)
 
     const std::vector<RenderJobStatus> observed = statuses.statuses();
     ASSERT_EQ(5U, observed.size());
-    EXPECT_EQ(1U, observed[0].key.jobId);
+    EXPECT_EQ(1U, observed[0].key.jobId.value);
     EXPECT_EQ(RenderJobState::Running, observed[0].state);
-    EXPECT_EQ(2U, observed[1].key.jobId);
+    EXPECT_EQ(2U, observed[1].key.jobId.value);
     EXPECT_EQ(RenderJobState::Queued, observed[1].state);
-    EXPECT_EQ(1U, observed[2].key.jobId);
+    EXPECT_EQ(1U, observed[2].key.jobId.value);
     EXPECT_EQ(RenderJobState::Succeeded, observed[2].state);
-    EXPECT_EQ(2U, observed[3].key.jobId);
+    EXPECT_EQ(2U, observed[3].key.jobId.value);
     EXPECT_EQ(RenderJobState::Running, observed[3].state);
-    EXPECT_EQ(2U, observed[4].key.jobId);
+    EXPECT_EQ(2U, observed[4].key.jobId.value);
     EXPECT_EQ(RenderJobState::Succeeded, observed[4].state);
 }
 
@@ -275,18 +277,18 @@ TEST(JobSchedulerStatusTest, EmitsCancellationOnlyAtTerminalTransition)
     ASSERT_TRUE(runner.waitForStarted(1));
     ASSERT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(2), collectInto(completions)));
 
-    ASSERT_TRUE(scheduler.cancel({1, 2}));
+    ASSERT_TRUE(scheduler.cancel({1, {2}}));
     ASSERT_TRUE(completions.waitForCompleted(1));
-    ASSERT_TRUE(scheduler.cancel({1, 1}));
+    ASSERT_TRUE(scheduler.cancel({1, {1}}));
     ASSERT_TRUE(completions.waitForCompleted(1));
 
     const std::vector<RenderJobStatus> observed = statuses.statuses();
     ASSERT_EQ(4U, observed.size());
     EXPECT_EQ(RenderJobState::Running, observed[0].state);
     EXPECT_EQ(RenderJobState::Queued, observed[1].state);
-    EXPECT_EQ(2U, observed[2].key.jobId);
+    EXPECT_EQ(2U, observed[2].key.jobId.value);
     EXPECT_EQ(RenderJobState::Cancelled, observed[2].state);
-    EXPECT_EQ(1U, observed[3].key.jobId);
+    EXPECT_EQ(1U, observed[3].key.jobId.value);
     EXPECT_EQ(RenderJobState::Cancelled, observed[3].state);
 }
 
@@ -341,13 +343,47 @@ TEST(JobSchedulerStatusTest, IsolatesCallbackExceptionsAndAllowsSnapshotReentry)
     EXPECT_EQ(2, callbackCount.load(std::memory_order_relaxed));
 }
 
+TEST(JobSchedulerStatusTest, DeliversSnapshotSafeCallbacksOnCallerAndWorkerContexts)
+{
+    BlockingRenderJobRunner runner;
+    CompletionCollector completions;
+    std::mutex deliveryMutex;
+    std::vector<std::pair<RenderJobState, QThread*>> deliveries;
+    JobScheduler* schedulerAddress = nullptr;
+    JobScheduler scheduler(runner, 1, 0, [&](RenderJobStatus status) {
+        static_cast<void>(schedulerAddress->snapshot());
+        const std::scoped_lock lock(deliveryMutex);
+        deliveries.emplace_back(status.state, QThread::currentThread());
+    });
+    schedulerAddress = &scheduler;
+    QThread* const callerThread = QThread::currentThread();
+
+    ASSERT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(1), collectInto(completions)));
+    ASSERT_TRUE(runner.waitForStarted(1));
+    {
+        const std::scoped_lock lock(deliveryMutex);
+        ASSERT_EQ(1U, deliveries.size());
+        EXPECT_EQ(RenderJobState::Running, deliveries.front().first);
+        EXPECT_EQ(callerThread, deliveries.front().second);
+    }
+
+    runner.release(1);
+    ASSERT_TRUE(completions.waitForCompleted(1));
+    {
+        const std::scoped_lock lock(deliveryMutex);
+        ASSERT_EQ(2U, deliveries.size());
+        EXPECT_EQ(RenderJobState::Succeeded, deliveries.back().first);
+        EXPECT_NE(callerThread, deliveries.back().second);
+    }
+}
+
 TEST(JobSchedulerTest, EnforcesRunningAndQueueBoundsWithHighWaterStats)
 {
     BlockingRenderJobRunner runner;
     JobScheduler scheduler(runner, 2, 2);
     CompletionCollector collector;
 
-    for (protocol::JobId jobId = 1; jobId <= 4; ++jobId)
+    for (std::uint64_t jobId = 1; jobId <= 4; ++jobId)
     {
         EXPECT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(jobId), collectInto(collector)));
     }
@@ -387,7 +423,7 @@ TEST(JobSchedulerTest, RejectsZeroAndDuplicateActiveJobIds)
     ASSERT_TRUE(runner.waitForStarted(1));
     EXPECT_EQ(SubmitStatus::DuplicateJobId, scheduler.submit(makeJob(1), collectInto(collector)));
 
-    EXPECT_TRUE(scheduler.cancel({1, 1}));
+    EXPECT_TRUE(scheduler.cancel({1, {1}}));
     ASSERT_TRUE(collector.waitForCompleted(1));
     ASSERT_EQ(1U, collector.outcomes().size());
     ASSERT_TRUE(collector.outcomes().front().result.hasValue());
@@ -399,7 +435,7 @@ TEST(JobSchedulerTest, RejectsZeroAndDuplicateActiveJobIds)
     EXPECT_EQ(RenderJobState::Cancelled, observed[1].state);
 }
 
-TEST(JobSchedulerTest, AllowsSameWireJobIdInDifferentSessions)
+TEST(JobSchedulerTest, AllowsSameRuntimeJobIdInDifferentSessions)
 {
     BlockingRenderJobRunner runner;
     JobScheduler scheduler(runner, 2, 0);
@@ -409,8 +445,8 @@ TEST(JobSchedulerTest, AllowsSameWireJobIdInDifferentSessions)
     EXPECT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(1, 22), collectInto(collector)));
     ASSERT_TRUE(runner.waitForStarted(2));
 
-    EXPECT_TRUE(scheduler.cancel({11, 1}));
-    EXPECT_TRUE(scheduler.cancel({22, 1}));
+    EXPECT_TRUE(scheduler.cancel({11, {1}}));
+    EXPECT_TRUE(scheduler.cancel({22, {1}}));
     ASSERT_TRUE(collector.waitForCompleted(2));
     EXPECT_EQ(2U, collector.outcomes().size());
 }
@@ -420,7 +456,7 @@ TEST(JobSchedulerTest, StartsQueuedJobsInFifoOrder)
     BlockingRenderJobRunner runner;
     JobScheduler scheduler(runner, 1, 2);
     CompletionCollector collector;
-    for (protocol::JobId jobId = 1; jobId <= 3; ++jobId)
+    for (std::uint64_t jobId = 1; jobId <= 3; ++jobId)
     {
         ASSERT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(jobId), collectInto(collector)));
     }
@@ -448,16 +484,16 @@ TEST(JobSchedulerTest, CancelsQueuedJobWithoutExecutingItAndCompletesOnce)
     ASSERT_TRUE(runner.waitForStarted(1));
     ASSERT_EQ(SubmitStatus::Accepted, scheduler.submit(makeJob(2), collectInto(collector)));
 
-    EXPECT_TRUE(scheduler.cancel({1, 2}));
+    EXPECT_TRUE(scheduler.cancel({1, {2}}));
     ASSERT_TRUE(collector.waitForCompleted(1));
     EXPECT_EQ(1, runner.executeCount());
     EXPECT_EQ(0U, scheduler.snapshot().queued);
 
-    EXPECT_TRUE(scheduler.cancel({1, 1}));
+    EXPECT_TRUE(scheduler.cancel({1, {1}}));
     ASSERT_TRUE(collector.waitForCompleted(1));
     const std::vector<RenderJobOutcome> outcomes = collector.outcomes();
     ASSERT_EQ(2U, outcomes.size());
-    EXPECT_NE(outcomes[0].key.jobId, outcomes[1].key.jobId);
+    EXPECT_NE(outcomes[0].key.jobId.value, outcomes[1].key.jobId.value);
     ASSERT_TRUE(outcomes[0].result.hasValue());
     ASSERT_TRUE(outcomes[1].result.hasValue());
     EXPECT_EQ(core::types::ErrorCode::Cancelled, outcomes[0].result.value().error().cause.code);

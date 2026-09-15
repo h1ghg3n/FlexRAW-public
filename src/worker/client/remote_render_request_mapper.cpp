@@ -26,7 +26,7 @@ namespace
                                                                                const QString& label)
 {
     const QString cleanedPath = QDir::cleanPath(path);
-    if (path.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedPath))
+    if (path.isEmpty() || path != path.trimmed() || !QDir::isAbsolutePath(cleanedPath))
     {
         return core::types::Result<QString, RemoteRenderPathError>::failure(
             makePathError(RemoteRenderPathErrorCode::InvalidRoot,
@@ -111,7 +111,7 @@ namespace
                                                                                 const QString& sourcePath)
 {
     const QString cleanedPath = QDir::cleanPath(sourcePath);
-    if (sourcePath.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedPath))
+    if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed() || !QDir::isAbsolutePath(cleanedPath))
     {
         return core::types::Result<QString, RemoteRenderPathError>::failure(makePathError(
             RemoteRenderPathErrorCode::InvalidPath, QStringLiteral("Remote render source path must be absolute.")));
@@ -141,7 +141,7 @@ namespace
                                                                                 const QString& outputPath)
 {
     const QString cleanedPath = QDir::cleanPath(outputPath);
-    if (outputPath.trimmed().isEmpty() || !QDir::isAbsolutePath(cleanedPath))
+    if (outputPath.isEmpty() || outputPath != outputPath.trimmed() || !QDir::isAbsolutePath(cleanedPath))
     {
         return core::types::Result<QString, RemoteRenderPathError>::failure(makePathError(
             RemoteRenderPathErrorCode::InvalidPath, QStringLiteral("Remote render output path must be absolute.")));

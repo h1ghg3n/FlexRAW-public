@@ -1,43 +1,89 @@
 {
   "name": "flexraw",
   "version": "0.1.0",
-  "default-features": [ "desktop", "tests" ],
-  "dependencies": [
-    "exiv2",
-    {
-      "name": "libiconv",
-      "platform": "windows"
-    },
-    "libraw",
-    "lcms",
-    "spdlog",
-    {
-      "name": "qtbase",
-      "default-features": false,
-      "features": [ "gui", "network", "jpeg", "png", "thread" ]
-    }
+  "default-features": [
+    "desktop",
+    "tests"
   ],
   "features": {
     "desktop": {
       "description": "Desktop UI and Catalog dependencies",
       "dependencies": [
-        "lensfun",
+        "exiv2",
+        "lcms",
         {
-          "name": "opencv4",
-          "default-features": false,
-          "features": [ "contrib", "intrinsics", "jpeg", "png", "thread", "tiff", "webp" ]
+          "name": "libiconv",
+          "platform": "windows"
         },
+        "libraw",
         {
           "name": "qtbase",
           "default-features": false,
-          "features": [ "widgets", "sql" ]
+          "features": [
+            "gui",
+            "jpeg",
+            "network",
+            "png",
+            "sql",
+            "thread",
+            "widgets"
+          ]
         },
-        "qtimageformats"
+        "qtimageformats",
+        "spdlog"
+      ]
+    },
+    "mcp": {
+      "description": "Standalone MCP Product Runtime dependencies without Desktop UI",
+      "dependencies": [
+        "exiv2",
+        "lcms",
+        {
+          "name": "libiconv",
+          "platform": "windows"
+        },
+        "libraw",
+        {
+          "name": "qtbase",
+          "default-features": false,
+          "features": [
+            "gui",
+            "sql",
+            "thread"
+          ]
+        },
+        "spdlog"
       ]
     },
     "tests": {
       "description": "Google Test dependency",
-      "dependencies": [ "gtest" ]
+      "dependencies": [
+        "gtest"
+      ]
+    },
+    "worker": {
+      "description": "Bounded render worker dependencies",
+      "dependencies": [
+        "exiv2",
+        "lcms",
+        {
+          "name": "libiconv",
+          "platform": "windows"
+        },
+        "libraw",
+        {
+          "name": "qtbase",
+          "default-features": false,
+          "features": [
+            "gui",
+            "jpeg",
+            "network",
+            "png",
+            "thread"
+          ]
+        },
+        "spdlog"
+      ]
     }
   }
 }

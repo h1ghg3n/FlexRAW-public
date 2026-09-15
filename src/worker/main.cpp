@@ -2,6 +2,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -309,12 +310,22 @@ void writeOutput(const QString& message)
     stream.flush();
 }
 
-}  // namespace
+class ScopedLoggingShutdown final
+{
+public:
+    // 목적: 자신보다 나중에 생성된 Worker context가 먼저 파괴된 뒤 logging 종료
+    // 입력: 없음
+    // 출력: process logging queue가 flush되고 종료된 상태
+    ~ScopedLoggingShutdown()
+    {
+        flexraw::core::util::shutdownLogging();
+    }
+};
 
 // 목적: Flexraw Worker configuration, Composition Root와 Qt event loop 실행
 // 입력: argc: process argument 수, argv: process argument 값
 // 출력: 정상 종료 0, configuration 2, listen 실패 3
-int main(int argc, char* argv[])
+int runWorkerProcess(int argc, char* argv[])
 {
     QCoreApplication application(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("Flexraw"));
@@ -343,6 +354,7 @@ int main(int argc, char* argv[])
     }
 
     flexraw::core::util::initializeLogging();
+    const ScopedLoggingShutdown loggingShutdown;
     std::signal(SIGINT, handleStopSignal);
     std::signal(SIGTERM, handleStopSignal);
 
@@ -351,8 +363,9 @@ int main(int argc, char* argv[])
         flexraw::worker::app::WorkerApplicationContext context(std::move(resolver.value()), parsed.value().application);
         if (!context.listen(parsed.value().listenAddress, parsed.value().port))
         {
+            const QString diagnostic = trWorker("Unable to listen: %1").arg(context.errorString());
+            writeError(diagnostic);
             LOG_ERROR("worker", "Unable to listen: {}", context.errorString().toStdString());
-            flexraw::core::util::shutdownLogging();
             return 3;
         }
 
@@ -375,6 +388,34 @@ int main(int argc, char* argv[])
     }
 
     LOG_INFO("worker", "Flexraw Worker stopped with exit code {}", exitCode);
-    flexraw::core::util::shutdownLogging();
     return exitCode;
+}
+
+}  // namespace
+
+// 목적: Worker Composition 생성 예외를 process diagnostic과 실패 code로 정규화
+// 입력: argc: process argument 수, argv: process argument 값
+// 출력: 정상 Worker code 또는 예상하지 못한 startup 실패 1
+int main(int argc, char* argv[])
+{
+    try
+    {
+        return runWorkerProcess(argc, argv);
+    }
+    catch (const std::exception& exception)
+    {
+        flexraw::core::util::initializeLogging();
+        writeError(trWorker("Unable to start Flexraw Worker: %1").arg(QString::fromUtf8(exception.what())));
+        LOG_ERROR("worker", "Unable to start Flexraw Worker: {}", exception.what());
+        flexraw::core::util::shutdownLogging();
+        return 1;
+    }
+    catch (...)
+    {
+        flexraw::core::util::initializeLogging();
+        writeError(trWorker("Unable to start Flexraw Worker: unknown exception"));
+        LOG_ERROR("worker", "Unable to start Flexraw Worker: unknown exception");
+        flexraw::core::util::shutdownLogging();
+        return 1;
+    }
 }

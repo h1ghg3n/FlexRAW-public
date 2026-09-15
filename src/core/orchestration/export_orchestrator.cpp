@@ -32,11 +32,13 @@ constexpr int ResourceRecheckMilliseconds = 1000;
 // 출력: 유효하면 빈 error, 유효하지 않으면 구조화된 error
 [[nodiscard]] std::optional<types::CoreError> validateFileRequest(const ExportFileRequest& request)
 {
-    if (request.source.path.trimmed().isEmpty() || request.outputPath.trimmed().isEmpty())
+    if (request.source.path.isEmpty() || request.outputPath.isEmpty() ||
+        request.source.path != request.source.path.trimmed() || request.outputPath != request.outputPath.trimmed() ||
+        (!request.catalogPath.isEmpty() && request.catalogPath != request.catalogPath.trimmed()))
     {
         return types::CoreError{
             types::ErrorCode::InvalidArgument,
-            QStringLiteral("Export source and output paths must not be empty."),
+            QStringLiteral("Export paths must not be empty or contain outer whitespace."),
         };
     }
     if (request.source.kind != types::SupportedFileKind::Raw &&
@@ -77,11 +79,13 @@ constexpr int ResourceRecheckMilliseconds = 1000;
 // 출력: 유효하면 빈 error, 유효하지 않으면 구조화된 error
 [[nodiscard]] std::optional<types::CoreError> validateBatchRequest(const ExportBatchRequest& request)
 {
-    if (request.inputFolderPath.trimmed().isEmpty() || request.outputFolderPath.trimmed().isEmpty())
+    if (request.inputFolderPath.isEmpty() || request.outputFolderPath.isEmpty() ||
+        request.inputFolderPath != request.inputFolderPath.trimmed() ||
+        request.outputFolderPath != request.outputFolderPath.trimmed())
     {
         return types::CoreError{
             types::ErrorCode::InvalidArgument,
-            QStringLiteral("Batch export input and output folders must not be empty."),
+            QStringLiteral("Batch export folders must not be empty or contain outer whitespace."),
         };
     }
     if (request.workerCount < 0)
@@ -129,7 +133,7 @@ constexpr int ResourceRecheckMilliseconds = 1000;
         {
             return error;
         }
-        const QString outputPath = QDir::cleanPath(item.outputPath).toCaseFolded();
+        const QString outputPath = QDir::cleanPath(item.outputPath);
         if (outputPaths.contains(outputPath))
         {
             return types::CoreError{
@@ -374,6 +378,7 @@ ExportSubmissionResult ExportOrchestrator::submitExport(ExportRequest request, E
     active.placement = std::move(placement);
     active.requestedLocalLimit = requestedLocalLimit(request);
     m_activeRequests.insert(requestId, std::move(active));
+    emit exportAccepted(requestId);
     startPreparation(requestId, std::move(request));
     return ExportSubmissionResult::success(requestId);
 }
@@ -890,7 +895,7 @@ void ExportOrchestrator::requeueRemote(const ExportJobId jobId,
     }
     if (request->placement.policy != ExportPlacementPolicy::Auto)
     {
-        completeJob(jobId, makeFailedItem(job->item, cause, ExportItemFailureKind::Execution));
+        completeJob(jobId, makeFailedItem(job->item, cause, ExportItemFailureKind::DispatchExhausted));
         return;
     }
 

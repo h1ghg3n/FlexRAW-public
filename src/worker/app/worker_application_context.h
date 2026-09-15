@@ -10,6 +10,7 @@
 #include "job_scheduler.h"
 #include "render_job_runner.h"
 #include "render_resource_admission.h"
+#include "render_worker_runtime_facade.h"
 #include "resolved_render_pipeline.h"
 #include "system_memory_probe.h"
 #include "worker_path_resolver.h"
@@ -75,6 +76,7 @@ private:
     runtime::PipelineRenderJobRunner m_pipelineRunner;
     admission::AdmissionRenderJobRunner m_runner;
     runtime::JobScheduler m_scheduler;
+    runtime::RenderWorkerRuntimeFacade m_runtimePort;
     network::WorkerServer m_server;
     bool m_shutdown{false};
 };

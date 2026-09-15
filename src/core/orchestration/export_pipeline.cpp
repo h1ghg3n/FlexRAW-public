@@ -1,11 +1,15 @@
 #include "export_pipeline.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <system_error>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -15,6 +19,7 @@
 #include <QImageReader>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QSet>
 #include <QThread>
 #include <QThreadPool>
 #include <QtConcurrentMap>
@@ -24,6 +29,7 @@
 #include "develop.h"
 #include "export.h"
 #include "folder_scanner.h"
+#include "path_identity_service.h"
 
 namespace flexraw::core::orchestration
 {
@@ -72,14 +78,145 @@ constexpr int DefaultMaximumBatchWorkers = 4;
     return {std::move(sourcePath), std::move(outputPath), false, std::move(error)};
 }
 
+// 목적: existing path는 canonical, 미생성 output은 case-preserving absolute 기준 보조 key 생성
+// 입력: path: 준비된 source 또는 output 경로
+// 출력: separator만 정규화하고 leaf 대소문자는 유지한 path key
+[[nodiscard]] QString preparedPathKey(const QString& path)
+{
+    const QFileInfo fileInfo(QDir::cleanPath(path));
+    const QString canonicalPath = fileInfo.canonicalFilePath();
+    const QString comparablePath = canonicalPath.isEmpty() ? fileInfo.absoluteFilePath() : canonicalPath;
+    return QDir::cleanPath(QDir::fromNativeSeparators(comparablePath));
+}
+
+// 목적: canonical path key만으로 구분할 수 없는 hard-link identity 비교 필요 여부 확인
+// 입력: path: 존재하는지와 hard-link count를 조회할 경로
+// 출력: 둘 이상의 directory entry가 같은 file identity를 공유하면 true
+[[nodiscard]] bool hasMultipleHardLinks(const QString& path)
+{
+    const QFileInfo fileInfo(QDir::cleanPath(path));
+    if (!fileInfo.exists())
+    {
+        return false;
+    }
+    std::error_code error;
+    const std::uintmax_t linkCount = std::filesystem::hard_link_count(fileInfo.filesystemAbsoluteFilePath(), error);
+    return !error && linkCount > 1U;
+}
+
+// 목적: 준비된 source/output의 OS별 prospective path key를 실행 전 검증
+// 입력: items: absolute source/output 목록, pathIdentityService: parent identity와 name policy provider
+// 출력: key unavailable 또는 output 충돌이면 오류, 모두 구분 가능하면 빈 값
+[[nodiscard]] std::optional<types::CoreError> validateTransientPathKeys(
+    const QVector<PreparedExportItem>& items, const platform::IPathIdentityService& pathIdentityService)
+{
+    std::unordered_set<std::string> sourceKeys;
+    sourceKeys.reserve(static_cast<std::size_t>(items.size()));
+    for (const PreparedExportItem& item : items)
+    {
+        const std::optional<platform::TransientPathKey> key =
+            pathIdentityService.comparisonKey(QFileInfo(item.request.source.path).filesystemAbsoluteFilePath());
+        if (!key.has_value())
+        {
+            return makeError(types::ErrorCode::Unknown, QStringLiteral("Export source path identity is unavailable."));
+        }
+        sourceKeys.insert(key->bytes);
+    }
+
+    std::unordered_set<std::string> outputKeys;
+    outputKeys.reserve(static_cast<std::size_t>(items.size()));
+    for (const PreparedExportItem& item : items)
+    {
+        const std::optional<platform::TransientPathKey> key =
+            pathIdentityService.comparisonKey(QFileInfo(item.request.outputPath).filesystemAbsoluteFilePath());
+        if (!key.has_value())
+        {
+            return makeError(types::ErrorCode::Unknown, QStringLiteral("Export output path identity is unavailable."));
+        }
+        if (!outputKeys.insert(key->bytes).second)
+        {
+            return makeError(types::ErrorCode::Conflict, QStringLiteral("Export output paths must be unique."));
+        }
+        if (sourceKeys.contains(key->bytes))
+        {
+            return makeError(types::ErrorCode::Conflict,
+                             QStringLiteral("An export output path conflicts with an export source path."));
+        }
+    }
+    return std::nullopt;
+}
+
+// 목적: 준비된 item 전체에서 output 중복과 output-to-source file 충돌 검증
+// 입력: items: absolute source와 output이 확정된 immutable export item 목록
+// 출력: 충돌이 없으면 빈 error, 원본 보존을 위반하면 Conflict
+[[nodiscard]] std::optional<types::CoreError> validatePreparedPathSet(
+    const QVector<PreparedExportItem>& items, const platform::IPathIdentityService& pathIdentityService)
+{
+    if (const std::optional<types::CoreError> error = validateTransientPathKeys(items, pathIdentityService);
+        error.has_value())
+    {
+        return error;
+    }
+
+    QSet<QString> sourcePathKeys;
+    for (const PreparedExportItem& item : items)
+    {
+        sourcePathKeys.insert(preparedPathKey(item.request.source.path));
+    }
+
+    QSet<QString> outputPathKeys;
+    for (qsizetype outputIndex = 0; outputIndex < items.size(); ++outputIndex)
+    {
+        const QString& outputPath = items.at(outputIndex).request.outputPath;
+        const QString outputPathKey = preparedPathKey(outputPath);
+        if (outputPathKeys.contains(outputPathKey))
+        {
+            return makeError(types::ErrorCode::Conflict, QStringLiteral("Export output paths must be unique."));
+        }
+        outputPathKeys.insert(outputPathKey);
+        if (sourcePathKeys.contains(outputPathKey))
+        {
+            return makeError(types::ErrorCode::Conflict,
+                             QStringLiteral("An export output path conflicts with an export source path."));
+        }
+        if (!hasMultipleHardLinks(outputPath))
+        {
+            continue;
+        }
+        for (qsizetype priorOutputIndex = 0; priorOutputIndex < outputIndex; ++priorOutputIndex)
+        {
+            if (export_::exportPathsReferToSameFile(outputPath, items.at(priorOutputIndex).request.outputPath))
+            {
+                return makeError(types::ErrorCode::Conflict, QStringLiteral("Export output paths must be unique."));
+            }
+        }
+        for (const PreparedExportItem& sourceItem : items)
+        {
+            if (export_::exportPathsReferToSameFile(outputPath, sourceItem.request.source.path))
+            {
+                return makeError(types::ErrorCode::Conflict,
+                                 QStringLiteral("An export output path conflicts with an export source path."));
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 // 목적: raster source를 sRGB working image로 decode하고 optional develop state 적용
 // 입력: request: source, output, develop state와 encoding option
 // 출력: item 단위 성공 또는 실패 상세 결과
 [[nodiscard]] ExportItemResult exportRasterFile(const ExportFileRequest& request,
                                                 const types::CancellationToken& cancellationToken)
 {
+    if (request.source.path.isEmpty() || request.source.path != request.source.path.trimmed())
+    {
+        return makeFailedItem(request.source.path,
+                              request.outputPath,
+                              makeError(types::ErrorCode::InvalidArgument,
+                                        QStringLiteral("Raster export input path contains outer whitespace.")));
+    }
     const QFileInfo inputInfo(QDir::cleanPath(request.source.path));
-    if (request.source.path.trimmed().isEmpty() || !inputInfo.exists())
+    if (!inputInfo.exists())
     {
         return makeFailedItem(
             request.source.path,
@@ -241,7 +378,20 @@ constexpr int DefaultMaximumBatchWorkers = 4;
         return ExportPreparationResult::failure(makeCancelledError());
     }
 
+    const export_::RasterExportPathResult outputPath = export_::validateRasterExportPath(request.outputPath);
+    if (outputPath.hasError())
+    {
+        return ExportPreparationResult::failure(outputPath.error());
+    }
+
     PreparedExportItem item{request, {}};
+    item.request.source.path = QFileInfo(QDir::cleanPath(request.source.path)).absoluteFilePath();
+    item.request.outputPath = outputPath.value();
+    if (export_::exportPathsReferToSameFile(item.request.source.path, item.request.outputPath))
+    {
+        return ExportPreparationResult::failure(makeError(
+            types::ErrorCode::Conflict, QStringLiteral("Export source and output paths refer to the same file.")));
+    }
     if (request.source.kind == types::SupportedFileKind::Raw)
     {
         const types::Result<types::DevelopParams, types::CoreError> params =
@@ -268,7 +418,8 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 [[nodiscard]] ExportPipelineResult executeFileRequest(const ExportFileRequest& request,
                                                       const types::CancellationToken& cancellationToken,
                                                       const ExportProgressCallback& progress,
-                                                      QMutex& catalogAccessMutex)
+                                                      QMutex& catalogAccessMutex,
+                                                      const platform::IPathIdentityService& pathIdentityService)
 {
     if (progress)
     {
@@ -278,6 +429,16 @@ constexpr int DefaultMaximumBatchWorkers = 4;
     if (cancellationToken.isCancellationRequested())
     {
         return makeCancelledResult();
+    }
+
+    PreparedExportItem pathItem{request, {}};
+    pathItem.request.source.path = QFileInfo(QDir::cleanPath(request.source.path)).absoluteFilePath();
+    pathItem.request.outputPath = QFileInfo(QDir::cleanPath(request.outputPath)).absoluteFilePath();
+    if (const std::optional<types::CoreError> error =
+            validatePreparedPathSet(QVector<PreparedExportItem>{pathItem}, pathIdentityService);
+        error.has_value())
+    {
+        return ExportPipelineResult::failure(*error);
     }
 
     std::optional<ExportItemResult> item;
@@ -315,7 +476,8 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 // 출력: 원래 순서를 보존한 immutable item 목록 또는 cancellation 오류
 [[nodiscard]] ExportPreparationResult prepareItemListRequest(const ExportItemListRequest& request,
                                                              const types::CancellationToken& cancellationToken,
-                                                             QMutex& catalogAccessMutex)
+                                                             QMutex& catalogAccessMutex,
+                                                             const platform::IPathIdentityService& pathIdentityService)
 {
     PreparedExport prepared;
     prepared.items.reserve(request.items.size());
@@ -328,6 +490,11 @@ constexpr int DefaultMaximumBatchWorkers = 4;
             return itemResult;
         }
         prepared.items.push_back(itemResult.value().items.constFirst());
+    }
+    if (const std::optional<types::CoreError> error = validatePreparedPathSet(prepared.items, pathIdentityService);
+        error.has_value())
+    {
+        return ExportPreparationResult::failure(*error);
     }
     return ExportPreparationResult::success(std::move(prepared));
 }
@@ -344,9 +511,11 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 [[nodiscard]] ExportPipelineResult executeItemListRequest(const ExportItemListRequest& request,
                                                           const types::CancellationToken& cancellationToken,
                                                           const ExportProgressCallback& progress,
-                                                          QMutex& catalogAccessMutex)
+                                                          QMutex& catalogAccessMutex,
+                                                          const platform::IPathIdentityService& pathIdentityService)
 {
-    const ExportPreparationResult preparation = prepareItemListRequest(request, cancellationToken, catalogAccessMutex);
+    const ExportPreparationResult preparation =
+        prepareItemListRequest(request, cancellationToken, catalogAccessMutex, pathIdentityService);
     if (preparation.hasError())
     {
         return ExportPipelineResult::failure(preparation.error());
@@ -526,7 +695,8 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 // 출력: immutable item 목록 또는 scan/output/cancellation 오류
 [[nodiscard]] ExportPreparationResult prepareBatchRequest(const ExportBatchRequest& request,
                                                           const types::CancellationToken& cancellationToken,
-                                                          QMutex& catalogAccessMutex)
+                                                          QMutex& catalogAccessMutex,
+                                                          const platform::IPathIdentityService& pathIdentityService)
 {
     if (cancellationToken.isCancellationRequested())
     {
@@ -564,6 +734,11 @@ constexpr int DefaultMaximumBatchWorkers = 4;
     {
         return ExportPreparationResult::failure(makeCancelledError());
     }
+    if (const std::optional<types::CoreError> error = validatePreparedPathSet(prepared.items, pathIdentityService);
+        error.has_value())
+    {
+        return ExportPreparationResult::failure(*error);
+    }
     return ExportPreparationResult::success(std::move(prepared));
 }
 
@@ -573,9 +748,11 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 [[nodiscard]] ExportPipelineResult executeBatchRequest(const ExportBatchRequest& request,
                                                        const types::CancellationToken& cancellationToken,
                                                        const ExportProgressCallback& progress,
-                                                       QMutex& catalogAccessMutex)
+                                                       QMutex& catalogAccessMutex,
+                                                       const platform::IPathIdentityService& pathIdentityService)
 {
-    const ExportPreparationResult preparation = prepareBatchRequest(request, cancellationToken, catalogAccessMutex);
+    const ExportPreparationResult preparation =
+        prepareBatchRequest(request, cancellationToken, catalogAccessMutex, pathIdentityService);
     if (preparation.hasError())
     {
         return ExportPipelineResult::failure(preparation.error());
@@ -658,6 +835,13 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 
 }  // namespace
 
+// 목적: OS별 prospective path 비교 service를 사용하는 file-backed export pipeline 조립
+// 입력: pathIdentityService: pipeline보다 오래 살아야 하는 Platform dependency
+// 출력: source/output 충돌을 실행 전에 판정하는 pipeline
+FileExportPipeline::FileExportPipeline(const platform::IPathIdentityService& pathIdentityService) noexcept
+    : m_pathIdentityService(&pathIdentityService)
+{}
+
 // 목적: legacy injected pipeline의 단일 file request를 기본 prepared item으로 변환
 // 입력: request: file 또는 batch 요청, cancellationToken: cooperative cancellation 상태
 // 출력: 단일 file item 또는 지원되지 않는 batch/cancellation 오류
@@ -717,15 +901,28 @@ ExportPreparationResult FileExportPipeline::prepare(const ExportRequest& request
             using RequestType = std::decay_t<decltype(typedRequest)>;
             if constexpr (std::is_same_v<RequestType, ExportFileRequest>)
             {
-                return prepareFileRequest(typedRequest, m_catalogAccessMutex, cancellationToken);
+                ExportPreparationResult prepared =
+                    prepareFileRequest(typedRequest, m_catalogAccessMutex, cancellationToken);
+                if (!prepared.hasError())
+                {
+                    if (const std::optional<types::CoreError> error =
+                            validatePreparedPathSet(prepared.value().items, *m_pathIdentityService);
+                        error.has_value())
+                    {
+                        return ExportPreparationResult::failure(*error);
+                    }
+                }
+                return prepared;
             }
             else if constexpr (std::is_same_v<RequestType, ExportBatchRequest>)
             {
-                return prepareBatchRequest(typedRequest, cancellationToken, m_catalogAccessMutex);
+                return prepareBatchRequest(
+                    typedRequest, cancellationToken, m_catalogAccessMutex, *m_pathIdentityService);
             }
             else
             {
-                return prepareItemListRequest(typedRequest, cancellationToken, m_catalogAccessMutex);
+                return prepareItemListRequest(
+                    typedRequest, cancellationToken, m_catalogAccessMutex, *m_pathIdentityService);
             }
         },
         request);
@@ -752,15 +949,18 @@ ExportPipelineResult FileExportPipeline::execute(const ExportRequest& request,
             using RequestType = std::decay_t<decltype(typedRequest)>;
             if constexpr (std::is_same_v<RequestType, ExportFileRequest>)
             {
-                return executeFileRequest(typedRequest, cancellationToken, progress, m_catalogAccessMutex);
+                return executeFileRequest(
+                    typedRequest, cancellationToken, progress, m_catalogAccessMutex, *m_pathIdentityService);
             }
             else if constexpr (std::is_same_v<RequestType, ExportBatchRequest>)
             {
-                return executeBatchRequest(typedRequest, cancellationToken, progress, m_catalogAccessMutex);
+                return executeBatchRequest(
+                    typedRequest, cancellationToken, progress, m_catalogAccessMutex, *m_pathIdentityService);
             }
             else
             {
-                return executeItemListRequest(typedRequest, cancellationToken, progress, m_catalogAccessMutex);
+                return executeItemListRequest(
+                    typedRequest, cancellationToken, progress, m_catalogAccessMutex, *m_pathIdentityService);
             }
         },
         request);

@@ -73,7 +73,7 @@ TEST(WorkerPathResolverTest, ResolvesExistingSourceAndOutputParentInsideRoots)
     ASSERT_TRUE(QDir(outputRoot.path()).mkpath(QStringLiteral("exports")));
     ASSERT_TRUE(createFile(QDir(sourceRoot.path()).filePath(QStringLiteral("originals/input.CR3"))));
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("originals/input.CR3");
     payload.outputRelativePath = QStringLiteral("exports/output.jpg");
 
@@ -100,7 +100,7 @@ TEST(WorkerPathResolverTest, ResolvesUnicodePathsInsideRoots)
     ASSERT_TRUE(QDir(outputRoot.path()).mkpath(QStringLiteral("결과")));
     ASSERT_TRUE(createFile(QDir(sourceRoot.path()).filePath(QStringLiteral("원본/사진.ARW"))));
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("원본/사진.ARW");
     payload.outputRelativePath = QStringLiteral("결과/완성.jpg");
 
@@ -121,7 +121,7 @@ TEST(WorkerPathResolverTest, RejectsAbsoluteParentAndNonPortablePaths)
     ASSERT_TRUE(sourceRoot.isValid());
     ASSERT_TRUE(outputRoot.isValid());
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.outputRelativePath = QStringLiteral("output.jpg");
 
     payload.sourceRelativePath = QDir(sourceRoot.path()).filePath(QStringLiteral("input.CR3"));
@@ -149,7 +149,7 @@ TEST(WorkerPathResolverTest, RejectsMissingSourceAndOutputParent)
     ASSERT_TRUE(sourceRoot.isValid());
     ASSERT_TRUE(outputRoot.isValid());
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("missing.CR3");
     payload.outputRelativePath = QStringLiteral("output.jpg");
 
@@ -185,7 +185,7 @@ TEST(WorkerPathResolverTest, RejectsSymlinkEscapeWhenPlatformAllowsProbe)
     }
 
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("linked/outside.CR3");
     payload.outputRelativePath = QStringLiteral("output.jpg");
 
@@ -218,7 +218,7 @@ TEST(WorkerPathResolverTest, RejectsOutputParentSymlinkEscapeWhenPlatformAllowsP
     }
 
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("input.CR3");
     payload.outputRelativePath = QStringLiteral("linked/output.jpg");
 
@@ -235,7 +235,7 @@ TEST(WorkerPathResolverTest, RejectsInvalidProcessingValuesBeforeResolution)
     ASSERT_TRUE(sourceRoot.isValid());
     ASSERT_TRUE(outputRoot.isValid());
     const WorkerPathResolver resolver = makeResolver(sourceRoot, outputRoot);
-    RenderRequestPayload payload;
+    RenderWorkerRequest payload;
     payload.sourceRelativePath = QStringLiteral("missing.CR3");
     payload.outputRelativePath = QStringLiteral("output.jpg");
     payload.outputOptions.jpegQuality = 0;
@@ -253,6 +253,20 @@ TEST(WorkerPathResolverTest, RejectsMissingConfiguredRoot)
 
     const WorkerPathResolver::CreateResult result =
         WorkerPathResolver::create({QStringLiteral("missing-worker-root"), outputRoot.path()});
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(WorkerPathErrorCode::InvalidRoot, result.error().code);
+}
+
+TEST(WorkerPathResolverTest, RejectsOuterWhitespaceInConfiguredRoot)
+{
+    QTemporaryDir sourceRoot;
+    QTemporaryDir outputRoot;
+    ASSERT_TRUE(sourceRoot.isValid());
+    ASSERT_TRUE(outputRoot.isValid());
+
+    const WorkerPathResolver::CreateResult result =
+        WorkerPathResolver::create({sourceRoot.path() + QLatin1Char(' '), outputRoot.path()});
 
     ASSERT_TRUE(result.hasError());
     EXPECT_EQ(WorkerPathErrorCode::InvalidRoot, result.error().code);

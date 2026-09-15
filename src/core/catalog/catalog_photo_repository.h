@@ -7,6 +7,7 @@
 
 #include "catalog_database.h"
 #include "catalog_entry.h"
+#include "catalog_folder_summary.h"
 #include "catalog_photo_page.h"
 #include "result.h"
 
@@ -14,6 +15,7 @@ namespace flexraw::core::catalog
 {
 
 using CatalogPhotoStoreResult = types::Result<int, types::CoreError>;
+using CatalogFolderQueryResult = types::Result<QVector<CatalogFolderSummary>, types::CoreError>;
 using CatalogPhotoQueryResult = types::Result<CatalogPhotoPage, types::CoreError>;
 using CatalogPhotoRecordResult = types::Result<std::optional<CatalogPhotoRecord>, types::CoreError>;
 using CatalogPhotoMutationResult = types::Result<std::monostate, types::CoreError>;
@@ -36,6 +38,11 @@ public:
     // 입력: request: page 크기, 이동 방향, optional exclusive cursor와 folder scope
     // 출력: 오름차순 record와 이전·다음 cursor 또는 validation·database 오류
     [[nodiscard]] CatalogPhotoQueryResult queryPage(const CatalogPhotoPageRequest& request) const;
+
+    // 목적: linked photo가 존재하는 Catalog Folder path와 photo 수 조회
+    // 입력: 없음
+    // 출력: path 순서의 distinct Folder summary 또는 database 오류
+    [[nodiscard]] CatalogFolderQueryResult queryFolders() const;
 
     // 목적: catalog-local PhotoId로 photo record 조회
     // 입력: photoId: 조회할 안정적 photo identity

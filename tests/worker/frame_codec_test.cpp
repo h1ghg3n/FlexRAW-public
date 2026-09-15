@@ -41,7 +41,7 @@ TEST(FrameCodecTest, WritesStableBigEndianHeader)
     const QByteArray& bytes = result.value();
     ASSERT_EQ(ProtocolHeaderBytes + 3, bytes.size());
     const QByteArray expectedHeader =
-        QByteArray("FRWK", 4) + QByteArray::fromHex("0001000100010000010203040506070800000003");
+        QByteArray("FRWK", 4) + QByteArray::fromHex("0001000200010000010203040506070800000003");
     EXPECT_EQ(expectedHeader, bytes.first(ProtocolHeaderBytes));
 }
 

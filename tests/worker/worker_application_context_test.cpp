@@ -1,6 +1,9 @@
 #include <utility>
 
+#include <QFileInfo>
 #include <QHostAddress>
+#include <QProcess>
+#include <QTcpServer>
 #include <QTemporaryDir>
 
 #include <gtest/gtest.h>
@@ -45,6 +48,40 @@ TEST(WorkerApplicationContextTest, OwnsListeningServerAndBoundedSchedulerLifecyc
     context.shutdown();
     EXPECT_FALSE(context.runtimeSnapshot().accepting);
     EXPECT_FALSE(context.listen(QHostAddress::LocalHost, 0));
+}
+
+TEST(WorkerApplicationContextTest, ProcessReportsOccupiedPortAndExitsAfterSafeTeardown)
+{
+    QTemporaryDir sourceRoot;
+    QTemporaryDir outputRoot;
+    ASSERT_TRUE(sourceRoot.isValid());
+    ASSERT_TRUE(outputRoot.isValid());
+
+    QTcpServer occupiedPort;
+    ASSERT_TRUE(occupiedPort.listen(QHostAddress::LocalHost, 0));
+    ASSERT_GT(occupiedPort.serverPort(), 0);
+
+    const QString executable = QString::fromUtf8(FLEXRAW_WORKER_EXECUTABLE_PATH);
+    ASSERT_TRUE(QFileInfo::exists(executable));
+
+    QProcess process;
+    process.setProgram(executable);
+    process.setArguments({QStringLiteral("--source-root"),
+                          sourceRoot.path(),
+                          QStringLiteral("--output-root"),
+                          outputRoot.path(),
+                          QStringLiteral("--listen-address"),
+                          QStringLiteral("127.0.0.1"),
+                          QStringLiteral("--port"),
+                          QString::number(occupiedPort.serverPort())});
+    process.start();
+    ASSERT_TRUE(process.waitForStarted(5'000));
+    ASSERT_TRUE(process.waitForFinished(10'000));
+
+    EXPECT_EQ(process.exitStatus(), QProcess::NormalExit);
+    EXPECT_EQ(process.exitCode(), 3);
+    EXPECT_TRUE(process.readAllStandardError().contains("Unable to listen:"));
+    EXPECT_TRUE(occupiedPort.isListening());
 }
 
 }  // namespace

@@ -8,12 +8,18 @@ target_sources(flexraw_core_catalog PRIVATE
     catalog_database.h
     catalog_develop_repository.cpp
     catalog_develop_repository.h
+    catalog_folder_summary.h
     catalog_preset_repository.h
     catalog_folder_importer.cpp
     catalog_folder_importer.h
     catalog_photo_page.h
     catalog_photo_repository.cpp
     catalog_photo_repository.h
+    catalog_path.cpp
+    catalog_path.h
+    catalog_project.h
+    catalog_project_repository.cpp
+    catalog_project_repository.h
     folder_scanner.cpp
     folder_scanner.h
     source_binding.cpp
@@ -34,6 +40,7 @@ qt_add_resources(flexraw_core_catalog catalog_migrations
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v5__separate_photo_identity.sql"
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v6__add_develop_revision.sql"
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v7__add_source_parent_path.sql"
+          "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v8__create_projects.sql"
 )
 
 target_include_directories(flexraw_core_catalog PUBLIC

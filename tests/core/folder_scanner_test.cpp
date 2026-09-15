@@ -27,6 +27,17 @@ TEST(FolderScanner, ReturnsInvalidArgumentForEmptyPath)
     EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
 }
 
+TEST(FolderScanner, RejectsOuterWhitespaceWithoutScanningAnotherFolder)
+{
+    QTemporaryDir folder;
+    ASSERT_TRUE(folder.isValid());
+
+    const CatalogScanResult result = scanFolder(folder.path() + QLatin1Char(' '));
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+}
+
 TEST(FolderScanner, ReturnsNotFoundForMissingFolder)
 {
     QTemporaryDir folder;

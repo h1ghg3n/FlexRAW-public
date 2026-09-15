@@ -1,3 +1,4 @@
+#include <QApplication>
 #include <QComboBox>
 #include <QGroupBox>
 #include <QObject>
@@ -8,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "adjustment_control.h"
 #include "develop_panel.h"
 
 namespace flexraw::ui::editor
@@ -28,11 +30,60 @@ TEST(DevelopPanelTest, EmitsParamsChangedForSliderInput)
 
     QSlider* exposureSlider = panel.findChild<QSlider*>(QStringLiteral("exposureSlider"));
     ASSERT_NE(exposureSlider, nullptr);
-    exposureSlider->setValue(15);
+    exposureSlider->setValue(150);
 
     EXPECT_EQ(signalCount, 1);
     EXPECT_FLOAT_EQ(emittedParams.exposureEv, 1.5F);
     EXPECT_FLOAT_EQ(panel.params().exposureEv, 1.5F);
+}
+
+TEST(DevelopPanelTest, StyleSwitchPreservesParamsWithoutCreatingHistoryEvent)
+{
+    DevelopPanel panel;
+    core::types::DevelopParams params;
+    params.exposureEv = 0.35F;
+    panel.setParams(params);
+    int paramsChangedCount = 0;
+    int adjustmentStartedCount = 0;
+    int adjustmentFinishedCount = 0;
+    QObject::connect(&panel, &DevelopPanel::paramsChanged, [&paramsChangedCount](const core::types::DevelopParams&) {
+        ++paramsChangedCount;
+    });
+    QObject::connect(&panel, &DevelopPanel::adjustmentStarted, [&adjustmentStartedCount] { ++adjustmentStartedCount; });
+    QObject::connect(
+        &panel, &DevelopPanel::adjustmentFinished, [&adjustmentFinishedCount] { ++adjustmentFinishedCount; });
+
+    panel.setAdjustmentControlStyle(AdjustmentControlStyle::Relative);
+
+    EXPECT_EQ(AdjustmentControlStyle::Relative, panel.adjustmentControlStyle());
+    EXPECT_FLOAT_EQ(0.35F, panel.params().exposureEv);
+    EXPECT_EQ(0, paramsChangedCount);
+    EXPECT_EQ(0, adjustmentStartedCount);
+    EXPECT_EQ(0, adjustmentFinishedCount);
+    const QList<AdjustmentParameterControl*> controls = panel.findChildren<AdjustmentParameterControl*>();
+    ASSERT_EQ(26, controls.size());
+    for (const AdjustmentParameterControl* control : controls)
+    {
+        EXPECT_EQ(AdjustmentControlStyle::Relative, control->controlStyle());
+    }
+}
+
+TEST(DevelopPanelTest, UsesFullWidthCommonRowsForLightSliders)
+{
+    DevelopPanel panel;
+    panel.resize(320, 900);
+    panel.show();
+    QApplication::processEvents();
+    auto* exposureControl = panel.findChild<AdjustmentParameterControl*>(QStringLiteral("exposureAdjustmentControl"));
+    auto* contrastControl = panel.findChild<AdjustmentParameterControl*>(QStringLiteral("contrastAdjustmentControl"));
+    ASSERT_NE(nullptr, exposureControl);
+    ASSERT_NE(nullptr, contrastControl);
+
+    EXPECT_EQ(200, panel.minimumWidth());
+    EXPECT_EQ(320, panel.maximumWidth());
+    EXPECT_EQ(QSizePolicy::Expanding, exposureControl->sizePolicy().horizontalPolicy());
+    EXPECT_EQ(QSizePolicy::Expanding, contrastControl->sizePolicy().horizontalPolicy());
+    EXPECT_EQ(exposureControl->width(), contrastControl->width());
 }
 
 TEST(DevelopPanelTest, AppliesDehazeFromSlider)

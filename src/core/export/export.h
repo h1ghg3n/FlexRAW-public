@@ -33,6 +33,11 @@ using RasterSourceImageResult = types::Result<QImage, types::CoreError>;
 // 출력: 정규화된 절대 경로 또는 구조화된 오류
 [[nodiscard]] RasterExportPathResult validateRasterExportPath(const QString& outputPath);
 
+// 목적: 두 export 경로가 정규화 또는 실제 file identity 기준으로 같은 대상을 가리키는지 판정
+// 입력: firstPath/secondPath: 비교할 source 또는 output 경로
+// 출력: 같은 경로, symbolic link 또는 hard link 대상이면 true
+[[nodiscard]] bool exportPathsReferToSameFile(const QString& firstPath, const QString& secondPath);
+
 // 목적: LibRaw decode bitmap을 raster export용 독립 sRGB QImage로 변환
 // 입력: rawImage: LibRaw가 반환한 bitmap과 남은 orientation
 // 출력: color tag와 orientation이 적용된 image 또는 bitmap 구조 오류

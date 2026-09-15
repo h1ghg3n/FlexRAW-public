@@ -9,6 +9,7 @@ target_sources(flexraw_core_tests PRIVATE
     catalog_develop_repository_test.cpp
     catalog_folder_importer_test.cpp
     catalog_photo_repository_test.cpp
+    catalog_project_repository_test.cpp
     catalog_preset_repository_test.cpp
     clipping_test.cpp
     color_test.cpp
@@ -20,9 +21,7 @@ target_sources(flexraw_core_tests PRIVATE
     develop_history_test.cpp
     export_test.cpp
     preview_cache_test.cpp
-    progressive_preview_controller_test.cpp
     raw_file_reader_test.cpp
-    standard_preview_worker_test.cpp
     source_binding_test.cpp
     source_fingerprint_test.cpp
     source_path_test.cpp

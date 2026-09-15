@@ -1,6 +1,10 @@
+#include <vector>
+
+#include <QApplication>
 #include <QItemSelection>
 #include <QItemSelectionModel>
 #include <QListWidgetItem>
+#include <QScrollBar>
 
 #include <gtest/gtest.h>
 
@@ -189,6 +193,49 @@ TEST(CatalogListWidgetTest, AppliesSourceUpdateAndSelectsCreatedIdentityWithoutS
     EXPECT_EQ(1, widget.currentRow());
     EXPECT_EQ(QStringLiteral("replacement.jpg"), widget.item(1)->text());
     EXPECT_EQ(1, catalogSelectionCount);
+}
+
+TEST(CatalogListWidgetTest, MaterializesOnlyVisibleAndAdjacentThumbnailRows)
+{
+    CatalogListWidget widget;
+    widget.resize(280, 240);
+    widget.show();
+    std::vector<core::client::ReplaceCatalogThumbnailWindowCommand> requestedWindows;
+    QObject::connect(&widget,
+                     &CatalogListWidget::thumbnailWindowChanged,
+                     &widget,
+                     [&requestedWindows](const core::client::ReplaceCatalogThumbnailWindowCommand& command) {
+                         requestedWindows.push_back(command);
+                     });
+    QVector<core::catalog::CatalogPhotoRecord> photos;
+    for (int index = 0; index < 20; ++index)
+    {
+        photos.push_back(makePhoto(index + 1, QStringLiteral("photo-%1.jpg").arg(index)));
+    }
+
+    widget.setPhotos(photos);
+    QApplication::processEvents();
+    QApplication::processEvents();
+
+    ASSERT_FALSE(requestedWindows.empty());
+    const core::client::ReplaceCatalogThumbnailWindowCommand firstWindow = requestedWindows.back();
+    ASSERT_FALSE(firstWindow.items.empty());
+    EXPECT_LT(firstWindow.items.size(), static_cast<std::size_t>(photos.size()));
+    EXPECT_EQ(core::client::CatalogThumbnailIdentityKind::CatalogPhoto, firstWindow.items.front().identity.kind);
+    widget.acceptThumbnailWindow({7});
+    QImage thumbnail(2, 1, QImage::Format_RGB32);
+    thumbnail.fill(Qt::blue);
+    widget.applyThumbnail({7}, firstWindow.items.front().identity, thumbnail);
+    EXPECT_FALSE(widget.item(0)->icon().isNull());
+
+    widget.verticalScrollBar()->setValue(widget.verticalScrollBar()->maximum());
+    QApplication::processEvents();
+    QApplication::processEvents();
+
+    EXPECT_TRUE(widget.item(0)->icon().isNull());
+    ASSERT_GE(requestedWindows.size(), 2);
+    EXPECT_LT(requestedWindows.back().items.size(), static_cast<std::size_t>(photos.size()));
+    EXPECT_NE(firstWindow.items.front().identity, requestedWindows.back().items.front().identity);
 }
 
 }  // namespace

@@ -21,13 +21,13 @@ namespace
 
 struct RenderJobKeyHash final
 {
-    // 목적: session-scoped JobId pair를 unordered active map hash로 결합
-    // 입력: key: Worker session과 wire JobId
+    // 목적: session-scoped Runtime job identity pair를 unordered active map hash로 결합
+    // 입력: key: Worker session과 Runtime-owned job identity
     // 출력: process-local hash 값
     [[nodiscard]] std::size_t operator()(const RenderJobKey& key) const noexcept
     {
         const std::size_t sessionHash = std::hash<WorkerSessionId>{}(key.sessionId);
-        const std::size_t jobHash = std::hash<protocol::JobId>{}(key.jobId);
+        const std::size_t jobHash = std::hash<std::uint64_t>{}(key.jobId.value);
         return sessionHash ^ (jobHash + 0x9E3779B9U + (sessionHash << 6U) + (sessionHash >> 2U));
     }
 };
@@ -108,7 +108,7 @@ struct JobScheduler::Implementation final
     // 출력: accepted 또는 validation/resource 거절 상태
     [[nodiscard]] SubmitStatus submit(ScheduledRenderJob job, RenderJobCompletion completion)
     {
-        if (job.key.sessionId == 0 || job.key.jobId == 0)
+        if (job.key.sessionId == 0 || job.key.jobId.value == 0)
         {
             return SubmitStatus::InvalidJobId;
         }
@@ -153,7 +153,7 @@ struct JobScheduler::Implementation final
     }
 
     // 목적: active queued/running job을 찾아 cancellation state 갱신
-    // 입력: key: Worker session과 wire JobId를 결합한 active identity
+    // 입력: key: Worker session과 Runtime job identity를 결합한 active identity
     // 출력: cancellation 요청 또는 queued terminal completion을 수행했으면 true
     [[nodiscard]] bool cancel(const RenderJobKey key)
     {
@@ -166,7 +166,7 @@ struct JobScheduler::Implementation final
                 return false;
             }
 
-            const std::shared_ptr<JobState>& state = jobIterator->second;
+            const std::shared_ptr<JobState> state = jobIterator->second;
             state->cancellation.requestCancellation();
             if (state->running)
             {
@@ -231,7 +231,12 @@ struct JobScheduler::Implementation final
         const std::scoped_lock lock(m_mutex);
         const core::measurement::HighWaterSnapshot queued = m_queuedCounter.snapshot();
         const core::measurement::HighWaterSnapshot running = m_runningCounter.snapshot();
-        return {queued.current, running.current, {queued.highWater, running.highWater}, m_accepting};
+        return {queued.current,
+                running.current,
+                m_maxConcurrency,
+                m_queueCapacity,
+                {queued.highWater, running.highWater},
+                m_accepting};
     }
 
 private:
@@ -400,7 +405,7 @@ JobScheduler::~JobScheduler()
 }
 
 // 목적: job을 즉시 실행하거나 bounded queue에 접수
-// 입력: job: non-zero session/JobId와 resolved request, completion: 임의 thread 호출을 허용하는 terminal callback
+// 입력: job: non-zero WorkerSessionId/Runtime RenderJobId와 resolved request, completion: 임의 thread terminal callback
 // 출력: 접수 여부와 duplicate/full/shutdown 거절 사유
 SubmitStatus JobScheduler::submit(ScheduledRenderJob job, RenderJobCompletion completion)
 {
@@ -408,7 +413,7 @@ SubmitStatus JobScheduler::submit(ScheduledRenderJob job, RenderJobCompletion co
 }
 
 // 목적: queued 또는 running job에 cooperative cancellation 요청
-// 입력: key: session과 wire JobId를 결합한 active identity
+// 입력: key: WorkerSessionId와 Runtime-owned RenderJobId를 결합한 active identity
 // 출력: active job을 찾아 취소했으면 true
 bool JobScheduler::cancel(const RenderJobKey key)
 {

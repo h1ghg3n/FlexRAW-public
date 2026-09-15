@@ -4,12 +4,11 @@
 
 #include <QWidget>
 
+#include "adjustment_control_style.h"
 #include "develop_params.h"
 
-class QDoubleSpinBox;
-class QFormLayout;
 class QComboBox;
-class QSlider;
+class QFormLayout;
 class QSpinBox;
 
 namespace flexraw::core::develop
@@ -21,6 +20,8 @@ namespace flexraw::ui::editor
 {
 
 class HistogramWidget;
+class AdjustmentParameterControl;
+struct AdjustmentParameterConfiguration;
 
 class DevelopPanel : public QWidget
 {
@@ -57,6 +58,21 @@ public:
     // 출력: histogram widget repaint 예약
     void clearHistogram();
 
+    // 목적: navigation 또는 외부 state 전환 전에 진행 중인 adjustment transaction 종료
+    // 입력: 없음
+    // 출력: 진행 중인 조작이 있으면 adjustmentFinished signal 발생
+    void finishActiveAdjustment();
+
+    // 목적: 모든 Develop parameter 의미를 유지하며 adjustment presentation 교체
+    // 입력: style: Classic 또는 Relative
+    // 출력: style 변경은 paramsChanged나 history signal을 발생시키지 않음
+    void setAdjustmentControlStyle(AdjustmentControlStyle style);
+
+    // 목적: 현재 adjustment presentation preference 반환
+    // 입력: 없음
+    // 출력: Classic 또는 Relative style
+    [[nodiscard]] AdjustmentControlStyle adjustmentControlStyle() const;
+
 signals:
     // 목적: 사용자가 수정한 develop parameter를 editor 조립 계층에 전달
     // 입력: params: 갱신된 develop parameter 값
@@ -74,12 +90,20 @@ signals:
     void adjustmentFinished();
 
 private:
-    struct NormalizedControl
+    struct ParameterControlBinding
     {
-        QSlider* slider{nullptr};
-        QSpinBox* spinBox{nullptr};
+        AdjustmentParameterControl* control{nullptr};
         float core::types::DevelopParams::* parameter{nullptr};
     };
+
+    // 목적: 공통 label/value와 Classic/Relative presentation을 가진 parameter control 생성
+    // 입력: layout: 추가 대상, configuration: 표시·범위·rate, parameter: 연결할 DevelopParams member,
+    //       activatesCustomWhiteBalance: 변경 시 Custom White Balance로 전환할지 여부
+    // 출력: 생성되어 layout과 parameter에 연결된 control
+    AdjustmentParameterControl* addParameterControl(QFormLayout* layout,
+                                                    const AdjustmentParameterConfiguration& configuration,
+                                                    float core::types::DevelopParams::* parameter,
+                                                    bool activatesCustomWhiteBalance = false);
 
     // 목적: 노출 control을 생성하고 DevelopParams::exposureEv에 연결
     // 입력: layout: control을 추가할 form layout
@@ -131,18 +155,12 @@ private:
     void finishAdjustment();
 
     core::types::DevelopParams m_params;
-    QSlider* m_exposureSlider{nullptr};
-    QDoubleSpinBox* m_exposureSpinBox{nullptr};
     QComboBox* m_whiteBalanceModeCombo{nullptr};
     QSpinBox* m_whiteBalanceTemperatureSpinBox{nullptr};
-    QSlider* m_whiteBalanceTintSlider{nullptr};
-    QSpinBox* m_whiteBalanceTintSpinBox{nullptr};
-    QSlider* m_sharpeningRadiusSlider{nullptr};
-    QSpinBox* m_sharpeningRadiusSpinBox{nullptr};
-    QSlider* m_sharpeningMaskingSlider{nullptr};
-    QSpinBox* m_sharpeningMaskingSpinBox{nullptr};
+    AdjustmentParameterControl* m_whiteBalanceTintControl{nullptr};
     HistogramWidget* m_histogramWidget{nullptr};
-    std::vector<NormalizedControl> m_normalizedControls;
+    std::vector<ParameterControlBinding> m_parameterControls;
+    AdjustmentControlStyle m_adjustmentControlStyle{AdjustmentControlStyle::Classic};
     bool m_adjustmentInProgress{false};
 };
 

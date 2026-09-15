@@ -83,6 +83,21 @@ public:
         return RemoteRenderResult::success({{request.outputRelativePath, 1234}, {}});
     }
 
+    // 목적: accepted-aware interface에서도 fake의 동기 callback 계약 보존
+    // 입력: endpoint/request/token: 실행 값, accepted: 같은 thread의 ownership callback
+    // 출력: callback 완료 뒤 3-argument fake 결과
+    [[nodiscard]] RemoteRenderResult execute(const RemoteRenderEndpoint& endpoint,
+                                             const RemoteRenderRequest& request,
+                                             const core::types::CancellationToken& cancellationToken,
+                                             const RemoteRenderAcceptedCallback& accepted) const override
+    {
+        if (accepted)
+        {
+            accepted();
+        }
+        return execute(endpoint, request, cancellationToken);
+    }
+
     // 목적: worker thread가 기록한 request snapshot 반환
     // 입력: 없음
     // 출력: execute 전이면 빈 optional, 이후면 RemoteRenderRequest 복사본
@@ -126,6 +141,21 @@ public:
              {core::types::ErrorCode::Cancelled, QStringLiteral("Fake remote render cancelled.")},
              {},
              std::nullopt});
+    }
+
+    // 목적: accepted-aware interface에서도 cancellation fake의 동기 callback 계약 보존
+    // 입력: endpoint/request/token: 실행 값, accepted: 같은 thread의 ownership callback
+    // 출력: callback 완료 뒤 cancellation 대기 결과
+    [[nodiscard]] RemoteRenderResult execute(const RemoteRenderEndpoint& endpoint,
+                                             const RemoteRenderRequest& request,
+                                             const core::types::CancellationToken& cancellationToken,
+                                             const RemoteRenderAcceptedCallback& accepted) const override
+    {
+        if (accepted)
+        {
+            accepted();
+        }
+        return execute(endpoint, request, cancellationToken);
     }
 
 private:
