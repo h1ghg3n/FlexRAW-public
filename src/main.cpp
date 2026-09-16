@@ -17,6 +17,7 @@ int runDesktopProcess(int argc, char* argv[])
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("Flexraw"));
     QCoreApplication::setApplicationName(QStringLiteral("Flexraw"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(FLEXRAW_VERSION_STRING));
     flexraw::core::util::initializeLogging();
     LOG_INFO("app", "Flexraw process started");
 

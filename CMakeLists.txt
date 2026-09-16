@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
-project(flexraw VERSION 0.1.0 LANGUAGES CXX)
+project(flexraw VERSION 0.2.0 LANGUAGES CXX)
 
-set(FLEXRAW_VERSION_PRERELEASE "alpha.5")
+set(FLEXRAW_VERSION_PRERELEASE "alpha.1")
 set(FLEXRAW_VERSION_STRING "${PROJECT_VERSION}-${FLEXRAW_VERSION_PRERELEASE}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -47,6 +47,10 @@ add_subdirectory(src)
 
 if(FLEXRAW_BUILD_DESKTOP)
 qt_add_executable(flexraw src/main.cpp)
+
+target_compile_definitions(flexraw PRIVATE
+    FLEXRAW_VERSION_STRING="${FLEXRAW_VERSION_STRING}"
+)
 
 if(WIN32)
     if(FLEXRAW_WINDOWS_DEBUG_CONSOLE)
