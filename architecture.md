@@ -69,9 +69,10 @@ Platform service / persistence / pipeline
 소멸 시에는 역순으로 callback 입구와 Adapter를 먼저 닫고, background operation을 취소·대기한 뒤 dependency를 파괴합니다.
 MCP process도 EOF에서 subscription을 먼저 닫고 Runtime을 종료합니다.
 
-현재 Product Runtime은 Catalog session, Catalog/Project, Editor와 Source Resolution authority를 공유합니다. Preview, thumbnail과
-Export의 전체 ownership은 Desktop use case에 남아 있으며, 실제 두 번째 consumer가 필요로 하는 vertical slice에서만 Runtime으로
-점진적으로 이동합니다.
+현재 Product Runtime은 Catalog session, Catalog/Project, Editor와 Source Resolution authority 및 주입된 capability를 사용하는
+Preview Orchestrator를 소유합니다. Desktop은 실제 Preview pipeline과 presentation Adapter를 조립하며 MCP는 unavailable Preview
+capability를 주입합니다. Thumbnail과 Export의 ownership은 Desktop use case에 남아 있고 실제 두 번째 consumer가 필요로 하는
+vertical slice에서만 Runtime으로 점진적으로 이동합니다.
 
 ## 4. Product Contract
 
@@ -105,8 +106,9 @@ Folder scan
 ```
 
 입력 path의 앞뒤 whitespace를 조용히 제거하지 않습니다. Existing source는 filesystem identity로 비교하며, 아직 생성되지 않은
-Export destination은 현재 OS Adapter가 제공하는 transient comparison key를 사용합니다. Windows는 case-insensitive semantics를,
-Linux는 현재 filesystem evidence를 기준으로 fail-closed 비교를 수행합니다.
+Export destination은 현재 OS Adapter가 제공하는 transient comparison key를 사용합니다. Windows는 parent directory의
+case-sensitive 설정을 반영하고, Linux는 filesystem evidence로 exact-name 비교가 안전한지 확인합니다. 의미를 확정할 수 없으면
+fail closed합니다.
 
 Source가 없어지거나 같은 path의 content가 바뀌더라도 Photo identity와 Develop state를 즉시 버리지 않습니다. Missing,
 replacement와 unreadable 상태를 기록하고 사용자가 replacement 수용, 새 Photo 등록 또는 relink를 선택할 수 있도록 합니다.
@@ -187,8 +189,8 @@ service를 사용해 생성 전에 차단합니다.
 | processing | `ResolvedRenderPipeline`을 호출합니다. |
 | app | concrete dependency와 startup/shutdown을 조립합니다. |
 
-TCP `ProtocolSession`은 concrete `JobScheduler` 대신 `IRenderWorkerRuntimePort`를 소비합니다. Wire `JobId`와 Runtime job identity의
-mapping은 session 내부에만 존재합니다.
+TCP `ProtocolSession`은 concrete `JobScheduler` 대신 `flexraw_worker_runtime_port` target의 `IRenderWorkerRuntime` interface를
+소비합니다. Wire `JobId`와 Runtime job identity의 mapping은 session 내부에만 존재합니다.
 
 Scheduler는 bounded running slot과 waiting queue를 사용합니다. Queue capacity와 resource admission은 서로 다른 제한입니다.
 Queued/running cancellation은 terminal을 정확히 한 번만 반환해야 하며 shutdown은 신규 접수 차단, active session 종료,
