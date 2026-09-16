@@ -9,11 +9,13 @@ target_sources(flexraw_core_tests PRIVATE
     catalog_develop_repository_test.cpp
     catalog_folder_importer_test.cpp
     catalog_photo_repository_test.cpp
+    catalog_project_repository_test.cpp
     catalog_preset_repository_test.cpp
     clipping_test.cpp
     color_test.cpp
     folder_scanner_test.cpp
     develop_test.cpp
+    display_frame_test.cpp
     histogram_test.cpp
     measurement_test.cpp
     render_test.cpp

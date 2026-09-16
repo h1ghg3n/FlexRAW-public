@@ -236,7 +236,7 @@ TEST_F(CatalogDatabaseTest, CreatesInitialSchemaForNewCatalog)
     EXPECT_TRUE(QFileInfo::exists(catalogPath));
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, ReopensExistingCatalogWithoutReapplyingSchema)
@@ -254,7 +254,7 @@ TEST_F(CatalogDatabaseTest, ReopensExistingCatalogWithoutReapplyingSchema)
     ASSERT_TRUE(secondOpen.hasValue());
     const CatalogSchemaVersionResult version = secondOpen.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionOneCatalogToCurrentSchema)
@@ -269,7 +269,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionOneCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionTwoCatalogToCurrentSchema)
@@ -284,7 +284,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionTwoCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionThreeCatalogToCurrentSchema)
@@ -299,7 +299,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionThreeCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhotoId)
@@ -314,7 +314,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhoto
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(7, version.value());
+    EXPECT_EQ(8, version.value());
     CatalogPhotoRepository repository(*result.value());
     const CatalogPhotoRecordResult migrated = repository.findById(types::PhotoId{42});
     ASSERT_TRUE(migrated.hasValue());
@@ -348,6 +348,12 @@ TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhoto
         ASSERT_TRUE(
             query.exec(QStringLiteral("EXPLAIN QUERY PLAN SELECT id FROM photos WHERE source_parent_path = 'C:/photos' "
                                       "ORDER BY display_name COLLATE NOCASE, id LIMIT 100")));
+        ASSERT_TRUE(query.next());
+        EXPECT_TRUE(query.value(3).toString().contains(QStringLiteral("idx_photos_source_parent_display_name_id")));
+
+        ASSERT_TRUE(query.exec(QStringLiteral("EXPLAIN QUERY PLAN SELECT source_parent_path, COUNT(*) FROM photos "
+                                              "WHERE source_parent_path IS NOT NULL GROUP BY source_parent_path "
+                                              "ORDER BY source_parent_path ASC")));
         ASSERT_TRUE(query.next());
         EXPECT_TRUE(query.value(3).toString().contains(QStringLiteral("idx_photos_source_parent_display_name_id")));
 

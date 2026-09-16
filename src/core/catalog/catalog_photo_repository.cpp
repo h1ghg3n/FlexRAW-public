@@ -142,7 +142,7 @@ namespace
            types::hasSourceContentHash(fingerprint);
 }
 
-// 목적: bounded keyset page 요청의 크기, folder scope와 cursor invariant 검증
+// 목적: bounded keyset page 요청의 크기, mutually-exclusive scope와 cursor invariant 검증
 // 입력: request: caller가 지정한 page 조건, folderScope: 정규화된 optional exact-folder path
 // 출력: 유효하면 빈 값, 아니면 InvalidArgument 오류
 [[nodiscard]] std::optional<types::CoreError> validatePageRequest(const CatalogPhotoPageRequest& request,
@@ -169,6 +169,20 @@ namespace
             QStringLiteral("Catalog photo folder scope is invalid."),
         };
     }
+    if (request.exactFolderPath.has_value() && request.projectId.has_value())
+    {
+        return types::CoreError{
+            types::ErrorCode::InvalidArgument,
+            QStringLiteral("Catalog photo page cannot combine Folder and Project scopes."),
+        };
+    }
+    if (request.projectId.has_value() && !isValidProjectId(*request.projectId))
+    {
+        return types::CoreError{
+            types::ErrorCode::InvalidArgument,
+            QStringLiteral("Catalog photo Project scope is invalid."),
+        };
+    }
     if (request.cursor.has_value() && !types::isValidPhotoId(request.cursor->photoId))
     {
         return types::CoreError{
@@ -182,18 +196,19 @@ namespace
             request.cursor->exactFolderPath.has_value()
                 ? std::optional<QString>{normalizeSourceFolderPath(*request.cursor->exactFolderPath)}
                 : std::nullopt;
-        if ((request.cursor->exactFolderPath.has_value() && cursorScope->isEmpty()) || cursorScope != folderScope)
+        if ((request.cursor->exactFolderPath.has_value() && cursorScope->isEmpty()) || cursorScope != folderScope ||
+            request.cursor->projectId != request.projectId)
         {
             return types::CoreError{
                 types::ErrorCode::InvalidArgument,
-                QStringLiteral("Catalog photo page cursor does not match the requested folder scope."),
+                QStringLiteral("Catalog photo page cursor does not match the requested scope."),
             };
         }
     }
     return std::nullopt;
 }
 
-// 목적: page 방향, optional folder scope와 cursor에 맞는 SQLite keyset query 생성
+// 목적: page 방향, optional Folder/Project scope와 cursor에 맞는 SQLite keyset query 생성
 // 입력: request: 검증된 page 요청, folderScope: 정규화된 optional exact-folder path
 // 출력: display name·PhotoId 순서의 LIMIT query
 [[nodiscard]] QString makePageStatement(const CatalogPhotoPageRequest& request,
@@ -201,16 +216,25 @@ namespace
 {
     const bool backwards = request.direction == CatalogPhotoPageDirection::Backward;
     QString statement =
-        QStringLiteral("SELECT id, source_path, last_known_path, extension, display_name, kind, scan_status, "
+        QStringLiteral("SELECT photos.id, source_path, last_known_path, extension, display_name, kind, scan_status, "
                        "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state FROM photos ");
+    if (request.projectId.has_value())
+    {
+        statement += QStringLiteral("INNER JOIN project_photos ON project_photos.photo_id = photos.id ");
+    }
     if (folderScope.has_value())
     {
         statement += QStringLiteral("WHERE source_parent_path = :sourceParentPath ");
     }
+    else if (request.projectId.has_value())
+    {
+        statement += QStringLiteral("WHERE project_photos.project_id = :projectId ");
+    }
     if (request.cursor.has_value())
     {
         const QString comparison = backwards ? QStringLiteral("<") : QStringLiteral(">");
-        statement += folderScope.has_value() ? QStringLiteral("AND ") : QStringLiteral("WHERE ");
+        statement += (folderScope.has_value() || request.projectId.has_value()) ? QStringLiteral("AND ")
+                                                                                : QStringLiteral("WHERE ");
         statement += QStringLiteral("display_name COLLATE NOCASE %1= :cursorDisplayName COLLATE NOCASE "
                                     "AND ((display_name COLLATE NOCASE %1 :cursorDisplayName COLLATE NOCASE) "
                                     "OR (display_name COLLATE NOCASE = :cursorDisplayName COLLATE NOCASE "
@@ -224,12 +248,13 @@ namespace
 }
 
 // 목적: 반환 record의 stable sort key와 query scope를 후속 page cursor로 변환
-// 입력: photo: page 경계의 catalog photo, folderScope: page에 적용된 optional exact-folder path
-// 출력: display name, immutable PhotoId와 normalized folder scope cursor
+// 입력: photo: page 경계 record, folderScope/projectId: page에 적용된 optional scope
+// 출력: display name, immutable PhotoId와 동일 scope를 보존한 cursor
 [[nodiscard]] CatalogPhotoPageCursor makePageCursor(const CatalogPhotoRecord& photo,
-                                                    const std::optional<QString>& folderScope)
+                                                    const std::optional<QString>& folderScope,
+                                                    std::optional<ProjectId> projectId)
 {
-    return {photo.displayName, photo.id, folderScope};
+    return {photo.displayName, photo.id, folderScope, projectId};
 }
 
 }  // namespace
@@ -331,6 +356,10 @@ CatalogPhotoQueryResult CatalogPhotoRepository::queryPage(const CatalogPhotoPage
     {
         query.bindValue(QStringLiteral(":sourceParentPath"), *folderScope);
     }
+    if (request.projectId.has_value())
+    {
+        query.bindValue(QStringLiteral(":projectId"), request.projectId->value);
+    }
     if (request.cursor.has_value())
     {
         query.bindValue(QStringLiteral(":cursorDisplayName"), request.cursor->displayName);
@@ -377,22 +406,50 @@ CatalogPhotoQueryResult CatalogPhotoRepository::queryPage(const CatalogPhotoPage
     {
         if (hasMore)
         {
-            page.previousCursor = makePageCursor(page.photos.front(), folderScope);
+            page.previousCursor = makePageCursor(page.photos.front(), folderScope, request.projectId);
         }
-        page.nextCursor = makePageCursor(page.photos.back(), folderScope);
+        page.nextCursor = makePageCursor(page.photos.back(), folderScope, request.projectId);
     }
     else
     {
         if (request.cursor.has_value())
         {
-            page.previousCursor = makePageCursor(page.photos.front(), folderScope);
+            page.previousCursor = makePageCursor(page.photos.front(), folderScope, request.projectId);
         }
         if (hasMore)
         {
-            page.nextCursor = makePageCursor(page.photos.back(), folderScope);
+            page.nextCursor = makePageCursor(page.photos.back(), folderScope, request.projectId);
         }
     }
     return CatalogPhotoQueryResult::success(std::move(page));
+}
+
+// 목적: linked photo가 존재하는 Catalog Folder path와 photo 수 조회
+// 입력: 없음
+// 출력: path 순서의 distinct Folder summary 또는 database 오류
+CatalogFolderQueryResult CatalogPhotoRepository::queryFolders() const
+{
+    QSqlQuery query(m_database.m_database);
+    if (!query.exec(QStringLiteral("SELECT source_parent_path, COUNT(*) FROM photos "
+                                   "WHERE source_parent_path IS NOT NULL "
+                                   "GROUP BY source_parent_path ORDER BY source_parent_path ASC")))
+    {
+        return CatalogFolderQueryResult::failure(
+            makeDatabaseError(QStringLiteral("Unable to query catalog folders: %1").arg(query.lastError().text())));
+    }
+
+    QVector<CatalogFolderSummary> folders;
+    while (query.next())
+    {
+        CatalogFolderSummary folder{query.value(0).toString(), query.value(1).toLongLong()};
+        if (folder.path.trimmed().isEmpty() || folder.photoCount <= 0)
+        {
+            return CatalogFolderQueryResult::failure(
+                makeDatabaseError(QStringLiteral("The catalog contains an invalid folder summary.")));
+        }
+        folders.push_back(std::move(folder));
+    }
+    return CatalogFolderQueryResult::success(std::move(folders));
 }
 
 // 목적: catalog-local PhotoId로 photo record 조회

@@ -41,7 +41,7 @@ struct CatalogMigration
     const char* resourcePath;
 };
 
-constexpr std::array<CatalogMigration, 7> CatalogMigrations{
+constexpr std::array<CatalogMigration, 8> CatalogMigrations{
     CatalogMigration{1, ":/sql/migrations/v1__init.sql"},
     CatalogMigration{2, ":/sql/migrations/v2__create_photos.sql"},
     CatalogMigration{3, ":/sql/migrations/v3__create_develop_state.sql"},
@@ -49,6 +49,7 @@ constexpr std::array<CatalogMigration, 7> CatalogMigrations{
     CatalogMigration{5, ":/sql/migrations/v5__separate_photo_identity.sql"},
     CatalogMigration{6, ":/sql/migrations/v6__add_develop_revision.sql"},
     CatalogMigration{7, ":/sql/migrations/v7__add_source_parent_path.sql"},
+    CatalogMigration{8, ":/sql/migrations/v8__create_projects.sql"},
 };
 
 constexpr int CurrentSchemaVersion = CatalogMigrations.back().version;

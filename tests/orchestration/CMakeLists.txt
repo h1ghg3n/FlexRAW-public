@@ -6,6 +6,7 @@ set_target_properties(flexraw_orchestration_tests PROPERTIES
 
 target_sources(flexraw_orchestration_tests PRIVATE
     catalog_orchestrator_test.cpp
+    catalog_thumbnail_orchestrator_test.cpp
     editor_orchestrator_test.cpp
     export_orchestrator_test.cpp
     export_placement_test.cpp

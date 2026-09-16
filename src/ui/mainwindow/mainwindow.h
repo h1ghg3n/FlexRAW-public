@@ -5,9 +5,12 @@
 #include <QHash>
 #include <QMainWindow>
 
+#include "activity_client.h"
 #include "catalog_contracts.h"
 #include "catalog_entry.h"
+#include "catalog_photo_client.h"
 #include "develop_params.h"
+#include "editor_event_client.h"
 
 namespace flexraw::ui::catalog
 {
@@ -41,10 +44,14 @@ class CatalogEditorFacade;
 namespace flexraw::ui::mainwindow
 {
 class FolderScanController;
-}
+class QtActivityAdapter;
+}  // namespace flexraw::ui::mainwindow
 
 class QAction;
 class QCloseEvent;
+class QComboBox;
+class QLabel;
+class QProgressBar;
 class QStackedWidget;
 class QTimer;
 class QToolButton;
@@ -71,6 +78,26 @@ protected:
     void closeEvent(QCloseEvent* event) override;
 
 private:
+    // 목적: status bar의 compact Activity label, indeterminate progress와 cancel control 구성
+    // 입력: 없음
+    // 출력: 초기에는 숨겨진 Activity presentation widget 생성
+    void initializeActivityStatus();
+
+    // 목적: Qt-free Activity client를 실제 MainWindow presentation consumer에 연결
+    // 입력: 없음
+    // 출력: RAII subscription 보관 또는 구조화된 오류 logging
+    void subscribeToActivityEvents();
+
+    // 목적: immutable active 목록을 status bar progress와 owner cancel target에 투영
+    // 입력: event: initial 또는 lifecycle transition 뒤 Activity snapshot
+    // 출력: active 여부와 cancellability에 맞는 compact status UI
+    void updateActivityUi(const core::client::ActivityEvent& event);
+
+    // 목적: status bar에 선택된 cancellable Activity를 실제 owner에서 취소
+    // 입력: 없음
+    // 출력: cancellation command 전달 또는 non-modal 실패 안내
+    void cancelDisplayedActivity();
+
     // 목적: 새 catalog file 경로를 선택하고 migration된 빈 catalog 생성
     // 입력: 없음
     // 출력: 없음
@@ -91,10 +118,61 @@ private:
     // 출력: photo 목록을 정상 조회해 표시했으면 true
     [[nodiscard]] bool refreshCatalogPhotos();
 
+    // 목적: active Catalog의 distinct Folder scope를 navigation control에 반영
+    // 입력: 없음
+    // 출력: Folder summary 조회와 control 갱신에 성공하면 true
+    [[nodiscard]] bool refreshCatalogFolders();
+
+    // 목적: active Catalog Project 목록을 navigation control에 반영
+    // 입력: preferredProjectId: refresh 뒤 유지할 optional Project identity
+    // 출력: Project 조회와 control 갱신에 성공하면 true
+    [[nodiscard]] bool refreshCatalogProjects(
+        std::optional<core::catalog::ProjectId> preferredProjectId = std::nullopt);
+
+    // 목적: 사용자가 선택한 전체 Catalog 또는 exact Folder scope로 photo page 전환
+    // 입력: index: Folder scope combo box의 선택 index
+    // 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
+    void changeCatalogFolderScope(int index);
+
+    // 목적: 사용자가 선택한 Catalog/Folder 또는 Project scope로 photo page 전환
+    // 입력: index: Project scope combo box의 선택 index
+    // 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
+    void changeCatalogProjectScope(int index);
+
+    // 목적: 이름 입력을 받아 active Catalog에 Project 생성
+    // 입력: 없음
+    // 출력: 생성 성공 시 새 Project scope로 이동
+    void createProject();
+
+    // 목적: 현재 Project의 표시 이름 변경
+    // 입력: 없음
+    // 출력: 변경 성공 시 Project navigation 갱신
+    void renameCurrentProject();
+
+    // 목적: 현재 Project와 membership 삭제
+    // 입력: 없음
+    // 출력: 사용자 확인 후 Photo를 보존하고 Catalog scope로 이동
+    void removeCurrentProject();
+
+    // 목적: 현재 multi-selection Photo를 사용자가 고른 Project에 추가
+    // 입력: 없음
+    // 출력: photo별 idempotent membership command 결과를 status에 표시
+    void addSelectedPhotosToProject();
+
+    // 목적: 현재 multi-selection Photo를 active Project에서 제거
+    // 입력: 없음
+    // 출력: membership 제거 후 active Project 첫 page reload
+    void removeSelectedPhotosFromProject();
+
+    // 목적: Catalog session, active Project와 selected Photo에 맞춰 Project action 상태 갱신
+    // 입력: 없음
+    // 출력: 유효한 Project command만 활성화
+    void updateProjectActions();
+
     // 목적: cursor 요청에 해당하는 bounded Catalog photo page를 현재 목록에 적용
     // 입력: request: page 크기, 이동 방향과 exclusive cursor
     // 출력: 조회와 UI 적용에 성공하면 true
-    [[nodiscard]] bool loadCatalogPhotoPage(const core::catalog::CatalogPhotoPageRequest& request);
+    [[nodiscard]] bool loadCatalogPhotoPage(const core::client::CatalogPhotoPageRequest& request);
 
     // 목적: 현재 첫 record 이전의 Catalog photo page로 이동
     // 입력: 없음
@@ -207,6 +285,11 @@ private:
     // 출력: 없음
     void setConsoleMode(bool enabled);
 
+    // 목적: application UI preference를 편집하고 accepted style을 즉시 DevelopPanel에 반영
+    // 입력: 없음
+    // 출력: Settings dialog가 modal로 표시되고 accept 시 preference 저장
+    void openSettings();
+
     // 목적: 현재 선택 사진에 대한 develop parameter 변경을 preview와 history에 반영
     // 입력: params: panel에서 변경된 develop parameter 값
     // 출력: 없음
@@ -249,8 +332,15 @@ private:
     cli::ConsoleModeWidget* m_consoleWidget{nullptr};
     FolderScanController* m_folderScanController{nullptr};
     facade::CatalogEditorFacade* m_catalogEditorFacade{nullptr};
+    QtActivityAdapter* m_activityAdapter{nullptr};
+    core::client::EditorStateSubscriptionHandle m_editorStateSubscription;
+    core::client::ActivitySubscriptionHandle m_activitySubscription;
     core::orchestration::ExportOrchestrator* m_exportOrchestrator{nullptr};
     QStackedWidget* m_contentStack{nullptr};
+    QLabel* m_activityLabel{nullptr};
+    QProgressBar* m_activityProgressBar{nullptr};
+    QToolButton* m_cancelActivityButton{nullptr};
+    std::optional<core::client::ActivityId> m_cancelActivityId;
     QAction* m_newCatalogAction{nullptr};
     QAction* m_openCatalogAction{nullptr};
     QAction* m_importFolderAction{nullptr};
@@ -260,9 +350,20 @@ private:
     QAction* m_consoleModeAction{nullptr};
     QAction* m_undoDevelopAction{nullptr};
     QAction* m_redoDevelopAction{nullptr};
+    QAction* m_settingsAction{nullptr};
+    QAction* m_createProjectAction{nullptr};
+    QAction* m_renameProjectAction{nullptr};
+    QAction* m_removeProjectAction{nullptr};
+    QAction* m_addSelectedPhotosToProjectAction{nullptr};
+    QAction* m_removeSelectedPhotosFromProjectAction{nullptr};
     QToolButton* m_previousCatalogPageButton{nullptr};
     QToolButton* m_nextCatalogPageButton{nullptr};
-    std::optional<core::catalog::CatalogPhotoPage> m_catalogPhotoPage;
+    QComboBox* m_catalogFolderScopeComboBox{nullptr};
+    QComboBox* m_catalogProjectScopeComboBox{nullptr};
+    QToolButton* m_catalogProjectMenuButton{nullptr};
+    std::optional<core::client::CatalogPhotoPage> m_catalogPhotoPage;
+    std::optional<QString> m_catalogFolderPath;
+    std::optional<core::catalog::ProjectId> m_catalogProjectId;
     QHash<qint64, core::types::RequestId> m_sourceResolutionRequests;
     bool m_importingFolder{false};
 };

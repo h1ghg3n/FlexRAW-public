@@ -13,6 +13,7 @@
 #include "catalog_develop_repository.h"
 #include "catalog_folder_importer.h"
 #include "catalog_photo_repository.h"
+#include "catalog_project_repository.h"
 #include "log.h"
 #include "source_binding.h"
 
@@ -23,6 +24,267 @@ namespace
 
 using OptionalRequestResult = types::Result<std::optional<types::RequestId>, types::CoreError>;
 using OptionalPhotoIdResult = types::Result<std::optional<types::PhotoId>, types::CoreError>;
+
+static_assert(client::DefaultCatalogPhotoPageSize == catalog::DefaultCatalogPhotoPageSize);
+static_assert(client::MaximumCatalogPhotoPageSize == catalog::MaximumCatalogPhotoPageSize);
+
+// 목적: QString을 Qt-free client contract용 UTF-8 string으로 변환
+// 입력: value: Orchestration 또는 domain 문자열
+// 출력: byte length를 보존한 UTF-8 string
+[[nodiscard]] std::string toClientString(const QString& value)
+{
+    const QByteArray utf8 = value.toUtf8();
+    return {utf8.constData(), static_cast<std::size_t>(utf8.size())};
+}
+
+// 목적: Core error 분류와 diagnostics를 Qt-free client 오류로 변환
+// 입력: error: Orchestration 또는 domain에서 반환한 구조화된 오류
+// 출력: 같은 의미의 fixed enum과 UTF-8 technical message
+[[nodiscard]] client::ClientError toClientError(const types::CoreError& error)
+{
+    client::ClientErrorCode code = client::ClientErrorCode::Unknown;
+    switch (error.code)
+    {
+    case types::ErrorCode::Unknown:
+        code = client::ClientErrorCode::Unknown;
+        break;
+    case types::ErrorCode::InvalidArgument:
+        code = client::ClientErrorCode::InvalidArgument;
+        break;
+    case types::ErrorCode::NotFound:
+        code = client::ClientErrorCode::NotFound;
+        break;
+    case types::ErrorCode::PermissionDenied:
+        code = client::ClientErrorCode::PermissionDenied;
+        break;
+    case types::ErrorCode::UnsupportedFormat:
+        code = client::ClientErrorCode::UnsupportedFormat;
+        break;
+    case types::ErrorCode::ThumbnailUnavailable:
+        code = client::ClientErrorCode::ThumbnailUnavailable;
+        break;
+    case types::ErrorCode::DecodeFailed:
+        code = client::ClientErrorCode::DecodeFailed;
+        break;
+    case types::ErrorCode::DatabaseError:
+        code = client::ClientErrorCode::DatabaseError;
+        break;
+    case types::ErrorCode::Conflict:
+        code = client::ClientErrorCode::Conflict;
+        break;
+    case types::ErrorCode::Cancelled:
+        code = client::ClientErrorCode::Cancelled;
+        break;
+    }
+    return {code, toClientString(error.message)};
+}
+
+// 목적: persisted Project record를 Qt-free client snapshot으로 변환
+// 입력: project: Catalog repository가 반환한 Project record
+// 출력: fixed-width identity와 UTF-8 이름 snapshot
+[[nodiscard]] client::CatalogProjectSnapshot toClientProject(const catalog::CatalogProjectRecord& project)
+{
+    return {{project.id.value}, toClientString(project.name)};
+}
+
+// 목적: Project mutation의 Core 성공·오류를 Qt-free receipt result로 변환
+// 입력: result: 기존 use case 결과, receipt: 성공 시 반환할 fixed-width identity
+// 출력: identity receipt 또는 같은 분류의 client 오류
+template<typename Receipt>
+[[nodiscard]] client::ClientResult<Receipt, client::ClientError> toClientProjectMutation(
+    const CatalogProjectMutationResult& result, Receipt receipt)
+{
+    if (result.hasError())
+    {
+        return client::ClientResult<Receipt, client::ClientError>::failure(toClientError(result.error()));
+    }
+    return client::ClientResult<Receipt, client::ClientError>::success(std::move(receipt));
+}
+
+// 목적: domain file kind를 Qt-free Catalog photo kind로 변환
+// 입력: kind: persisted photo의 file 분류
+// 출력: 같은 의미의 client enum
+[[nodiscard]] client::CatalogFileKind toClientFileKind(types::SupportedFileKind kind) noexcept
+{
+    switch (kind)
+    {
+    case types::SupportedFileKind::Raw:
+        return client::CatalogFileKind::Raw;
+    case types::SupportedFileKind::RasterImage:
+        return client::CatalogFileKind::RasterImage;
+    case types::SupportedFileKind::Unknown:
+        return client::CatalogFileKind::Unknown;
+    }
+    return client::CatalogFileKind::Unknown;
+}
+
+// 목적: domain scan status를 Qt-free Catalog scan status로 변환
+// 입력: status: persisted photo scan 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] client::CatalogScanStatus toClientScanStatus(types::FileScanStatus status) noexcept
+{
+    switch (status)
+    {
+    case types::FileScanStatus::Pending:
+        return client::CatalogScanStatus::Pending;
+    case types::FileScanStatus::Ready:
+        return client::CatalogScanStatus::Ready;
+    case types::FileScanStatus::Unsupported:
+        return client::CatalogScanStatus::Unsupported;
+    case types::FileScanStatus::Failed:
+        return client::CatalogScanStatus::Failed;
+    }
+    return client::CatalogScanStatus::Pending;
+}
+
+// 목적: domain source binding state를 Qt-free Catalog source state로 변환
+// 입력: state: persisted source identity 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] client::CatalogSourceState toClientSourceState(catalog::SourceBindingState state) noexcept
+{
+    switch (state)
+    {
+    case catalog::SourceBindingState::FingerprintPending:
+        return client::CatalogSourceState::FingerprintPending;
+    case catalog::SourceBindingState::Available:
+        return client::CatalogSourceState::Available;
+    case catalog::SourceBindingState::Missing:
+        return client::CatalogSourceState::Missing;
+    case catalog::SourceBindingState::VerificationRequired:
+        return client::CatalogSourceState::VerificationRequired;
+    case catalog::SourceBindingState::IdentityUnverified:
+        return client::CatalogSourceState::IdentityUnverified;
+    case catalog::SourceBindingState::ReplacementDetected:
+        return client::CatalogSourceState::ReplacementDetected;
+    case catalog::SourceBindingState::Unreadable:
+        return client::CatalogSourceState::Unreadable;
+    case catalog::SourceBindingState::Unlinked:
+        return client::CatalogSourceState::Unlinked;
+    }
+    return client::CatalogSourceState::FingerprintPending;
+}
+
+// 목적: source fingerprint metadata와 optional SHA-256를 Qt-free snapshot으로 변환
+// 입력: fingerprint: Catalog에 저장된 source observation baseline
+// 출력: fixed-width metadata와 byte vector
+[[nodiscard]] client::CatalogSourceFingerprint toClientFingerprint(const types::SourceFingerprint& fingerprint)
+{
+    client::CatalogSourceFingerprint snapshot;
+    snapshot.sizeBytes = fingerprint.sizeBytes;
+    snapshot.modifiedAtMs = fingerprint.modifiedAtMs;
+    snapshot.sha256.reserve(static_cast<std::size_t>(fingerprint.sha256.size()));
+    for (const char byte : fingerprint.sha256)
+    {
+        snapshot.sha256.push_back(static_cast<std::uint8_t>(byte));
+    }
+    return snapshot;
+}
+
+// 목적: persisted photo record 전체를 Qt-free page state로 변환
+// 입력: photo: Catalog repository photo record
+// 출력: identity/source/display/fingerprint 의미를 보존한 snapshot
+[[nodiscard]] client::CatalogPhotoSnapshot toClientPhoto(const catalog::CatalogPhotoRecord& photo)
+{
+    client::CatalogPhotoSnapshot snapshot;
+    snapshot.id = {photo.id.value};
+    if (photo.source.has_value())
+    {
+        snapshot.sourcePath = toClientString(photo.source->path);
+    }
+    snapshot.lastKnownPath = toClientString(photo.lastKnownPath);
+    snapshot.extension = toClientString(photo.extension);
+    snapshot.displayName = toClientString(photo.displayName);
+    snapshot.kind = toClientFileKind(photo.kind);
+    snapshot.scanStatus = toClientScanStatus(photo.scanStatus);
+    snapshot.fingerprint = toClientFingerprint(photo.fingerprint);
+    snapshot.sourceState = toClientSourceState(photo.sourceState);
+    return snapshot;
+}
+
+// 목적: domain page cursor의 scope-bound key를 Qt-free cursor로 변환
+// 입력: cursor: display name, PhotoId와 optional Folder/Project scope
+// 출력: UTF-8/fixed-width cursor snapshot
+[[nodiscard]] client::CatalogPhotoPageCursor toClientCursor(const catalog::CatalogPhotoPageCursor& cursor)
+{
+    client::CatalogPhotoPageCursor snapshot;
+    snapshot.displayName = toClientString(cursor.displayName);
+    snapshot.photoId = {cursor.photoId.value};
+    if (cursor.exactFolderPath.has_value())
+    {
+        snapshot.exactFolderPath = toClientString(*cursor.exactFolderPath);
+    }
+    if (cursor.projectId.has_value())
+    {
+        snapshot.projectId = client::ClientProjectId{cursor.projectId->value};
+    }
+    return snapshot;
+}
+
+// 목적: UTF-8 client string을 internal QString으로 변환
+// 입력: value: byte length가 명시된 UTF-8 문자열
+// 출력: 같은 Unicode text를 보유한 QString
+[[nodiscard]] QString fromClientString(const std::string& value)
+{
+    return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+// 목적: Qt-free bounded page request를 기존 Catalog repository request로 변환
+// 입력: request: client page 크기, 방향, cursor와 optional scope
+// 출력: 같은 keyset 의미의 internal request
+[[nodiscard]] catalog::CatalogPhotoPageRequest toCatalogPhotoPageRequest(const client::CatalogPhotoPageRequest& request)
+{
+    catalog::CatalogPhotoPageRequest internal;
+    internal.pageSize = request.pageSize;
+    internal.direction = request.direction == client::CatalogPhotoPageDirection::Backward
+                             ? catalog::CatalogPhotoPageDirection::Backward
+                             : catalog::CatalogPhotoPageDirection::Forward;
+    if (request.cursor.has_value())
+    {
+        catalog::CatalogPhotoPageCursor cursor;
+        cursor.displayName = fromClientString(request.cursor->displayName);
+        cursor.photoId = {request.cursor->photoId.value};
+        if (request.cursor->exactFolderPath.has_value())
+        {
+            cursor.exactFolderPath = fromClientString(*request.cursor->exactFolderPath);
+        }
+        if (request.cursor->projectId.has_value())
+        {
+            cursor.projectId = catalog::ProjectId{request.cursor->projectId->value};
+        }
+        internal.cursor = std::move(cursor);
+    }
+    if (request.exactFolderPath.has_value())
+    {
+        internal.exactFolderPath = fromClientString(*request.exactFolderPath);
+    }
+    if (request.projectId.has_value())
+    {
+        internal.projectId = catalog::ProjectId{request.projectId->value};
+    }
+    return internal;
+}
+
+// 목적: internal bounded page와 cursor를 Qt-free client state로 변환
+// 입력: page: stable order photo record와 optional 양방향 cursor
+// 출력: ownership이 독립된 client page snapshot
+[[nodiscard]] client::CatalogPhotoPage toClientPhotoPage(const catalog::CatalogPhotoPage& page)
+{
+    client::CatalogPhotoPage snapshot;
+    snapshot.photos.reserve(static_cast<std::size_t>(page.photos.size()));
+    for (const catalog::CatalogPhotoRecord& photo : page.photos)
+    {
+        snapshot.photos.push_back(toClientPhoto(photo));
+    }
+    if (page.previousCursor.has_value())
+    {
+        snapshot.previousCursor = toClientCursor(*page.previousCursor);
+    }
+    if (page.nextCursor.has_value())
+    {
+        snapshot.nextCursor = toClientCursor(*page.nextCursor);
+    }
+    return snapshot;
+}
 
 // 목적: catalog-session 선행조건 실패를 구조화된 error로 생성
 // 입력: message: caller에게 전달할 technical 설명
@@ -114,6 +376,7 @@ CatalogOrchestrator::~CatalogOrchestrator()
     cancelAllSourceRequests(false);
     m_folderImporter.reset();
     m_developRepository.reset();
+    m_projectRepository.reset();
     m_photoRepository.reset();
     m_database.reset();
 }
@@ -144,6 +407,7 @@ CatalogSessionResult CatalogOrchestrator::openCatalog(const QString& catalogPath
 
     m_database = std::move(opened.value());
     m_photoRepository = std::make_unique<catalog::CatalogPhotoRepository>(*m_database);
+    m_projectRepository = std::make_unique<catalog::CatalogProjectRepository>(*m_database);
     m_developRepository = std::make_unique<catalog::CatalogDevelopRepository>(*m_database);
     m_folderImporter = std::make_unique<catalog::CatalogFolderImporter>(*m_database);
     return CatalogSessionResult::success(state());
@@ -157,13 +421,14 @@ CatalogSessionState CatalogOrchestrator::closeCatalog()
     cancelAllSourceRequests(true);
     m_folderImporter.reset();
     m_developRepository.reset();
+    m_projectRepository.reset();
     m_photoRepository.reset();
     m_database.reset();
     return state();
 }
 
-// 목적: 열린 catalog에서 optional exact-folder scope와 stable cursor 기반 bounded photo page 조회
-// 입력: request: page 크기, 방향, optional exclusive cursor와 folder scope
+// 목적: 열린 catalog에서 optional Folder/Project scope와 stable cursor 기반 bounded photo page 조회
+// 입력: request: page 크기, 방향, optional exclusive cursor와 mutually-exclusive scope
 // 출력: 표시 순서의 bounded page 또는 session·validation·database 오류
 CatalogPhotoPageResult CatalogOrchestrator::queryPhotos(const catalog::CatalogPhotoPageRequest& request) const
 {
@@ -172,7 +437,198 @@ CatalogPhotoPageResult CatalogOrchestrator::queryPhotos(const catalog::CatalogPh
         return CatalogPhotoPageResult::failure(*error);
     }
 
+    if (request.projectId.has_value())
+    {
+        const catalog::CatalogProjectFindResult project = m_projectRepository->findById(*request.projectId);
+        if (project.hasError())
+        {
+            return CatalogPhotoPageResult::failure(project.error());
+        }
+        if (!project.value().has_value())
+        {
+            return CatalogPhotoPageResult::failure(
+                {types::ErrorCode::NotFound, QStringLiteral("Project does not exist.")});
+        }
+    }
     return m_photoRepository->queryPage(request);
+}
+
+// 목적: optional Catalog/Folder/Project scope의 bounded page를 Qt-free snapshot으로 조회
+// 입력: request: fixed-width page 크기, 방향, optional cursor와 UTF-8 scope
+// 출력: stable order photo snapshot과 양방향 cursor 또는 구조화된 client 오류
+client::CatalogPhotoPageResult CatalogOrchestrator::queryPhotoPage(const client::CatalogPhotoPageRequest& request) const
+{
+    const CatalogPhotoPageResult page = queryPhotos(toCatalogPhotoPageRequest(request));
+    if (page.hasError())
+    {
+        return client::CatalogPhotoPageResult::failure(toClientError(page.error()));
+    }
+    return client::CatalogPhotoPageResult::success(toClientPhotoPage(page.value()));
+}
+
+// 목적: active Catalog에서 linked photo가 존재하는 Folder summary 조회
+// 입력: 없음
+// 출력: path 순서의 Folder와 photo 수 또는 session·database 오류
+CatalogFolderListResult CatalogOrchestrator::queryFolders() const
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogFolderListResult::failure(*error);
+    }
+
+    return m_photoRepository->queryFolders();
+}
+
+// 목적: active Catalog 안에 logical Project 생성
+// 입력: name: 공백 제거 후 비어 있지 않은 Project 표시 이름
+// 출력: 발급된 Project identity와 이름 또는 session·validation·database 오류
+CatalogProjectResult CatalogOrchestrator::createProject(const QString& name)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectResult::failure(*error);
+    }
+    return m_projectRepository->createProject(name);
+}
+
+// 목적: active Catalog의 Project 목록 조회
+// 입력: 없음
+// 출력: 이름과 identity stable order의 Project 목록 또는 session·database 오류
+CatalogProjectListResult CatalogOrchestrator::queryProjects() const
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectListResult::failure(*error);
+    }
+    return m_projectRepository->queryProjects();
+}
+
+// 목적: active Catalog Project를 Qt-free client snapshot으로 조회
+// 입력: 없음
+// 출력: UTF-8 이름과 fixed-width identity 목록 또는 구조화된 client 오류
+client::CatalogProjectListResult CatalogOrchestrator::listProjects() const
+{
+    const CatalogProjectListResult projects = queryProjects();
+    if (projects.hasError())
+    {
+        return client::CatalogProjectListResult::failure(toClientError(projects.error()));
+    }
+
+    std::vector<client::CatalogProjectSnapshot> snapshots;
+    snapshots.reserve(static_cast<std::size_t>(projects.value().size()));
+    for (const catalog::CatalogProjectRecord& project : projects.value())
+    {
+        snapshots.push_back(toClientProject(project));
+    }
+    return client::CatalogProjectListResult::success(std::move(snapshots));
+}
+
+// 목적: Qt-free command로 active Catalog Project 생성
+// 입력: command: UTF-8 Project 표시 이름
+// 출력: 생성된 Project snapshot 또는 구조화된 client 오류
+client::CatalogProjectResult CatalogOrchestrator::createProject(const client::CreateProjectCommand& command)
+{
+    const CatalogProjectResult project = createProject(fromClientString(command.name));
+    if (project.hasError())
+    {
+        return client::CatalogProjectResult::failure(toClientError(project.error()));
+    }
+    return client::CatalogProjectResult::success(toClientProject(project.value()));
+}
+
+// 목적: Qt-free command로 active Catalog Project 이름 변경
+// 입력: command: fixed-width identity와 UTF-8 새 표시 이름
+// 출력: 변경된 Project snapshot 또는 구조화된 client 오류
+client::CatalogProjectResult CatalogOrchestrator::renameProject(const client::RenameProjectCommand& command)
+{
+    const CatalogProjectResult project =
+        renameProject(catalog::ProjectId{command.projectId.value}, fromClientString(command.name));
+    if (project.hasError())
+    {
+        return client::CatalogProjectResult::failure(toClientError(project.error()));
+    }
+    return client::CatalogProjectResult::success(toClientProject(project.value()));
+}
+
+// 목적: Qt-free command로 active Catalog Project와 membership 삭제
+// 입력: command: 삭제할 Project identity
+// 출력: Photo 보존을 전제로 한 mutation receipt 또는 구조화된 client 오류
+client::CatalogProjectDeleteResult CatalogOrchestrator::deleteProject(const client::DeleteProjectCommand& command)
+{
+    return toClientProjectMutation(removeProject(catalog::ProjectId{command.projectId.value}),
+                                   client::CatalogProjectDeleteReceipt{command.projectId});
+}
+
+// 목적: Qt-free command로 Project membership에 Photo 추가
+// 입력: command: Project와 Photo identity 한 쌍
+// 출력: 처리한 identity receipt 또는 구조화된 client 오류
+client::CatalogProjectMembershipResult CatalogOrchestrator::addPhotoToProject(
+    const client::ProjectPhotoMembershipCommand& command)
+{
+    return toClientProjectMutation(
+        addPhotoToProject(catalog::ProjectId{command.projectId.value}, types::PhotoId{command.photoId.value}),
+        client::CatalogProjectMembershipReceipt{command.projectId, command.photoId});
+}
+
+// 목적: Qt-free command로 Project membership에서 Photo 제거
+// 입력: command: Project와 Photo identity 한 쌍
+// 출력: 처리한 identity receipt 또는 구조화된 client 오류
+client::CatalogProjectMembershipResult CatalogOrchestrator::removePhotoFromProject(
+    const client::ProjectPhotoMembershipCommand& command)
+{
+    return toClientProjectMutation(
+        removePhotoFromProject(catalog::ProjectId{command.projectId.value}, types::PhotoId{command.photoId.value}),
+        client::CatalogProjectMembershipReceipt{command.projectId, command.photoId});
+}
+
+// 목적: active Catalog Project의 표시 이름 변경
+// 입력: projectId: 변경 대상, name: 새 Project 표시 이름
+// 출력: 갱신된 Project 또는 session·validation·not-found·database 오류
+CatalogProjectResult CatalogOrchestrator::renameProject(catalog::ProjectId projectId, const QString& name)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectResult::failure(*error);
+    }
+    return m_projectRepository->renameProject(projectId, name);
+}
+
+// 목적: active Catalog에서 Project와 membership만 삭제
+// 입력: projectId: 삭제할 Project identity
+// 출력: Photo와 Develop state를 보존한 성공 표식 또는 오류
+CatalogProjectMutationResult CatalogOrchestrator::removeProject(catalog::ProjectId projectId)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectMutationResult::failure(*error);
+    }
+    return m_projectRepository->removeProject(projectId);
+}
+
+// 목적: Project에 기존 Catalog Photo membership 추가
+// 입력: projectId: 대상 Project, photoId: 추가할 stable Photo identity
+// 출력: idempotent 성공 표식 또는 session·identity·database 오류
+CatalogProjectMutationResult CatalogOrchestrator::addPhotoToProject(catalog::ProjectId projectId,
+                                                                    types::PhotoId photoId)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectMutationResult::failure(*error);
+    }
+    return m_projectRepository->addPhoto(projectId, photoId);
+}
+
+// 목적: Project에서 Photo membership 제거
+// 입력: projectId: 대상 Project, photoId: 제거할 stable Photo identity
+// 출력: idempotent 성공 표식 또는 session·identity·database 오류
+CatalogProjectMutationResult CatalogOrchestrator::removePhotoFromProject(catalog::ProjectId projectId,
+                                                                         types::PhotoId photoId)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return CatalogProjectMutationResult::failure(*error);
+    }
+    return m_projectRepository->removePhoto(projectId, photoId);
 }
 
 // 목적: folder 사진을 catalog에 등록하고 pending fingerprint 작업 예약
@@ -473,8 +929,8 @@ bool CatalogOrchestrator::cancelSourceRequest(types::RequestId requestId)
 // 출력: 열려 있으면 빈 error, 아니면 session 오류
 std::optional<types::CoreError> CatalogOrchestrator::requireOpenCatalog() const
 {
-    if (m_database == nullptr || m_photoRepository == nullptr || m_developRepository == nullptr ||
-        m_folderImporter == nullptr)
+    if (m_database == nullptr || m_photoRepository == nullptr || m_projectRepository == nullptr ||
+        m_developRepository == nullptr || m_folderImporter == nullptr)
     {
         return makeSessionError(QStringLiteral("No catalog session is open."));
     }
@@ -673,6 +1129,7 @@ CatalogSourceSubmissionResult CatalogOrchestrator::submitFingerprintJob(Fingerpr
                     makeUnhandledError(QStringLiteral("Unhandled non-standard source fingerprint exception.")));
             }
         }));
+    emit sourceBindingStarted(requestId, photoId);
     return CatalogSourceSubmissionResult::success(requestId);
 }
 

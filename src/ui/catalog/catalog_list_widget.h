@@ -2,10 +2,16 @@
 
 #include <optional>
 
+#include <QImage>
 #include <QListWidget>
+#include <QSet>
+#include <QSize>
 #include <QVector>
 
 #include "catalog_entry.h"
+
+class QResizeEvent;
+class QTimer;
 
 namespace flexraw::ui::catalog
 {
@@ -57,6 +63,16 @@ public:
                           const std::optional<core::catalog::CatalogPhotoRecord>& createdPhoto,
                           core::types::PhotoId selectedPhotoId);
 
+    // 목적: current viewport thumbnail window에 해당하는 decoded image 적용
+    // 입력: sourcePath: 결과 source identity, image: UI thread에서 QPixmap으로 변환할 frame
+    // 출력: source가 여전히 adjacent window에 있을 때만 row icon 갱신
+    void applyThumbnail(const QString& sourcePath, const QImage& image);
+
+    // 목적: current viewport source의 terminal thumbnail 실패 기록
+    // 입력: sourcePath: 재요청 반복을 막을 source identity
+    // 출력: source가 window를 벗어나기 전까지 같은 decode 요청 생략
+    void markThumbnailFailed(const QString& sourcePath);
+
     // 목적: 현재 catalog 목록과 선택 상태 초기화
     // 입력: 없음
     // 출력: 없음
@@ -73,14 +89,43 @@ signals:
     // 출력: 없음
     void photoSelected(const core::catalog::CatalogPhotoRecord& photo);
 
+    // 목적: viewport와 앞뒤 인접 범위에 필요한 bounded thumbnail source set 전달
+    // 입력: sources: 현재 row에서 materialize할 file descriptor, targetSize: icon 최대 크기
+    // 출력: 없음
+    void thumbnailWindowChanged(const QVector<core::types::FileDescriptor>& sources, const QSize& targetSize);
+
+protected:
+    // 목적: viewport 크기 변경을 adjacent thumbnail window 재계산으로 변환
+    // 입력: event: Qt resize event
+    // 출력: base resize 처리 후 coalesced window refresh 예약
+    void resizeEvent(QResizeEvent* event) override;
+
 private:
     // 목적: 현재 row 변경을 CatalogEntry 선택 signal로 변환
     // 입력: row: 새로 선택된 목록 row
     // 출력: 없음
     void handleCurrentRowChanged(int row);
 
+    // 목적: 연속 scroll/resize event를 한 번의 thumbnail window 갱신으로 coalesce
+    // 입력: 없음
+    // 출력: 다음 event-loop turn에 refreshThumbnailWindow 실행 예약
+    void scheduleThumbnailWindowRefresh();
+
+    // 목적: visible row와 앞뒤 한 viewport만 thumbnail materialization 대상으로 교체
+    // 입력: 없음
+    // 출력: 범위 밖 QPixmap 해제 및 아직 terminal 결과가 없는 source 요청
+    void refreshThumbnailWindow();
+
+    // 목적: row에 연결된 transient 또는 Catalog-backed file descriptor 반환
+    // 입력: row: 현재 list row index
+    // 출력: source가 processing 가능하면 descriptor, 아니면 빈 값
+    [[nodiscard]] std::optional<core::types::FileDescriptor> thumbnailSourceAt(int row) const;
+
     QVector<core::catalog::CatalogEntry> m_entries;
     QVector<core::catalog::CatalogPhotoRecord> m_photos;
+    QSet<QString> m_thumbnailWindowPaths;
+    QSet<QString> m_thumbnailTerminalPaths;
+    QTimer* m_thumbnailRefreshTimer{nullptr};
     bool m_showingCatalogPhotos{false};
 };
 

@@ -13,6 +13,9 @@ CPU 사용량은 현재 4코어 고정이며, 추후 지원할 예정입니다.
 - 노출, 대비, 하이라이트/그림자, White Balance, 채도, 명료도, 디헤이즈, 날카롭게 하기, 노이즈 감소와 톤 커브를
   조정할 수 있습니다.
 - 연속된 조작에서는 빠른 interactive preview를 사용하고, 조작이 끝나면 final preview를 다시 생성합니다.
+- Catalog, Folder와 Project 범위의 bounded page navigation과 다중 선택 Project membership을 지원합니다.
+- 화면에 보이는 행과 인접 viewport만 thumbnail로 유지해 큰 Catalog의 UI memory 사용을 제한합니다.
+- 모든 숫자 보정 slider는 설정에서 Classic과 중앙 복귀형 Relative rate control 중 하나를 선택할 수 있습니다.
 - JPEG, PNG, TIFF 형식의 단일, 다중 선택과 folder batch 내보내기를 지원합니다.
 - Local/Remote/Auto placement를 이용해 Desktop과 별도 Worker의 여유 slot에 내보내기 작업을 배치합니다.
 - Worker는 bounded queue, cancellation, backpressure와 실행 전 resource admission을 사용합니다.
@@ -22,21 +25,23 @@ CPU 사용량은 현재 4코어 고정이며, 추후 지원할 예정입니다.
 현재 버전은 `0.1.0`입니다. Desktop은 Windows x64를 우선 지원하며, 워커는 Windows x64, Linux x64와
 Jetson ARM64에서 native build와 실제 RAW end-to-end 경로를 확인했습니다.
 
-현재 개발은 Milestone 단위로 진행하며, **M1.3 Qt-free Client Boundary**를 진행 중입니다.
+현재 개발은 Milestone 단위로 진행하며, **M1.3 Qt-free Client Boundary**를 완료하고
+**M1.4 MCP Contract Proof**를 진행하고 있습니다.
 
 | Milestone | 상태 |
 |---|---|
 | M1.1 Persistent Editor | DONE |
 | M1.2 Catalog Navigation & Project | DONE |
-| M1.3 Qt-free Client Boundary | IN PROGRESS |
-| M1.4 MCP Contract Proof | PLANNED |
+| M1.3 Qt-free Client Boundary | DONE |
+| M1.4 MCP Contract Proof | IN PROGRESS |
 | M1.5 Export & Acceptance | PLANNED |
 
-현재 M1.3의 세부 진행 위치와 다음 범위는 [`ROADMAP.md`](ROADMAP.md)를 참고하십시오.
+현재 milestone의 공개 범위와 다음 단계는 [`ROADMAP.md`](ROADMAP.md)를 참고하십시오.
 
 Remote 내보내기는 RAW나 결과물을 TCP로 전송하는 방식이 아니라 Desktop과 Worker가 함께 접근할 수 있는 네트워크 스토리지 연결을 필요로 합니다.
 그래서 현재 프로토콜에는 TLS와 인증/인가가 없기 때문에 loopback 또는 신뢰할 수 있는 내부
-네트워크에서만 사용하는 것을 전제로 합니다. 프로젝트 폴더, 고급 색 관리, frame/watermark를 포함한 일부 기능은 아직 개발 중입니다.
+네트워크에서만 사용하는 것을 전제로 합니다. 고급 Project hierarchy, 고급 색 관리, frame/watermark를 포함한 일부
+기능은 아직 개발 중입니다.
 
 ## 빌드
 

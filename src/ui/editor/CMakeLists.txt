@@ -3,6 +3,9 @@
 add_library(flexraw_ui_editor STATIC)
 
 target_sources(flexraw_ui_editor PRIVATE
+    adjustment_control.cpp
+    adjustment_control.h
+    adjustment_control_style.h
     develop_panel.cpp
     develop_panel.h
     develop_preview_controller.cpp

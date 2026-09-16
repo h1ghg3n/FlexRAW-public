@@ -328,6 +328,160 @@ TEST(CatalogOrchestratorTest, RejectsRelinkWhenLegacyIdentityHasNoHashBaseline)
     EXPECT_EQ(types::ErrorCode::Conflict, relinked.error().code);
 }
 
+TEST(CatalogOrchestratorTest, PersistsProjectUseCasesAndProjectScopedPhotoPages)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstPath = QDir(directory.path()).filePath(QStringLiteral("first.jpg"));
+    const QString secondPath = QDir(directory.path()).filePath(QStringLiteral("second.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(firstPath, QByteArray("first-project-source")));
+    ASSERT_TRUE(writeSourceFile(secondPath, QByteArray("second-project-source")));
+    CatalogOrchestrator orchestrator;
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogImportResult imported = orchestrator.importFolder(directory.path());
+    ASSERT_TRUE(imported.hasValue());
+    ASSERT_EQ(2, imported.value().photoIds.size());
+    const CatalogProjectResult created = orchestrator.createProject(QStringLiteral(" Selection "));
+    ASSERT_TRUE(created.hasValue());
+    EXPECT_EQ(QStringLiteral("Selection"), created.value().name);
+    const CatalogProjectResult renamed = orchestrator.renameProject(created.value().id, QStringLiteral("Portfolio"));
+    ASSERT_TRUE(renamed.hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(created.value().id, imported.value().photoIds[0]).hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(created.value().id, imported.value().photoIds[1]).hasValue());
+    catalog::CatalogPhotoPageRequest request;
+    request.pageSize = 1;
+    request.projectId = created.value().id;
+
+    const CatalogPhotoPageResult firstPage = orchestrator.queryPhotos(request);
+
+    ASSERT_TRUE(firstPage.hasValue());
+    ASSERT_EQ(1, firstPage.value().photos.size());
+    ASSERT_TRUE(firstPage.value().nextCursor.has_value());
+    request.cursor = firstPage.value().nextCursor;
+    const CatalogPhotoPageResult secondPage = orchestrator.queryPhotos(request);
+    ASSERT_TRUE(secondPage.hasValue());
+    ASSERT_EQ(1, secondPage.value().photos.size());
+    EXPECT_FALSE(secondPage.value().nextCursor.has_value());
+
+    client::ICatalogPhotoClient& photoClient = orchestrator;
+    client::CatalogPhotoPageRequest clientRequest;
+    clientRequest.pageSize = 1;
+    clientRequest.projectId = client::ClientProjectId{created.value().id.value};
+    const client::CatalogPhotoPageResult firstClientPage = photoClient.queryPhotoPage(clientRequest);
+    ASSERT_TRUE(firstClientPage.hasValue());
+    ASSERT_EQ(1, firstClientPage.value().photos.size());
+    ASSERT_TRUE(firstClientPage.value().photos.front().sourcePath.has_value());
+    EXPECT_EQ("first.jpg", firstClientPage.value().photos.front().displayName);
+    ASSERT_TRUE(firstClientPage.value().nextCursor.has_value());
+    EXPECT_EQ(clientRequest.projectId, firstClientPage.value().nextCursor->projectId);
+    clientRequest.cursor = firstClientPage.value().nextCursor;
+    const client::CatalogPhotoPageResult secondClientPage = photoClient.queryPhotoPage(clientRequest);
+    ASSERT_TRUE(secondClientPage.hasValue());
+    ASSERT_EQ(1, secondClientPage.value().photos.size());
+    EXPECT_EQ("second.jpg", secondClientPage.value().photos.front().displayName);
+    EXPECT_FALSE(secondClientPage.value().nextCursor.has_value());
+
+    EXPECT_FALSE(orchestrator.closeCatalog().isOpen);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogProjectListResult restoredProjects = orchestrator.queryProjects();
+    ASSERT_TRUE(restoredProjects.hasValue());
+    ASSERT_EQ(1, restoredProjects.value().size());
+    EXPECT_EQ(QStringLiteral("Portfolio"), restoredProjects.value().front().name);
+    ASSERT_TRUE(orchestrator.removePhotoFromProject(created.value().id, imported.value().photoIds[1]).hasValue());
+    ASSERT_TRUE(orchestrator.removeProject(created.value().id).hasValue());
+    const CatalogPhotoPageResult missingProjectPage = orchestrator.queryPhotos(request);
+    ASSERT_TRUE(missingProjectPage.hasError());
+    EXPECT_EQ(types::ErrorCode::NotFound, missingProjectPage.error().code);
+    const client::CatalogPhotoPageResult missingClientProjectPage = photoClient.queryPhotoPage(clientRequest);
+    ASSERT_TRUE(missingClientProjectPage.hasError());
+    EXPECT_EQ(client::ClientErrorCode::NotFound, missingClientProjectPage.error().code);
+    const CatalogPhotoPageResult retainedPhotos = orchestrator.queryPhotos(catalog::CatalogPhotoPageRequest{});
+    ASSERT_TRUE(retainedPhotos.hasValue());
+    EXPECT_EQ(2, retainedPhotos.value().photos.size());
+}
+
+TEST(CatalogOrchestratorTest, ProjectsQtFreeClientCommandsAndUtf8State)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("client-projects.flexraw-catalog"));
+    CatalogOrchestrator orchestrator;
+    client::ICatalogProjectClient& projectClient = orchestrator;
+
+    const client::CatalogProjectListResult closedProjects = projectClient.listProjects();
+    ASSERT_TRUE(closedProjects.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closedProjects.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+
+    const client::CatalogProjectResult created = projectClient.createProject({" 선택 "});
+    ASSERT_TRUE(created.hasValue());
+    EXPECT_GT(created.value().id.value, 0);
+    EXPECT_EQ("선택", created.value().name);
+
+    const client::CatalogProjectListResult projects = projectClient.listProjects();
+    ASSERT_TRUE(projects.hasValue());
+    ASSERT_EQ(1, projects.value().size());
+    EXPECT_EQ(created.value(), projects.value().front());
+}
+
+TEST(CatalogOrchestratorTest, ProjectsQtFreeMutationCommandsPreserveIdentityAndMembership)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("membership.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("mutations.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("membership-source")));
+    CatalogOrchestrator orchestrator;
+    client::ICatalogProjectClient& projectClient = orchestrator;
+
+    const client::CatalogProjectDeleteResult closedDelete = projectClient.deleteProject({{1}});
+    ASSERT_TRUE(closedDelete.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closedDelete.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogImportResult imported = orchestrator.importFolder(directory.path());
+    ASSERT_TRUE(imported.hasValue());
+    ASSERT_EQ(1, imported.value().photoIds.size());
+
+    const client::CatalogProjectResult created = projectClient.createProject({"선택"});
+    ASSERT_TRUE(created.hasValue());
+    const client::CatalogProjectResult renamed = projectClient.renameProject({created.value().id, "최종 선택"});
+    ASSERT_TRUE(renamed.hasValue());
+    EXPECT_EQ(created.value().id, renamed.value().id);
+    EXPECT_EQ("최종 선택", renamed.value().name);
+
+    const client::ClientPhotoId photoId{imported.value().photoIds.front().value};
+    const client::CatalogProjectMembershipResult added = projectClient.addPhotoToProject({created.value().id, photoId});
+    ASSERT_TRUE(added.hasValue());
+    EXPECT_EQ(created.value().id, added.value().projectId);
+    EXPECT_EQ(photoId, added.value().photoId);
+
+    client::CatalogPhotoPageRequest pageRequest;
+    pageRequest.projectId = created.value().id;
+    const client::CatalogPhotoPageResult addedPage = orchestrator.queryPhotoPage(pageRequest);
+    ASSERT_TRUE(addedPage.hasValue());
+    ASSERT_EQ(1, addedPage.value().photos.size());
+    const client::CatalogProjectMembershipResult removed =
+        projectClient.removePhotoFromProject({created.value().id, photoId});
+    ASSERT_TRUE(removed.hasValue());
+    const client::CatalogPhotoPageResult removedPage = orchestrator.queryPhotoPage(pageRequest);
+    ASSERT_TRUE(removedPage.hasValue());
+    EXPECT_TRUE(removedPage.value().photos.empty());
+
+    const client::CatalogProjectDeleteResult deleted = projectClient.deleteProject({created.value().id});
+    ASSERT_TRUE(deleted.hasValue());
+    EXPECT_EQ(created.value().id, deleted.value().projectId);
+    const client::CatalogProjectListResult remainingProjects = projectClient.listProjects();
+    ASSERT_TRUE(remainingProjects.hasValue());
+    EXPECT_TRUE(remainingProjects.value().empty());
+    const client::CatalogProjectDeleteResult missingDelete = projectClient.deleteProject({created.value().id});
+    ASSERT_TRUE(missingDelete.hasError());
+    EXPECT_EQ(client::ClientErrorCode::NotFound, missingDelete.error().code);
+}
+
 TEST(CatalogOrchestratorTest, ClosingCatalogCancelsPendingFingerprintRequest)
 {
     (void)test::application();
@@ -340,7 +494,12 @@ TEST(CatalogOrchestratorTest, ClosingCatalogCancelsPendingFingerprintRequest)
     ASSERT_TRUE(source.resize(64 * 1024 * 1024));
     source.close();
     CatalogOrchestrator orchestrator;
+    std::vector<std::pair<types::RequestId, types::PhotoId>> starts;
     std::vector<types::RequestId> cancellations;
+    QObject::connect(
+        &orchestrator,
+        &CatalogOrchestrator::sourceBindingStarted,
+        [&](types::RequestId requestId, types::PhotoId photoId) { starts.emplace_back(requestId, photoId); });
     QObject::connect(&orchestrator, &CatalogOrchestrator::sourceBindingCancelled, [&](types::RequestId requestId) {
         cancellations.push_back(requestId);
     });
@@ -348,6 +507,9 @@ TEST(CatalogOrchestratorTest, ClosingCatalogCancelsPendingFingerprintRequest)
     const CatalogImportResult imported = orchestrator.importFolder(directory.path());
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().fingerprintRequestIds.size());
+    ASSERT_EQ(1U, starts.size());
+    EXPECT_EQ(imported.value().fingerprintRequestIds.front(), starts.front().first);
+    EXPECT_EQ(imported.value().photoIds.front().value, starts.front().second.value);
 
     const CatalogSessionState closed = orchestrator.closeCatalog();
 

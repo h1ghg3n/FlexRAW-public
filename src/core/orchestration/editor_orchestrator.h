@@ -8,6 +8,7 @@
 #include <QTimer>
 
 #include "develop_history.h"
+#include "editor_client.h"
 #include "editor_contracts.h"
 
 namespace flexraw::core::orchestration
@@ -17,7 +18,7 @@ class CatalogOrchestrator;
 class PreviewOrchestrator;
 struct CatalogSourceUpdate;
 
-class EditorOrchestrator final : public QObject
+class EditorOrchestrator final : public QObject, public client::IEditorClient
 {
     Q_OBJECT
 
@@ -33,6 +34,51 @@ public:
     // 입력: 없음
     // 출력: session-owned request가 남지 않음
     ~EditorOrchestrator() override;
+
+    // 목적: 현재 Editor session의 immutable Qt-free state 조회
+    // 입력: 없음
+    // 출력: selection, Develop state, source capability와 history snapshot
+    [[nodiscard]] client::EditorSnapshot editorSnapshot() const override;
+
+    // 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
+    // 입력: command: 선택할 fixed-width Photo identity
+    // 출력: 선택 후 snapshot 또는 validation·Catalog·Develop load 오류
+    [[nodiscard]] client::EditorResult selectPhoto(const client::SelectEditorPhotoCommand& command) override;
+
+    // 목적: 현재 Editor selection과 진행 중 Adjustment를 정리
+    // 입력: 없음
+    // 출력: 선택되지 않은 snapshot
+    [[nodiscard]] client::EditorResult clearEditorSelection() override;
+
+    // 목적: 현재 Photo의 Develop parameter를 검증하고 session state에 반영
+    // 입력: command: Qt-free Develop parameter 전체 값
+    // 출력: 변경 후 snapshot 또는 selection·source·validation 오류
+    [[nodiscard]] client::EditorResult updateDevelopParams(const client::UpdateDevelopParamsCommand& command) override;
+
+    // 목적: 연속 Develop parameter 조작을 하나의 undo 단위로 시작
+    // 입력: 없음
+    // 출력: Adjustment가 활성화된 snapshot 또는 현재 state 오류
+    [[nodiscard]] client::EditorResult beginAdjustment() override;
+
+    // 목적: 현재 연속 Adjustment를 종료하고 undo 단위를 확정
+    // 입력: 없음
+    // 출력: Adjustment가 종료된 snapshot 또는 현재 state 오류
+    [[nodiscard]] client::EditorResult endAdjustment() override;
+
+    // 목적: 현재 Photo의 마지막 Develop Adjustment를 되돌림
+    // 입력: 없음
+    // 출력: 되돌린 snapshot 또는 selection·history 상태 오류
+    [[nodiscard]] client::EditorResult undoDevelop() override;
+
+    // 목적: 현재 Photo에서 마지막으로 되돌린 Develop Adjustment를 다시 적용
+    // 입력: 없음
+    // 출력: 다시 적용한 snapshot 또는 selection·history 상태 오류
+    [[nodiscard]] client::EditorResult redoDevelop() override;
+
+    // 목적: dirty Develop state를 optimistic persisted revision으로 저장
+    // 입력: 없음
+    // 출력: 저장된 baseline과 revision snapshot 또는 conflict·database 오류
+    [[nodiscard]] client::EditorResult saveDevelopState() override;
 
     // 목적: 현재 editor session의 immutable state snapshot 반환
     // 입력: 없음
@@ -69,6 +115,11 @@ public:
     // 출력: 유효한 선택에서 실제 target 크기가 변경됐으면 true
     [[nodiscard]] bool updatePreviewTargetSize(const QSize& targetSize);
 
+    // 목적: Activity client가 지정한 현재 preview request를 실제 owner에서 취소
+    // 입력: requestId: 현재 Editor session의 accepted preview identity
+    // 출력: current request를 취소했으면 true
+    bool cancelPreviewRequest(types::RequestId requestId);
+
     // 목적: 연속 parameter 조작을 하나의 undo 단계로 시작
     // 입력: 없음
     // 출력: 없음
@@ -94,6 +145,16 @@ signals:
     // 입력: state: 변경 후 immutable editor state
     // 출력: 없음
     void stateChanged(const EditorState& state);
+
+    // 목적: Qt-free Editor snapshot 의미가 변경됐음을 event adapter에 알림
+    // 입력: 없음; adapter가 owner context에서 immutable snapshot을 즉시 capture
+    // 출력: 없음
+    void editorSnapshotChanged();
+
+    // 목적: 현재 Editor preview request가 owner에 accepted됐음을 adapter에 전달
+    // 입력: requestId: accepted preview request identity
+    // 출력: 없음
+    void previewStarted(types::RequestId requestId);
 
     // 목적: 현재 editor state와 일치하는 progressive preview 전달
     // 입력: result: stale result가 제거된 preview frame
@@ -132,6 +193,11 @@ private:
         Immediate,
     };
 
+    // 목적: transitional Qt state와 Qt-free snapshot invalidation을 한 state transition에서 publish
+    // 입력: currentState: 변경이 끝난 현재 Editor state
+    // 출력: 기존 GUI signal과 client event adapter 알림
+    void publishStateChanged(const EditorState& currentState);
+
     // 목적: 현재 state를 full-quality final preview로 예약
     // 입력: targetSize: preview viewport 크기, progression: source tier 정책, timing: 제출 시점
     // 출력: 기존 request 취소와 final preview sequence 증가
@@ -159,8 +225,8 @@ private:
 
     // 목적: 현재 accepted preview request의 향후 결과 publish 취소
     // 입력: 없음
-    // 출력: active request cancellation 가능
-    void cancelActivePreview();
+    // 출력: active owner request를 취소했으면 true
+    bool cancelActivePreview();
 
     // 목적: preview 결과가 현재 editor selection과 revision에 일치하는지 확인
     // 입력: result: PreviewOrchestrator가 전달한 결과

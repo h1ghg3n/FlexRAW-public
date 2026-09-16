@@ -5,18 +5,23 @@ set_target_properties(flexraw_ui_tests PROPERTIES
 )
 
 target_sources(flexraw_ui_tests PRIVATE
+    adjustment_control_test.cpp
     catalog_editor_facade_test.cpp
     catalog_command_service_test.cpp
     catalog_list_widget_test.cpp
+    catalog_photo_page_qt_adapter_test.cpp
     console_command_controller_test.cpp
     develop_panel_test.cpp
     develop_preview_controller_test.cpp
+    display_frame_qt_adapter_test.cpp
+    editor_settings_test.cpp
     export_command_service_test.cpp
     export_dialog_test.cpp
     export_settings_test.cpp
     folder_scan_controller_test.cpp
     mainwindow_catalog_pagination_test.cpp
     preview_widget_test.cpp
+    qt_activity_adapter_test.cpp
     raw_diagnostic_service_test.cpp
     source_resolution_widget_test.cpp
     ui_test_main.cpp

@@ -14,6 +14,7 @@ namespace flexraw::core::catalog
 class CatalogDatabase;
 class CatalogDevelopRepository;
 class CatalogPhotoRepository;
+class CatalogProjectRepository;
 class CatalogPresetRepository;
 
 using CatalogDatabasePtr = std::unique_ptr<CatalogDatabase>;
@@ -49,6 +50,7 @@ public:
 private:
     friend class CatalogDevelopRepository;
     friend class CatalogPhotoRepository;
+    friend class CatalogProjectRepository;
     friend class CatalogPresetRepository;
 
     // 목적: 열린 Qt SQL connection과 경로를 보관하는 CatalogDatabase 생성

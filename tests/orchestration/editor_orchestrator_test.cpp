@@ -1,4 +1,5 @@
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include "catalog_orchestrator.h"
+#include "editor_client_projection.h"
 #include "editor_orchestrator.h"
 #include "preview_orchestrator.h"
 #include "preview_pipeline.h"
@@ -210,6 +212,41 @@ public:
 private:
     std::atomic_int m_renderCount{0};
 };
+
+TEST(EditorClientProjectionTest, PreservesEveryDevelopParameter)
+{
+    types::DevelopParams params;
+    params.exposureEv = 0.1F;
+    params.contrast = 0.2F;
+    params.highlights = 0.3F;
+    params.shadows = 0.4F;
+    params.whites = 0.5F;
+    params.blacks = 0.6F;
+    params.saturation = 0.7F;
+    params.vibrance = 0.8F;
+    params.whiteBalanceMode = types::WhiteBalanceMode::Custom;
+    params.whiteBalanceTemperatureKelvin = 7200.0F;
+    params.whiteBalanceTint = 0.9F;
+    params.clarity = 1.0F;
+    params.dehaze = 1.1F;
+    params.sharpeningAmount = 1.2F;
+    params.sharpeningRadius = 1.3F;
+    params.sharpeningDetail = 1.4F;
+    params.sharpeningMasking = 1.5F;
+    params.luminanceNoiseReduction = 1.6F;
+    params.colorNoiseReduction = 1.7F;
+    params.toneCurveShadows = 1.8F;
+    params.toneCurveDarks = 1.9F;
+    params.toneCurveLights = 2.0F;
+    params.toneCurveHighlights = 2.1F;
+    params.pointCurveBlack = 2.2F;
+    params.pointCurveShadows = 2.3F;
+    params.pointCurveMidtones = 2.4F;
+    params.pointCurveHighlights = 2.5F;
+    params.pointCurveWhite = 2.6F;
+
+    EXPECT_EQ(params, fromClientDevelopParams(toClientDevelopParams(params)));
+}
 
 TEST(EditorOrchestratorTest, SavesAndRestoresCatalogDevelopStateAcrossSessions)
 {
@@ -530,6 +567,75 @@ TEST(EditorOrchestratorTest, OwnsSelectionDirtyAndUndoRedoState)
     EXPECT_FALSE(editorOrchestrator.state().hasSelection);
 }
 
+TEST(EditorOrchestratorTest, ExecutesQtFreeEditorCommandsWithoutPreviewTarget)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    auto pipeline = std::make_unique<RecordingPreviewPipeline>();
+    RecordingPreviewPipeline* pipelineObserver = pipeline.get();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editorOrchestrator(previewOrchestrator, catalog.orchestrator());
+    client::IEditorClient& editorClient = editorOrchestrator;
+    const client::EditorResult missingSelection = editorClient.updateDevelopParams({});
+    ASSERT_TRUE(missingSelection.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, missingSelection.error().code);
+    const client::EditorResult invalidSelection = editorClient.selectPhoto({client::ClientPhotoId{0}});
+    ASSERT_TRUE(invalidSelection.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, invalidSelection.error().code);
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("headless.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdateCount = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdateCount](const CatalogSourceUpdate&) { ++sourceUpdateCount; });
+    const CatalogPhotoRegistrationResult registered = catalog.orchestrator().registerPhoto(*entry);
+    ASSERT_TRUE(registered.hasValue());
+
+    const client::EditorResult selected = editorClient.selectPhoto({client::ClientPhotoId{registered.value().value}});
+    ASSERT_TRUE(selected.hasValue());
+    EXPECT_TRUE(selected.value().hasSelection);
+    EXPECT_EQ(registered.value().value, selected.value().photoId.value);
+    EXPECT_FALSE(selected.value().adjustmentActive);
+    client::EditorDevelopParams invalidParams = selected.value().params;
+    invalidParams.exposureEv = std::numeric_limits<float>::infinity();
+    const client::EditorResult invalidUpdate = editorClient.updateDevelopParams({invalidParams});
+    ASSERT_TRUE(invalidUpdate.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, invalidUpdate.error().code);
+    EXPECT_EQ(selected.value().params, editorClient.editorSnapshot().params);
+    ASSERT_TRUE(editorClient.beginAdjustment().hasValue());
+    client::EditorDevelopParams firstParams = selected.value().params;
+    firstParams.exposureEv = 0.7F;
+    ASSERT_TRUE(editorClient.updateDevelopParams({firstParams}).hasValue());
+    client::EditorDevelopParams secondParams = firstParams;
+    secondParams.contrast = 0.2F;
+    const client::EditorResult updated = editorClient.updateDevelopParams({secondParams});
+    ASSERT_TRUE(updated.hasValue());
+    EXPECT_TRUE(updated.value().adjustmentActive);
+    const client::EditorResult adjusted = editorClient.endAdjustment();
+    ASSERT_TRUE(adjusted.hasValue());
+    EXPECT_FALSE(adjusted.value().adjustmentActive);
+    EXPECT_TRUE(adjusted.value().dirty);
+    EXPECT_TRUE(adjusted.value().canUndo);
+
+    const client::EditorResult undone = editorClient.undoDevelop();
+    ASSERT_TRUE(undone.hasValue());
+    EXPECT_EQ(selected.value().params, undone.value().params);
+    EXPECT_TRUE(undone.value().canRedo);
+    const client::EditorResult redone = editorClient.redoDevelop();
+    ASSERT_TRUE(redone.hasValue());
+    EXPECT_EQ(secondParams, redone.value().params);
+    const client::EditorResult saved = editorClient.saveDevelopState();
+    ASSERT_TRUE(saved.hasValue());
+    EXPECT_FALSE(saved.value().dirty);
+    EXPECT_GT(saved.value().persistedRevision.value, 0U);
+
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdateCount, 1));
+    EXPECT_TRUE(pipelineObserver->requests().empty());
+}
+
 TEST(EditorOrchestratorTest, RejectsInvalidParamsBeforeMutatingHistory)
 {
     (void)test::application();
@@ -712,6 +818,14 @@ TEST(EditorOrchestratorTest, FiltersCancelledSelectionBeforePublishingLatestFram
     PreviewOrchestrator previewOrchestrator(std::move(pipeline));
     EditorOrchestrator editorOrchestrator(previewOrchestrator, catalog.orchestrator());
     std::vector<QString> publishedPaths;
+    std::vector<types::RequestId> startedRequests;
+    std::vector<types::RequestId> cancelledRequests;
+    QObject::connect(&editorOrchestrator, &EditorOrchestrator::previewStarted, [&](types::RequestId requestId) {
+        startedRequests.push_back(requestId);
+    });
+    QObject::connect(&editorOrchestrator, &EditorOrchestrator::previewCancelled, [&](types::RequestId requestId) {
+        cancelledRequests.push_back(requestId);
+    });
     QObject::connect(&editorOrchestrator, &EditorOrchestrator::previewUpdated, [&](const PreviewResult& result) {
         publishedPaths.push_back(result.sourcePath);
     });
@@ -743,8 +857,12 @@ TEST(EditorOrchestratorTest, FiltersCancelledSelectionBeforePublishingLatestFram
     }
 
     ASSERT_TRUE(firstRenderStarted);
+    ASSERT_EQ(1U, startedRequests.size());
+    const types::RequestId firstRequestId = startedRequests.front();
 
     ASSERT_TRUE(editorOrchestrator.activatePhoto(*secondEntry, QSize{640, 480}).hasValue());
+    ASSERT_EQ(1U, cancelledRequests.size());
+    EXPECT_EQ(firstRequestId, cancelledRequests.front());
     pipelinePointer->allowFirstRenderToFinish.release();
     QEventLoop resultLoop;
     QObject::connect(&editorOrchestrator, &EditorOrchestrator::previewUpdated, &resultLoop, &QEventLoop::quit);

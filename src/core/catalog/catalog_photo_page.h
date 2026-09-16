@@ -6,6 +6,7 @@
 #include <QVector>
 
 #include "catalog_entry.h"
+#include "catalog_project.h"
 
 namespace flexraw::core::catalog
 {
@@ -24,6 +25,7 @@ struct CatalogPhotoPageCursor
     QString displayName;
     types::PhotoId photoId;
     std::optional<QString> exactFolderPath;
+    std::optional<ProjectId> projectId;
 };
 
 struct CatalogPhotoPageRequest
@@ -32,6 +34,7 @@ struct CatalogPhotoPageRequest
     CatalogPhotoPageDirection direction{CatalogPhotoPageDirection::Forward};
     std::optional<CatalogPhotoPageCursor> cursor;
     std::optional<QString> exactFolderPath;
+    std::optional<ProjectId> projectId;
 };
 
 struct CatalogPhotoPage

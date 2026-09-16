@@ -37,6 +37,7 @@ endif()
 # 기반 모듈 (다른 모듈이 의존)
 add_subdirectory(measurement)
 add_subdirectory(types)
+add_subdirectory(client)
 add_subdirectory(util)
 
 # Worker와 Desktop이 공유하는 resolved render dependency
@@ -66,6 +67,7 @@ if(FLEXRAW_BUILD_DESKTOP)
     target_link_libraries(flexraw_core INTERFACE
         flexraw_core_measurement
         flexraw_core_types
+        flexraw_core_client
         flexraw_core_util
         flexraw_core_catalog
         flexraw_core_raw
