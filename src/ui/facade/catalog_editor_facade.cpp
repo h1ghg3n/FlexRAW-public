@@ -3,122 +3,46 @@
 #include <utility>
 
 #include "catalog_orchestrator.h"
+#include "catalog_session_orchestrator.h"
 #include "catalog_thumbnail_orchestrator.h"
-#include "display_frame_qt_adapter.h"
-#include "editor_client_projection.h"
 #include "editor_orchestrator.h"
+#include "qt_catalog_thumbnail_event_adapter.h"
 #include "qt_editor_event_adapter.h"
+#include "qt_folder_import_event_adapter.h"
+#include "qt_preview_presentation_event_adapter.h"
 
 namespace flexraw::ui::facade
 {
-namespace
-{
-
-// 목적: Qt-free Editor result를 기존 Qt GUI adapter result로 변환
-// 입력: result: client contract command 결과
-// 출력: 같은 state 또는 오류 의미를 가진 transitional result
-[[nodiscard]] core::orchestration::EditorStateResult toQtEditorResult(const core::client::EditorResult& result)
-{
-    return result.hasError()
-               ? core::orchestration::EditorStateResult::failure(core::orchestration::fromClientError(result.error()))
-               : core::orchestration::EditorStateResult::success(
-                     core::orchestration::fromClientEditorSnapshot(result.value()));
-}
-
-}  // namespace
-
 // 목적: GUI adapter가 사용할 Catalog/Editor command와 event 경계 구성
-// 입력: catalogOrchestrator: catalog use case, catalogThumbnailOrchestrator: list thumbnail use case,
-//       editorOrchestrator: editor session use case, parent: Qt 부모 object
-// 출력: 세 Orchestrator를 감싼 facade 객체
+// 입력: catalogOrchestrator: catalog data use case, catalogSessionOrchestrator: session transition use case,
+//       catalogThumbnailOrchestrator: list thumbnail use case, editorOrchestrator: editor session use case,
+//       sourceResolutionEventSource: Runtime-owned source lifecycle, parent: Qt 부모 object
+// 출력: 주입된 use case와 Source Resolution event를 감싼 facade 객체
 CatalogEditorFacade::CatalogEditorFacade(
     core::orchestration::CatalogOrchestrator& catalogOrchestrator,
+    core::orchestration::CatalogSessionOrchestrator& catalogSessionOrchestrator,
     core::orchestration::CatalogThumbnailOrchestrator& catalogThumbnailOrchestrator,
     core::orchestration::EditorOrchestrator& editorOrchestrator,
+    core::client::ISourceResolutionEventSource& sourceResolutionEventSource,
     QObject* parent)
     : QObject(parent),
       m_catalogOrchestrator(&catalogOrchestrator),
+      m_catalogSessionOrchestrator(&catalogSessionOrchestrator),
       m_catalogThumbnailOrchestrator(&catalogThumbnailOrchestrator),
       m_editorOrchestrator(&editorOrchestrator),
-      m_editorEventAdapter(new QtEditorEventAdapter(editorOrchestrator, this))
-{
-    qRegisterMetaType<core::client::DisplayFrame>();
-    connect(m_catalogThumbnailOrchestrator,
-            &core::orchestration::CatalogThumbnailOrchestrator::thumbnailReady,
-            this,
-            &CatalogEditorFacade::catalogThumbnailReady);
-    connect(m_catalogThumbnailOrchestrator,
-            &core::orchestration::CatalogThumbnailOrchestrator::thumbnailFailed,
-            this,
-            &CatalogEditorFacade::catalogThumbnailFailed);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::stateChanged,
-            this,
-            &CatalogEditorFacade::editorStateChanged);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewStarted,
-            this,
-            &CatalogEditorFacade::previewStarted);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewUpdated,
-            this,
-            [this](const core::orchestration::PreviewResult& result) {
-                const std::optional<core::client::DisplayFrame> frame =
-                    toDisplayFrame(result.image, result.previewSequence);
-                if (frame.has_value())
-                {
-                    emit displayFrameUpdated(*frame);
-                }
-                emit previewUpdated(result);
-            });
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewWarning,
-            this,
-            &CatalogEditorFacade::previewWarning);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewCompleted,
-            this,
-            &CatalogEditorFacade::previewCompleted);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewFailed,
-            this,
-            &CatalogEditorFacade::previewFailed);
-    connect(m_editorOrchestrator,
-            &core::orchestration::EditorOrchestrator::previewCancelled,
-            this,
-            &CatalogEditorFacade::previewCancelled);
-    connect(m_catalogOrchestrator,
-            &core::orchestration::CatalogOrchestrator::sourceBindingStarted,
-            this,
-            &CatalogEditorFacade::sourceBindingStarted);
-    connect(m_catalogOrchestrator,
-            &core::orchestration::CatalogOrchestrator::sourceBindingUpdated,
-            this,
-            &CatalogEditorFacade::sourceBindingUpdated);
-    connect(m_catalogOrchestrator,
-            &core::orchestration::CatalogOrchestrator::sourceBindingFailed,
-            this,
-            &CatalogEditorFacade::sourceBindingFailed);
-    connect(m_catalogOrchestrator,
-            &core::orchestration::CatalogOrchestrator::sourceBindingCancelled,
-            this,
-            &CatalogEditorFacade::sourceBindingCancelled);
-}
+      m_catalogThumbnailEventAdapter(new QtCatalogThumbnailEventAdapter(catalogThumbnailOrchestrator, this)),
+      m_editorEventAdapter(new QtEditorEventAdapter(editorOrchestrator, this)),
+      m_folderImportEventAdapter(new QtFolderImportEventAdapter(catalogOrchestrator, this)),
+      m_previewPresentationEventAdapter(new QtPreviewPresentationEventAdapter(editorOrchestrator, this)),
+      m_sourceResolutionEventSource(&sourceResolutionEventSource)
+{}
 
-// 목적: 현재 catalog session state 반환
+// 목적: 현재 active Catalog session을 immutable Qt-free snapshot으로 조회
 // 입력: 없음
-// 출력: catalog open 여부와 canonical path
-core::orchestration::CatalogSessionState CatalogEditorFacade::catalogState() const
+// 출력: open 여부와 open 상태에서만 채워지는 normalized absolute UTF-8 catalog path
+core::client::CatalogSessionSnapshot CatalogEditorFacade::catalogSnapshot() const
 {
-    return m_catalogOrchestrator->state();
-}
-
-// 목적: 현재 editor session state 반환
-// 입력: 없음
-// 출력: selection, params, dirty와 history 상태
-core::orchestration::EditorState CatalogEditorFacade::editorState() const
-{
-    return core::orchestration::fromClientEditorSnapshot(editorSnapshot());
+    return m_catalogSessionOrchestrator->catalogSnapshot();
 }
 
 // 목적: 현재 Editor session의 immutable Qt-free state 조회
@@ -129,6 +53,14 @@ core::client::EditorSnapshot CatalogEditorFacade::editorSnapshot() const
     return m_editorOrchestrator->editorSnapshot();
 }
 
+// 목적: Folder scan source를 active Catalog에 등록·resolve하고 Editor session으로 선택
+// 입력: command: normalized absolute UTF-8 source와 표시 metadata
+// 출력: stable Photo identity가 발급된 snapshot 또는 validation·Catalog 오류
+core::client::EditorResult CatalogEditorFacade::activateSource(const core::client::ActivateEditorSourceCommand& command)
+{
+    return m_editorOrchestrator->activateSource(command);
+}
+
 // 목적: Qt GUI delivery context에서 initial snapshot과 이후 Editor state event 구독
 // 입력: callback: immutable Qt-free event consumer
 // 출력: RAII unsubscribe handle 또는 callback·thread 오류
@@ -136,6 +68,130 @@ core::client::EditorStateSubscriptionResult CatalogEditorFacade::subscribeToEdit
     core::client::EditorStateCallback callback)
 {
     return m_editorEventAdapter->subscribeToEditorState(std::move(callback));
+}
+
+// 목적: Qt-free viewport command를 authoritative Editor Preview owner에 전달
+// 입력: command: 양수 fixed-width pixel 크기
+// 출력: 적용된 viewport 또는 validation 오류
+core::client::PreviewViewportResult CatalogEditorFacade::setPreviewViewport(
+    const core::client::SetPreviewViewportCommand& command)
+{
+    return m_editorOrchestrator->setPreviewViewport(command);
+}
+
+// 목적: 현재 accepted Preview request의 향후 frame publication과 processing 취소
+// 입력: requestId: owner가 발급해 presentation snapshot에 공개한 identity
+// 출력: 취소된 identity 또는 stale·validation 오류
+core::client::PreviewRequestCancelResult CatalogEditorFacade::cancelPreviewRequest(
+    core::client::PreviewRequestId requestId)
+{
+    return m_editorOrchestrator->cancelPreviewRequest(requestId);
+}
+
+// 목적: Qt GUI delivery context에서 initial Preview snapshot과 이후 lifecycle 구독
+// 입력: callback: immutable frame·analysis·warning·terminal consumer
+// 출력: RAII unsubscribe handle 또는 callback·thread 오류
+core::client::PreviewPresentationSubscriptionResult CatalogEditorFacade::subscribeToPreviewPresentation(
+    core::client::PreviewPresentationCallback callback)
+{
+    return m_previewPresentationEventAdapter->subscribeToPreviewPresentation(std::move(callback));
+}
+
+// 목적: Qt-free command로 replacement source를 기존 Photo identity의 새 baseline으로 수용
+// 입력: command: develop state를 유지할 stable Photo identity
+// 출력: accepted request context 또는 capability·session 오류
+core::client::SourceRequestResult CatalogEditorFacade::acceptReplacement(
+    const core::client::AcceptReplacementCommand& command)
+{
+    return m_catalogOrchestrator->acceptReplacement(command);
+}
+
+// 목적: Qt-free command로 replacement source에 새 Photo identity 발급
+// 입력: command: source binding을 해제할 기존 stable Photo identity
+// 출력: accepted request context 또는 capability·session 오류
+core::client::SourceRequestResult CatalogEditorFacade::registerReplacementAsNew(
+    const core::client::RegisterReplacementAsNewCommand& command)
+{
+    return m_catalogOrchestrator->registerReplacementAsNew(command);
+}
+
+// 목적: Qt-free command로 기존 Photo를 normalized absolute source locator에 재연결
+// 입력: command: stable Photo identity와 UTF-8 lexical locator
+// 출력: accepted request context 또는 validation·capability·session 오류
+core::client::SourceRequestResult CatalogEditorFacade::relinkSource(const core::client::RelinkSourceCommand& command)
+{
+    return m_catalogOrchestrator->relinkSource(command);
+}
+
+// 목적: accepted source fingerprint request의 향후 mutation과 event publication 취소
+// 입력: requestId: owner가 발급한 source request identity
+// 출력: 취소된 identity 또는 stale·validation 오류
+core::client::SourceRequestCancelResult CatalogEditorFacade::cancelSourceRequest(
+    core::client::SourceRequestId requestId)
+{
+    return m_catalogOrchestrator->cancelSourceRequest(requestId);
+}
+
+// 목적: Qt GUI delivery context에서 initial source requests와 이후 lifecycle 구독
+// 입력: callback: immutable Source Resolution event consumer
+// 출력: RAII unsubscribe handle 또는 callback·thread 오류
+core::client::SourceResolutionSubscriptionResult CatalogEditorFacade::subscribeToSourceResolution(
+    core::client::SourceResolutionCallback callback)
+{
+    return m_sourceResolutionEventSource->subscribeToSourceResolution(std::move(callback));
+}
+
+// 목적: Qt-free tagged item 집합으로 visible/adjacent Catalog thumbnail window 교체
+// 입력: command: stable PhotoId 또는 transient locator identity와 target extent
+// 출력: owner generation과 accepted item 수 또는 validation·shutdown 오류
+core::client::CatalogThumbnailWindowResult CatalogEditorFacade::replaceThumbnailWindow(
+    const core::client::ReplaceCatalogThumbnailWindowCommand& command)
+{
+    return m_catalogThumbnailOrchestrator->replaceThumbnailWindow(command);
+}
+
+// 목적: active Catalog thumbnail window와 pending decode를 idempotent하게 정리
+// 입력: 없음
+// 출력: 기존 generation cancellation 완료 또는 shutdown 오류
+core::client::CatalogThumbnailClearResult CatalogEditorFacade::clearThumbnailWindow()
+{
+    return m_catalogThumbnailOrchestrator->clearThumbnailWindow();
+}
+
+// 목적: Qt GUI delivery context에서 initial Catalog thumbnail snapshot과 이후 lifecycle 구독
+// 입력: callback: immutable frame·issue·terminal consumer
+// 출력: RAII unsubscribe handle 또는 callback·thread 오류
+core::client::CatalogThumbnailSubscriptionResult CatalogEditorFacade::subscribeToCatalogThumbnails(
+    core::client::CatalogThumbnailCallback callback)
+{
+    return m_catalogThumbnailEventAdapter->subscribeToCatalogThumbnails(std::move(callback));
+}
+
+// 목적: Qt-free command로 Catalog와 독립적인 단일 folder scan 제출
+// 입력: command: UTF-8 folder path
+// 출력: accepted operation receipt 또는 validation·busy 오류
+core::client::FolderOperationResult CatalogEditorFacade::submitFolderScan(
+    const core::client::ScanFolderCommand& command)
+{
+    return m_catalogOrchestrator->submitFolderScan(command);
+}
+
+// 목적: Qt-free command로 expected Catalog에 묶인 단일 folder import 제출
+// 입력: command: UTF-8 folder path와 submit 시점 Catalog path
+// 출력: accepted operation receipt 또는 validation·session·busy 오류
+core::client::FolderOperationResult CatalogEditorFacade::submitFolderImport(
+    const core::client::ImportFolderCommand& command)
+{
+    return m_catalogOrchestrator->submitFolderImport(command);
+}
+
+// 목적: Qt GUI delivery context에서 initial Folder operation과 이후 lifecycle event 구독
+// 입력: callback: immutable Qt-free event consumer
+// 출력: RAII unsubscribe handle 또는 callback·thread 오류
+core::client::FolderOperationSubscriptionResult CatalogEditorFacade::subscribeToFolderOperations(
+    core::client::FolderOperationCallback callback)
+{
+    return m_folderImportEventAdapter->subscribeToFolderOperations(std::move(callback));
 }
 
 // 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
@@ -203,29 +259,20 @@ core::client::EditorResult CatalogEditorFacade::saveDevelopState()
     return m_editorOrchestrator->saveDevelopState();
 }
 
-// 목적: 지정 catalog를 열어 facade의 active catalog session으로 설정
-// 입력: catalogPath: 생성하거나 열 catalog file 경로
-// 출력: 열린 session state 또는 오류
-core::orchestration::CatalogSessionResult CatalogEditorFacade::openCatalog(const QString& catalogPath)
+// 목적: 명시적 create/open 및 optional clean-session 교체 정책으로 Catalog 활성화
+// 입력: command: UTF-8 path, create/open mode와 active session replacement 정책
+// 출력: 열린 normalized absolute snapshot 또는 validation·permission·database·conflict 오류
+core::client::CatalogSessionResult CatalogEditorFacade::openCatalog(const core::client::OpenCatalogCommand& command)
 {
-    return m_catalogOrchestrator->openCatalog(catalogPath);
+    return m_catalogSessionOrchestrator->openCatalog(command);
 }
 
-// 목적: active catalog session과 background source 작업 정리
+// 목적: dirty Editor state를 보존하면서 clean Catalog session을 idempotent하게 종료
 // 입력: 없음
-// 출력: 닫힌 session state
-core::orchestration::CatalogSessionState CatalogEditorFacade::closeCatalog()
+// 출력: 닫힌 snapshot 또는 unsaved Editor conflict 오류
+core::client::CatalogSessionResult CatalogEditorFacade::closeCatalog()
 {
-    return m_catalogOrchestrator->closeCatalog();
-}
-
-// 목적: active catalog에서 optional exact-folder scope와 stable cursor 기반 bounded photo page 반환
-// 입력: request: page 크기, 방향, optional exclusive cursor와 folder scope
-// 출력: catalog photo page 또는 오류
-core::orchestration::CatalogPhotoPageResult CatalogEditorFacade::queryPhotos(
-    const core::catalog::CatalogPhotoPageRequest& request) const
-{
-    return m_catalogOrchestrator->queryPhotos(request);
+    return m_catalogSessionOrchestrator->closeCatalog();
 }
 
 // 목적: optional Catalog/Folder/Project scope의 bounded page를 Qt-free snapshot으로 조회
@@ -237,12 +284,12 @@ core::client::CatalogPhotoPageResult CatalogEditorFacade::queryPhotoPage(
     return m_catalogOrchestrator->queryPhotoPage(request);
 }
 
-// 목적: active Catalog navigation에 사용할 distinct Folder summary 반환
+// 목적: active Catalog navigation에 사용할 distinct Folder snapshot 조회
 // 입력: 없음
-// 출력: path 순서의 Folder와 photo 수 또는 오류
-core::orchestration::CatalogFolderListResult CatalogEditorFacade::queryFolders() const
+// 출력: normalized UTF-8 path 순서와 양수 photo 수 또는 구조화된 client 오류
+core::client::CatalogFolderListResult CatalogEditorFacade::listFolders() const
 {
-    return m_catalogOrchestrator->queryFolders();
+    return m_catalogOrchestrator->listFolders();
 }
 
 // 목적: active Catalog Project를 Qt-free client snapshot으로 조회
@@ -294,170 +341,6 @@ core::client::CatalogProjectMembershipResult CatalogEditorFacade::removePhotoFro
     const core::client::ProjectPhotoMembershipCommand& command)
 {
     return m_catalogOrchestrator->removePhotoFromProject(command);
-}
-
-// 목적: Catalog list viewport와 인접 범위의 bounded thumbnail source set 교체
-// 입력: sources: 현재 materialize할 file descriptor, targetSize: icon 최대 크기
-// 출력: 수락 성공 또는 validation·shutdown 오류
-core::orchestration::CatalogThumbnailWindowResult CatalogEditorFacade::updateThumbnailWindow(
-    QVector<core::types::FileDescriptor> sources, const QSize& targetSize)
-{
-    return m_catalogThumbnailOrchestrator->updateWindow({std::move(sources), targetSize});
-}
-
-// 목적: worker에서 scan한 photo를 active catalog에 등록
-// 입력: entries: 분류가 완료된 supported photo 목록
-// 출력: 저장 수와 PhotoId 목록 또는 오류
-core::orchestration::CatalogImportResult CatalogEditorFacade::importScannedEntries(
-    const QVector<core::catalog::CatalogEntry>& entries)
-{
-    return m_catalogOrchestrator->importScannedEntries(entries);
-}
-
-// 목적: Folder photo를 active Catalog에 등록·resolve하고 stable Editor session 시작
-// 입력: entry: scan된 supported photo, targetSize: preview viewport 크기
-// 출력: 선택 후 editor state 또는 registration·catalog/source 오류
-core::orchestration::EditorStateResult CatalogEditorFacade::activatePhoto(const core::catalog::CatalogEntry& entry,
-                                                                          const QSize& targetSize)
-{
-    (void)updatePreviewTargetSize(targetSize);
-    const core::orchestration::CatalogPhotoRegistrationResult registered = m_catalogOrchestrator->registerPhoto(entry);
-    if (registered.hasError())
-    {
-        return core::orchestration::EditorStateResult::failure(registered.error());
-    }
-
-    return toQtEditorResult(selectPhoto({core::client::ClientPhotoId{registered.value().value}}));
-}
-
-// 목적: stable PhotoId photo를 persisted develop state와 함께 선택
-// 입력: photoId: catalog-local identity, targetSize: preview viewport 크기
-// 출력: 선택 후 editor state 또는 오류
-core::orchestration::EditorStateResult CatalogEditorFacade::selectCatalogPhoto(core::types::PhotoId photoId,
-                                                                               const QSize& targetSize)
-{
-    (void)updatePreviewTargetSize(targetSize);
-    return toQtEditorResult(selectPhoto({core::client::ClientPhotoId{photoId.value}}));
-}
-
-// 목적: 현재 catalog-backed photo의 develop state 저장
-// 입력: 없음
-// 출력: 저장 후 editor state 또는 오류
-core::orchestration::EditorStateResult CatalogEditorFacade::saveCurrentPhoto()
-{
-    return toQtEditorResult(saveDevelopState());
-}
-
-// 목적: current source를 기존 PhotoId의 새 baseline으로 수용
-// 입력: photoId: develop state를 유지할 catalog identity
-// 출력: accepted background request ID 또는 state 오류
-core::orchestration::CatalogSourceSubmissionResult CatalogEditorFacade::acceptReplacement(core::types::PhotoId photoId)
-{
-    return m_catalogOrchestrator->acceptReplacement(photoId);
-}
-
-// 목적: current replacement source를 새 PhotoId로 등록
-// 입력: photoId: source binding을 해제할 기존 identity
-// 출력: accepted background request ID 또는 state 오류
-core::orchestration::CatalogSourceSubmissionResult CatalogEditorFacade::registerReplacementAsNew(
-    core::types::PhotoId photoId)
-{
-    return m_catalogOrchestrator->registerReplacementAsNew(photoId);
-}
-
-// 목적: 기존 PhotoId를 검증된 다른 source locator에 재연결
-// 입력: photoId: 유지할 identity, locator: 검증할 새 위치
-// 출력: accepted background request ID 또는 state 오류
-core::orchestration::CatalogSourceSubmissionResult CatalogEditorFacade::relinkSource(
-    core::types::PhotoId photoId, const core::types::SourceLocator& locator)
-{
-    return m_catalogOrchestrator->relinkSource(photoId, locator);
-}
-
-// 목적: Activity adapter가 current Editor preview cancellation을 owner에 전달
-// 입력: requestId: accepted preview request identity
-// 출력: current request를 취소했으면 true
-bool CatalogEditorFacade::cancelPreviewActivity(core::types::RequestId requestId)
-{
-    return m_editorOrchestrator->cancelPreviewRequest(requestId);
-}
-
-// 목적: Activity adapter가 source verification cancellation을 owner에 전달
-// 입력: requestId: accepted source request identity
-// 출력: active source request를 취소했으면 true
-bool CatalogEditorFacade::cancelSourceActivity(core::types::RequestId requestId)
-{
-    return m_catalogOrchestrator->cancelSourceRequest(requestId);
-}
-
-// 목적: 현재 editor selection과 active preview 정리
-// 입력: 없음
-// 출력: 없음
-void CatalogEditorFacade::clearSelection()
-{
-    (void)clearEditorSelection();
-}
-
-// 목적: 현재 editor params를 갱신하고 preview 예약
-// 입력: params: 새 develop 값, targetSize: preview viewport 크기
-// 출력: 실제 state가 변경되면 true
-bool CatalogEditorFacade::updateDevelopParams(const core::types::DevelopParams& params, const QSize& targetSize)
-{
-    (void)updatePreviewTargetSize(targetSize);
-    const core::client::EditorDevelopParams previous = editorSnapshot().params;
-    const core::client::EditorResult updated =
-        updateDevelopParams({core::orchestration::toClientDevelopParams(params)});
-    return updated.hasValue() && updated.value().params != previous;
-}
-
-// 목적: GUI viewport resize를 Editor preview target 변경으로 전달
-// 입력: targetSize: layout 적용 후 preview viewport 크기
-// 출력: 실제 target 크기 변경이 예약됐으면 true
-bool CatalogEditorFacade::updatePreviewTargetSize(const QSize& targetSize)
-{
-    return m_editorOrchestrator->updatePreviewTargetSize(targetSize);
-}
-
-// 목적: 연속 develop 조작을 하나의 undo 단계로 시작
-// 입력: 없음
-// 출력: 없음
-void CatalogEditorFacade::beginEdit()
-{
-    (void)beginAdjustment();
-}
-
-// 목적: 현재 연속 develop 조작 종료
-// 입력: 없음
-// 출력: 없음
-void CatalogEditorFacade::endEdit()
-{
-    (void)endAdjustment();
-}
-
-// 목적: 현재 photo의 마지막 develop 변경 되돌리기
-// 입력: targetSize: preview viewport 크기
-// 출력: 변경된 state 또는 undo 불가 시 빈 값
-std::optional<core::orchestration::EditorState> CatalogEditorFacade::undo(const QSize& targetSize)
-{
-    (void)updatePreviewTargetSize(targetSize);
-    const core::client::EditorResult result = undoDevelop();
-    return result.hasValue()
-               ? std::optional<core::orchestration::EditorState>{core::orchestration::fromClientEditorSnapshot(
-                     result.value())}
-               : std::nullopt;
-}
-
-// 목적: 현재 photo의 마지막 undo 변경 다시 적용
-// 입력: targetSize: preview viewport 크기
-// 출력: 변경된 state 또는 redo 불가 시 빈 값
-std::optional<core::orchestration::EditorState> CatalogEditorFacade::redo(const QSize& targetSize)
-{
-    (void)updatePreviewTargetSize(targetSize);
-    const core::client::EditorResult result = redoDevelop();
-    return result.hasValue()
-               ? std::optional<core::orchestration::EditorState>{core::orchestration::fromClientEditorSnapshot(
-                     result.value())}
-               : std::nullopt;
 }
 
 }  // namespace flexraw::ui::facade

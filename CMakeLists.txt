@@ -1,33 +1,47 @@
 cmake_minimum_required(VERSION 3.25)
 project(flexraw VERSION 0.1.0 LANGUAGES CXX)
 
-set(FLEXRAW_VERSION_STRING "${PROJECT_VERSION}")
+set(FLEXRAW_VERSION_PRERELEASE "alpha.5")
+set(FLEXRAW_VERSION_STRING "${PROJECT_VERSION}-${FLEXRAW_VERSION_PRERELEASE}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(FLEXRAW_BUILD_DESKTOP "Build the Flexraw desktop application" ON)
 option(FLEXRAW_BUILD_WORKER "Build the bounded render worker" OFF)
+option(FLEXRAW_BUILD_MCP "Build the local STDIO MCP second consumer" ${FLEXRAW_BUILD_DESKTOP})
 option(FLEXRAW_BUILD_TESTS "Build Flexraw test targets" ON)
 option(FLEXRAW_BUILD_UI_TESTS "Build Qt Widgets UI tests" ON)
+option(FLEXRAW_BUILD_PORTABLE_TESTS "Build Qt-free product contract tests" ON)
 option(FLEXRAW_BUILD_BENCHMARKS "Build opt-in runtime measurement executables" OFF)
 option(FLEXRAW_WINDOWS_DEBUG_CONSOLE "Show the Windows desktop debug console" OFF)
 
-if(NOT FLEXRAW_BUILD_DESKTOP AND NOT FLEXRAW_BUILD_WORKER)
-    message(FATAL_ERROR "At least one of FLEXRAW_BUILD_DESKTOP or FLEXRAW_BUILD_WORKER must be ON.")
+if(NOT FLEXRAW_BUILD_DESKTOP AND NOT FLEXRAW_BUILD_WORKER AND NOT FLEXRAW_BUILD_MCP AND
+   NOT (FLEXRAW_BUILD_TESTS AND FLEXRAW_BUILD_PORTABLE_TESTS))
+    message(FATAL_ERROR
+        "Enable Desktop, Worker, MCP, or FLEXRAW_BUILD_TESTS with FLEXRAW_BUILD_PORTABLE_TESTS."
+    )
 endif()
 
 if(MSVC)
     add_compile_options(/permissive- /W4)
 endif()
 
-set(FLEXRAW_QT_COMPONENTS Core Gui Network)
-if(FLEXRAW_BUILD_DESKTOP)
-    list(APPEND FLEXRAW_QT_COMPONENTS Concurrent Widgets Sql)
+if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER OR FLEXRAW_BUILD_MCP)
+    set(FLEXRAW_QT_COMPONENTS Core Gui)
+    if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER)
+        list(APPEND FLEXRAW_QT_COMPONENTS Network)
+    endif()
+    if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_MCP)
+        list(APPEND FLEXRAW_QT_COMPONENTS Concurrent Sql)
+    endif()
+    if(FLEXRAW_BUILD_DESKTOP)
+        list(APPEND FLEXRAW_QT_COMPONENTS Widgets)
+    endif()
+    list(REMOVE_DUPLICATES FLEXRAW_QT_COMPONENTS)
+    find_package(Qt6 REQUIRED COMPONENTS ${FLEXRAW_QT_COMPONENTS})
+    qt_standard_project_setup()
 endif()
-list(REMOVE_DUPLICATES FLEXRAW_QT_COMPONENTS)
-find_package(Qt6 REQUIRED COMPONENTS ${FLEXRAW_QT_COMPONENTS})
-qt_standard_project_setup()
 
 add_subdirectory(src)
 

@@ -27,6 +27,19 @@ TEST(RawFileReader, ReturnsInvalidArgumentForEmptyPath)
     EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
 }
 
+TEST(RawFileReader, RejectsOuterWhitespaceBeforeFilesystemLookup)
+{
+    QTemporaryDir folder;
+    ASSERT_TRUE(folder.isValid());
+    const QString sourcePath = QDir(folder.path()).filePath(QStringLiteral("input.dng"));
+    ASSERT_TRUE(createEmptyFile(sourcePath));
+
+    const RawMetadataResult result = readRawMetadata(sourcePath + QLatin1Char(' '));
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+}
+
 TEST(RawFileReader, ReturnsNotFoundForMissingFile)
 {
     QTemporaryDir folder;

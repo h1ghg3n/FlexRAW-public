@@ -6,11 +6,24 @@
 #include <QMainWindow>
 
 #include "activity_client.h"
-#include "catalog_contracts.h"
 #include "catalog_entry.h"
+#include "catalog_folder_client.h"
 #include "catalog_photo_client.h"
+#include "catalog_project.h"
+#include "catalog_project_client.h"
+#include "catalog_session_client.h"
+#include "catalog_startup_settings_client.h"
+#include "catalog_thumbnail_client.h"
 #include "develop_params.h"
+#include "editor_client.h"
 #include "editor_event_client.h"
+#include "export_client.h"
+#include "export_defaults_client.h"
+#include "folder_import_client.h"
+#include "preview_presentation_client.h"
+#include "source_resolution_client.h"
+#include "worker_health_client.h"
+#include "worker_profile_client.h"
 
 namespace flexraw::ui::catalog
 {
@@ -31,8 +44,6 @@ class ConsoleModeWidget;
 
 namespace flexraw::core::orchestration
 {
-class CatalogOrchestrator;
-class ExportOrchestrator;
 struct EditorState;
 }  // namespace flexraw::core::orchestration
 
@@ -43,7 +54,6 @@ class CatalogEditorFacade;
 
 namespace flexraw::ui::mainwindow
 {
-class FolderScanController;
 class QtActivityAdapter;
 }  // namespace flexraw::ui::mainwindow
 
@@ -52,6 +62,7 @@ class QCloseEvent;
 class QComboBox;
 class QLabel;
 class QProgressBar;
+class QSettings;
 class QStackedWidget;
 class QTimer;
 class QToolButton;
@@ -63,12 +74,19 @@ class MainWindow : public QMainWindow
 {
 public:
     // 목적: Flexraw 첫 catalog-to-preview window를 editor session adapter로 초기화
-    // 입력: catalogEditorFacade: GUI boundary, catalogOrchestrator: console catalog use case,
-    //       exportOrchestrator: Local/Remote/Auto export use case, parent: Qt 부모 widget
+    // 입력: catalogEditorFacade: GUI와 Folder lifecycle boundary,
+    //       Export command/event/default contract, applicationSettings/profile client, optional Worker health와
+    //       Catalog startup settings capability, parent: Qt 부모 widget
     // 출력: 초기화된 MainWindow 객체
     explicit MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
-                        core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                        core::orchestration::ExportOrchestrator& exportOrchestrator,
+                        core::client::IExportClient& exportClient,
+                        core::client::IExportEventSource& exportEventSource,
+                        core::client::IExportDefaultsClient& exportDefaultsClient,
+                        QSettings& applicationSettings,
+                        core::client::IWorkerProfileClient& workerProfileClient,
+                        core::client::IWorkerHealthClient* workerHealthClient = nullptr,
+                        core::client::IWorkerHealthEventSource* workerHealthEventSource = nullptr,
+                        core::client::ICatalogStartupSettingsClient* catalogStartupSettingsClient = nullptr,
                         QWidget* parent = nullptr);
 
 protected:
@@ -87,6 +105,51 @@ private:
     // 입력: 없음
     // 출력: RAII subscription 보관 또는 구조화된 오류 logging
     void subscribeToActivityEvents();
+
+    // 목적: Qt-free Folder operation event source를 MainWindow presentation에 연결
+    // 입력: 없음
+    // 출력: RAII subscription 보관 또는 구조화된 오류 logging
+    void subscribeToFolderOperationEvents();
+
+    // 목적: Qt-free Preview presentation event source를 MainWindow view에 연결
+    // 입력: 없음
+    // 출력: RAII subscription 보관 또는 구조화된 오류 logging
+    void subscribeToPreviewPresentationEvents();
+
+    // 목적: Qt-free Catalog thumbnail event source를 MainWindow view에 연결
+    // 입력: 없음
+    // 출력: RAII subscription 보관 또는 구조화된 오류 logging
+    void subscribeToCatalogThumbnailEvents();
+
+    // 목적: Qt-free Source Resolution event source를 MainWindow presentation에 연결
+    // 입력: 없음
+    // 출력: RAII subscription 보관 또는 구조화된 오류 logging
+    void subscribeToSourceResolutionEvents();
+
+    // 목적: immutable Preview snapshot/event를 image·analysis·status presentation에 반영
+    // 입력: event: initial state, frame update, warning 또는 terminal
+    // 출력: PreviewWidget과 DevelopPanel 표시 갱신
+    void handlePreviewPresentationEvent(const core::client::PreviewPresentationEvent& event);
+
+    // 목적: immutable Catalog thumbnail frame/issue/terminal을 list presentation에 반영
+    // 입력: event: initial state 또는 window lifecycle transition
+    // 출력: current generation row icon/terminal 상태 갱신
+    void handleCatalogThumbnailEvent(const core::client::CatalogThumbnailEvent& event);
+
+    // 목적: initial/active/terminal Folder lifecycle을 MainWindow 상태로 투영
+    // 입력: event: immutable Folder operation event
+    // 출력: action enablement와 scan/import presentation 갱신
+    void handleFolderOperationEvent(const core::client::FolderOperationEvent& event);
+
+    // 목적: accepted Folder scan/import 시작 상태를 action과 preview presentation에 반영
+    // 입력: receipt: operation kind와 normalized folder path
+    // 출력: 중복 command 차단과 scan 종류별 status 표시
+    void handleFolderOperationStarted(const core::client::FolderOperationReceipt& receipt);
+
+    // 목적: Folder scan/import exact terminal을 list 또는 Catalog navigation에 적용
+    // 입력: terminal: completion snapshot 또는 구조화된 실패
+    // 출력: action 복원과 scan/import 결과 표시
+    void handleFolderOperationTerminal(const core::client::FolderOperationTerminal& terminal);
 
     // 목적: immutable active 목록을 status bar progress와 owner cancel target에 투영
     // 입력: event: initial 또는 lifecycle transition 뒤 Activity snapshot
@@ -109,9 +172,9 @@ private:
     void openCatalog();
 
     // 목적: 지정 catalog를 단일 active session으로 열고 stable PhotoId 목록 표시
-    // 입력: catalogPath: 생성하거나 열 catalog file 경로
+    // 입력: catalogPath: 생성하거나 열 catalog file 경로, openMode: explicit create/open 의도
     // 출력: catalog와 photo list를 모두 열었으면 true
-    [[nodiscard]] bool openCatalogPath(const QString& catalogPath);
+    [[nodiscard]] bool openCatalogPath(const QString& catalogPath, core::client::CatalogOpenMode openMode);
 
     // 목적: 이미 열린 Catalog의 photo 목록과 관련 action을 현재 window에 반영
     // 입력: 없음
@@ -199,6 +262,11 @@ private:
     // 출력: 없음
     void importFolder();
 
+    // 목적: 현재 Catalog snapshot을 baseline으로 Folder import command 제출
+    // 입력: folderPath: file dialog에서 선택한 folder
+    // 출력: accepted lifecycle 또는 non-modal submission 실패 표시
+    void submitFolderImport(const QString& folderPath);
+
     // 목적: folder 선택 dialog를 열고 선택된 folder scan 시작
     // 입력: 없음
     // 출력: 없음
@@ -237,28 +305,28 @@ private:
     // 목적: source resolution command 제출 결과를 공통 inline 상태로 변환
     // 입력: result: request ID 또는 오류, failureMessage: 사용자용 실패 안내
     // 출력: request가 accepted되면 true
-    [[nodiscard]] bool beginSourceResolution(const core::orchestration::CatalogSourceSubmissionResult& result,
+    [[nodiscard]] bool beginSourceResolution(const core::client::SourceRequestResult& result,
                                              const QString& failureMessage);
+
+    // 목적: immutable source request lifecycle을 inline control과 Catalog presentation에 반영
+    // 입력: event: initial active requests 또는 accepted·update·issue·terminal transition
+    // 출력: pending 상태와 source transition 결과 갱신
+    void handleSourceResolutionEvent(const core::client::SourceResolutionEvent& event);
 
     // 목적: source transition을 현재 Editor selection과 catalog list에 반영
     // 입력: update: 갱신된 기존 photo와 optional 신규 photo
     // 출력: 현재 selection의 Register as New이면 신규 PhotoId로 전환
-    void handleSourceBindingUpdated(const core::orchestration::CatalogSourceUpdate& update);
+    void handleSourceBindingUpdated(const core::client::SourceResolutionUpdate& update);
 
     // 목적: current photo의 source verification/resolution 실패를 inline 상태로 표시
     // 입력: issue: request·photo identity와 technical 오류
     // 출력: pending 해제와 사용자용 실패 안내
-    void handleSourceBindingFailed(const core::orchestration::CatalogIssue& issue);
+    void handleSourceBindingFailed(const core::client::SourceResolutionIssue& issue);
 
     // 목적: source request terminal cancellation을 inline 상태에 반영
     // 입력: requestId: 취소된 request identity
     // 출력: pending 상태 해제
-    void handleSourceBindingCancelled(core::types::RequestId requestId);
-
-    // 목적: terminal event와 일치하는 explicit source request 추적을 제거
-    // 입력: requestId: 완료·실패·취소된 request identity
-    // 출력: 해당 request가 명시적 GUI command이면 대상 PhotoId
-    [[nodiscard]] std::optional<core::types::PhotoId> takeSourceResolutionRequest(core::types::RequestId requestId);
+    void handleSourceBindingCancelled(const core::client::SourceResolutionTerminal& terminal);
 
     // 목적: 현재 catalog-backed photo의 develop state를 explicit user command로 저장
     // 입력: 없음
@@ -285,9 +353,9 @@ private:
     // 출력: 없음
     void setConsoleMode(bool enabled);
 
-    // 목적: application UI preference를 편집하고 accepted style을 즉시 DevelopPanel에 반영
+    // 목적: application UI preference와 product setting을 편집하는 Settings dialog 표시
     // 입력: 없음
-    // 출력: Settings dialog가 modal로 표시되고 accept 시 preference 저장
+    // 출력: accept 시 Export 기본값 저장과 adjustment style 즉시 반영
     void openSettings();
 
     // 목적: 현재 선택 사진에 대한 develop parameter 변경을 preview와 history에 반영
@@ -316,7 +384,7 @@ private:
     void redoDevelopAdjustment();
 
     // 목적: Editor state 변경을 action 활성화와 source-blocked 안내에 반영
-    // 입력: state: CatalogEditorFacade가 publish한 immutable state
+    // 입력: state: Qt-free Editor event snapshot을 Qt presentation model로 변환한 immutable state
     // 출력: 없음
     void updateEditorStateUi(const core::orchestration::EditorState& state);
 
@@ -330,12 +398,35 @@ private:
     catalog::SourceResolutionWidget* m_sourceResolutionWidget{nullptr};
     editor::PreviewWidget* m_previewWidget{nullptr};
     cli::ConsoleModeWidget* m_consoleWidget{nullptr};
-    FolderScanController* m_folderScanController{nullptr};
-    facade::CatalogEditorFacade* m_catalogEditorFacade{nullptr};
+    core::client::ICatalogPhotoClient* m_catalogPhotoClient{nullptr};
+    core::client::ICatalogProjectClient* m_catalogProjectClient{nullptr};
+    core::client::ICatalogFolderClient* m_catalogFolderClient{nullptr};
+    core::client::ICatalogSessionClient* m_catalogSessionClient{nullptr};
+    core::client::IEditorClient* m_editorClient{nullptr};
+    core::client::IEditorStateEventSource* m_editorStateEventSource{nullptr};
+    core::client::IFolderImportClient* m_folderImportClient{nullptr};
+    core::client::IFolderImportEventSource* m_folderImportEventSource{nullptr};
+    core::client::ICatalogThumbnailClient* m_catalogThumbnailClient{nullptr};
+    core::client::ICatalogThumbnailEventSource* m_catalogThumbnailEventSource{nullptr};
+    core::client::IPreviewPresentationClient* m_previewPresentationClient{nullptr};
+    core::client::IPreviewPresentationEventSource* m_previewPresentationEventSource{nullptr};
+    core::client::ISourceResolutionClient* m_sourceResolutionClient{nullptr};
+    core::client::ISourceResolutionEventSource* m_sourceResolutionEventSource{nullptr};
     QtActivityAdapter* m_activityAdapter{nullptr};
     core::client::EditorStateSubscriptionHandle m_editorStateSubscription;
     core::client::ActivitySubscriptionHandle m_activitySubscription;
-    core::orchestration::ExportOrchestrator* m_exportOrchestrator{nullptr};
+    core::client::FolderOperationSubscriptionHandle m_folderOperationSubscription;
+    core::client::CatalogThumbnailSubscriptionHandle m_catalogThumbnailSubscription;
+    core::client::PreviewPresentationSubscriptionHandle m_previewPresentationSubscription;
+    core::client::SourceResolutionSubscriptionHandle m_sourceResolutionSubscription;
+    core::client::IExportClient* m_exportClient{nullptr};
+    core::client::IExportEventSource* m_exportEventSource{nullptr};
+    core::client::IExportDefaultsClient* m_exportDefaultsClient{nullptr};
+    QSettings* m_applicationSettings{nullptr};
+    core::client::IWorkerProfileClient* m_workerProfileClient{nullptr};
+    core::client::IWorkerHealthClient* m_workerHealthClient{nullptr};
+    core::client::IWorkerHealthEventSource* m_workerHealthEventSource{nullptr};
+    core::client::ICatalogStartupSettingsClient* m_catalogStartupSettingsClient{nullptr};
     QStackedWidget* m_contentStack{nullptr};
     QLabel* m_activityLabel{nullptr};
     QProgressBar* m_activityProgressBar{nullptr};
@@ -364,8 +455,8 @@ private:
     std::optional<core::client::CatalogPhotoPage> m_catalogPhotoPage;
     std::optional<QString> m_catalogFolderPath;
     std::optional<core::catalog::ProjectId> m_catalogProjectId;
-    QHash<qint64, core::types::RequestId> m_sourceResolutionRequests;
-    bool m_importingFolder{false};
+    QHash<qint64, core::client::SourceRequestId> m_sourceResolutionRequests;
+    bool m_folderOperationActive{false};
 };
 
 }  // namespace flexraw::ui::mainwindow

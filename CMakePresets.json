@@ -3,50 +3,289 @@
   "configurePresets": [
     {
       "name": "windows-msvc-debug",
-      "displayName": "Windows MSVC Debug (Desktop)",
+      "displayName": "Windows MSVC Debug",
       "generator": "Visual Studio 17 2022",
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/debug",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "FLEXRAW_BUILD_DESKTOP": "ON",
-        "FLEXRAW_BUILD_WORKER": "OFF",
-        "FLEXRAW_BUILD_TESTS": "ON",
-        "FLEXRAW_BUILD_UI_TESTS": "ON",
-        "FLEXRAW_BUILD_BENCHMARKS": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_WORKER": "ON",
         "FLEXRAW_WINDOWS_DEBUG_CONSOLE": "ON"
       }
     },
     {
       "name": "windows-msvc-release",
-      "displayName": "Windows MSVC Release (Desktop)",
+      "displayName": "Windows MSVC Release",
       "generator": "Visual Studio 17 2022",
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "FLEXRAW_BUILD_DESKTOP": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_WORKER": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-release-benchmarks",
+      "inherits": "windows-msvc-release",
+      "displayName": "Windows MSVC Release with Benchmarks",
+      "binaryDir": "${sourceDir}/build/benchmarks/release",
+      "cacheVariables": {
+        "FLEXRAW_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-ninja-release",
+      "displayName": "Windows MSVC Ninja Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_WORKER": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-ninja-debug",
+      "displayName": "Windows MSVC Ninja Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_WORKER": "ON",
+        "FLEXRAW_WINDOWS_DEBUG_CONSOLE": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-worker-release",
+      "displayName": "Windows MSVC Worker Release",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/worker/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_DESKTOP": "OFF",
+        "FLEXRAW_BUILD_WORKER": "ON",
+        "FLEXRAW_BUILD_TESTS": "ON",
+        "FLEXRAW_BUILD_UI_TESTS": "OFF",
+        "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "worker;tests"
+      }
+    },
+    {
+      "name": "windows-msvc-worker-debug",
+      "inherits": "windows-msvc-worker-release",
+      "displayName": "Windows MSVC Worker Debug",
+      "binaryDir": "${sourceDir}/build/worker/windows-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-msvc-mcp-release",
+      "displayName": "Windows MSVC MCP-only Release",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/mcp/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_DESKTOP": "OFF",
+        "FLEXRAW_BUILD_WORKER": "OFF",
+        "FLEXRAW_BUILD_MCP": "ON",
+        "FLEXRAW_BUILD_TESTS": "ON",
+        "FLEXRAW_BUILD_UI_TESTS": "OFF",
+        "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "mcp;tests"
+      }
+    },
+    {
+      "name": "windows-msvc-portable-contract-release",
+      "displayName": "Windows MSVC Portable Contract Release",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/portable/windows-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "FLEXRAW_BUILD_DESKTOP": "OFF",
         "FLEXRAW_BUILD_WORKER": "OFF",
         "FLEXRAW_BUILD_TESTS": "ON",
-        "FLEXRAW_BUILD_UI_TESTS": "ON",
-        "FLEXRAW_BUILD_BENCHMARKS": "OFF",
-        "FLEXRAW_WINDOWS_DEBUG_CONSOLE": "OFF"
+        "FLEXRAW_BUILD_UI_TESTS": "OFF",
+        "FLEXRAW_BUILD_PORTABLE_TESTS": "ON",
+        "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "linux-wsl-worker-debug",
+      "displayName": "WSL Worker Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/worker/wsl-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-linux",
+        "FLEXRAW_BUILD_DESKTOP": "OFF",
+        "FLEXRAW_BUILD_WORKER": "ON",
+        "FLEXRAW_BUILD_TESTS": "ON",
+        "FLEXRAW_BUILD_UI_TESTS": "OFF",
+        "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "worker;tests"
+      }
+    },
+    {
+      "name": "linux-wsl-worker-release",
+      "inherits": "linux-wsl-worker-debug",
+      "displayName": "WSL Worker Release",
+      "binaryDir": "${sourceDir}/build/worker/wsl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-arm64-worker-release",
+      "inherits": "linux-wsl-worker-release",
+      "displayName": "Linux ARM64 Worker Release",
+      "binaryDir": "${sourceDir}/build/worker/linux-arm64-release",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-linux"
+      }
+    },
+    {
+      "name": "linux-wsl-portable-contract-release",
+      "displayName": "WSL x64 Portable Contract Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/portable/wsl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-linux",
+        "FLEXRAW_BUILD_DESKTOP": "OFF",
+        "FLEXRAW_BUILD_WORKER": "OFF",
+        "FLEXRAW_BUILD_TESTS": "ON",
+        "FLEXRAW_BUILD_UI_TESTS": "OFF",
+        "FLEXRAW_BUILD_PORTABLE_TESTS": "ON",
+        "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
+      "name": "linux-arm64-portable-contract-release",
+      "inherits": "linux-wsl-portable-contract-release",
+      "displayName": "Linux ARM64 Portable Contract Release",
+      "binaryDir": "${sourceDir}/build/portable/linux-arm64-release",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-linux"
       }
     }
   ],
   "buildPresets": [
     {
       "name": "debug",
-      "configurePreset": "windows-msvc-debug",
-      "configuration": "Debug"
+      "configurePreset": "windows-msvc-debug"
     },
     {
       "name": "release",
-      "configurePreset": "windows-msvc-release",
-      "configuration": "Release"
+      "configurePreset": "windows-msvc-release"
+    },
+    {
+      "name": "benchmarks-release",
+      "configurePreset": "windows-msvc-release-benchmarks",
+      "targets": [
+        "flexraw_benchmark_validation"
+      ]
+    },
+    {
+      "name": "ninja-release",
+      "configurePreset": "windows-msvc-ninja-release",
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/ninja-release/vcpkg_installed/x64-windows/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
+    {
+      "name": "ninja-debug",
+      "configurePreset": "windows-msvc-ninja-debug",
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/ninja-debug/vcpkg_installed/x64-windows/debug/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
+    {
+      "name": "worker-windows-release",
+      "configurePreset": "windows-msvc-worker-release"
+    },
+    {
+      "name": "worker-windows-debug",
+      "configurePreset": "windows-msvc-worker-debug"
+    },
+    {
+      "name": "mcp-windows-release",
+      "configurePreset": "windows-msvc-mcp-release"
+    },
+    {
+      "name": "worker-wsl-debug",
+      "configurePreset": "linux-wsl-worker-debug"
+    },
+    {
+      "name": "worker-wsl-release",
+      "configurePreset": "linux-wsl-worker-release"
+    },
+    {
+      "name": "worker-linux-arm64-release",
+      "configurePreset": "linux-arm64-worker-release"
+    },
+    {
+      "name": "portable-contract-windows-release",
+      "configurePreset": "windows-msvc-portable-contract-release"
+    },
+    {
+      "name": "portable-contract-wsl-release",
+      "configurePreset": "linux-wsl-portable-contract-release"
+    },
+    {
+      "name": "portable-contract-linux-arm64-release",
+      "configurePreset": "linux-arm64-portable-contract-release"
     }
   ],
   "testPresets": [
+    {
+      "name": "release",
+      "configurePreset": "windows-msvc-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/release/vcpkg_installed/x64-windows/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
+    {
+      "name": "benchmarks-release",
+      "configurePreset": "windows-msvc-release-benchmarks",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/benchmarks/release/vcpkg_installed/x64-windows/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
     {
       "name": "debug",
       "configurePreset": "windows-msvc-debug",
@@ -60,15 +299,102 @@
       }
     },
     {
-      "name": "release",
-      "configurePreset": "windows-msvc-release",
+      "name": "ninja-release",
+      "configurePreset": "windows-msvc-ninja-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/ninja-release/vcpkg_installed/x64-windows/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
+    {
+      "name": "ninja-debug",
+      "configurePreset": "windows-msvc-ninja-debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/ninja-debug/vcpkg_installed/x64-windows/debug/Qt6/plugins",
+        "QT_QPA_PLATFORM": "minimal"
+      }
+    },
+    {
+      "name": "worker-windows-release",
+      "configurePreset": "windows-msvc-worker-release",
       "configuration": "Release",
       "output": {
         "outputOnFailure": true
       },
       "environment": {
-        "QT_PLUGIN_PATH": "${sourceDir}/build/release/vcpkg_installed/x64-windows/Qt6/plugins",
-        "QT_QPA_PLATFORM": "minimal"
+        "PATH": "${sourceDir}/build/worker/windows-release/vcpkg_installed/x64-windows/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "worker-windows-debug",
+      "configurePreset": "windows-msvc-worker-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "PATH": "${sourceDir}/build/worker/windows-debug/vcpkg_installed/x64-windows/debug/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "mcp-windows-release",
+      "configurePreset": "windows-msvc-mcp-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "QT_PLUGIN_PATH": "${sourceDir}/build/mcp/windows-release/vcpkg_installed/x64-windows/Qt6/plugins",
+        "PATH": "${sourceDir}/build/mcp/windows-release/vcpkg_installed/x64-windows/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "worker-wsl-debug",
+      "configurePreset": "linux-wsl-worker-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "worker-wsl-release",
+      "configurePreset": "linux-wsl-worker-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "worker-linux-arm64-release",
+      "configurePreset": "linux-arm64-worker-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "portable-contract-windows-release",
+      "configurePreset": "windows-msvc-portable-contract-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "portable-contract-wsl-release",
+      "configurePreset": "linux-wsl-portable-contract-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "portable-contract-linux-arm64-release",
+      "configurePreset": "linux-arm64-portable-contract-release",
+      "output": {
+        "outputOnFailure": true
       }
     }
   ]

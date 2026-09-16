@@ -10,6 +10,7 @@
 #include "develop_history.h"
 #include "editor_client.h"
 #include "editor_contracts.h"
+#include "preview_presentation_client.h"
 
 namespace flexraw::core::orchestration
 {
@@ -18,7 +19,7 @@ class CatalogOrchestrator;
 class PreviewOrchestrator;
 struct CatalogSourceUpdate;
 
-class EditorOrchestrator final : public QObject, public client::IEditorClient
+class EditorOrchestrator final : public QObject, public client::IEditorClient, public client::IPreviewPresentationClient
 {
     Q_OBJECT
 
@@ -40,14 +41,45 @@ public:
     // 출력: selection, Develop state, source capability와 history snapshot
     [[nodiscard]] client::EditorSnapshot editorSnapshot() const override;
 
+    // 목적: Qt-free viewport command를 기존 Preview target과 resize coalescing에 전달
+    // 입력: command: 양수 fixed-width pixel 크기
+    // 출력: 적용된 viewport 또는 validation 오류
+    [[nodiscard]] client::PreviewViewportResult setPreviewViewport(
+        const client::SetPreviewViewportCommand& command) override;
+
+    // 목적: 현재 accepted Preview request의 향후 frame publication과 processing 취소
+    // 입력: requestId: owner가 발급해 presentation snapshot에 공개한 identity
+    // 출력: 취소된 identity 또는 stale·validation 오류
+    [[nodiscard]] client::PreviewRequestCancelResult cancelPreviewRequest(client::PreviewRequestId requestId) override;
+
+    // 목적: Preview presentation adapter가 현재 target 크기를 owner context에서 조회
+    // 입력: 없음
+    // 출력: 아직 설정되지 않았으면 빈 QSize, 아니면 양수 pixel 크기
+    [[nodiscard]] QSize previewTargetSize() const noexcept;
+
+    // 목적: Preview presentation adapter가 현재 latest-wins sequence를 조회
+    // 입력: 없음
+    // 출력: 선택·편집·resize transition에 따라 증가한 sequence
+    [[nodiscard]] types::PreviewSequence previewSequence() const noexcept;
+
+    // 목적: Preview presentation adapter가 현재 accepted request identity를 조회
+    // 입력: 없음
+    // 출력: active request가 없으면 0, 있으면 owner-issued identity
+    [[nodiscard]] types::RequestId activePreviewRequestId() const noexcept;
+
+    // 목적: Folder scan source를 active Catalog에 등록·resolve하고 Editor session으로 선택
+    // 입력: command: normalized absolute UTF-8 source와 표시 metadata
+    // 출력: stable Photo identity가 발급된 snapshot 또는 validation·Catalog 오류
+    [[nodiscard]] client::EditorResult activateSource(const client::ActivateEditorSourceCommand& command) override;
+
     // 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
     // 입력: command: 선택할 fixed-width Photo identity
     // 출력: 선택 후 snapshot 또는 validation·Catalog·Develop load 오류
     [[nodiscard]] client::EditorResult selectPhoto(const client::SelectEditorPhotoCommand& command) override;
 
-    // 목적: 현재 Editor selection과 진행 중 Adjustment를 정리
+    // 목적: 현재 Editor selection과 해당 Photo의 session-local Develop state를 폐기
     // 입력: 없음
-    // 출력: 선택되지 않은 snapshot
+    // 출력: 다른 Photo history와 persisted data를 유지한 선택되지 않은 snapshot
     [[nodiscard]] client::EditorResult clearEditorSelection() override;
 
     // 목적: 현재 Photo의 Develop parameter를 검증하고 session state에 반영
@@ -100,9 +132,9 @@ public:
     // 출력: persisted baseline이 갱신된 state 또는 conflict·session 오류
     [[nodiscard]] EditorStateResult saveCurrentPhoto();
 
-    // 목적: 현재 선택과 진행 중 preview를 정리하되 사진별 in-memory history 유지
+    // 목적: 현재 선택과 해당 Photo의 session-local Develop state 및 진행 중 preview 정리
     // 입력: 없음
-    // 출력: 선택되지 않은 editor state
+    // 출력: 다른 Photo history와 persisted data를 유지한 선택되지 않은 editor state
     void clearSelection();
 
     // 목적: 현재 사진의 develop params를 갱신하고 debounce된 preview 예약
@@ -141,15 +173,15 @@ public:
     [[nodiscard]] std::optional<EditorState> redo(const QSize& targetSize);
 
 signals:
-    // 목적: 선택, params 또는 history 상태 변경을 adapter에 전달
-    // 입력: state: 변경 후 immutable editor state
-    // 출력: 없음
-    void stateChanged(const EditorState& state);
-
     // 목적: Qt-free Editor snapshot 의미가 변경됐음을 event adapter에 알림
     // 입력: 없음; adapter가 owner context에서 immutable snapshot을 즉시 capture
     // 출력: 없음
     void editorSnapshotChanged();
+
+    // 목적: viewport 또는 Editor transition 뒤 Preview presentation snapshot invalidation 전달
+    // 입력: 없음; adapter가 owner context에서 최신 state를 capture
+    // 출력: 없음
+    void previewPresentationStateChanged();
 
     // 목적: 현재 Editor preview request가 owner에 accepted됐음을 adapter에 전달
     // 입력: requestId: accepted preview request identity
@@ -193,10 +225,10 @@ private:
         Immediate,
     };
 
-    // 목적: transitional Qt state와 Qt-free snapshot invalidation을 한 state transition에서 publish
-    // 입력: currentState: 변경이 끝난 현재 Editor state
-    // 출력: 기존 GUI signal과 client event adapter 알림
-    void publishStateChanged(const EditorState& currentState);
+    // 목적: Editor와 Preview의 Qt-free snapshot invalidation을 한 state transition에서 publish
+    // 입력: 없음
+    // 출력: client event adapter 알림
+    void publishStateChanged();
 
     // 목적: 현재 state를 full-quality final preview로 예약
     // 입력: targetSize: preview viewport 크기, progression: source tier 정책, timing: 제출 시점

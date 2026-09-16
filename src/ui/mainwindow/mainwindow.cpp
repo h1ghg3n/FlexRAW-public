@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <QAction>
+#include <QByteArray>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDir>
@@ -39,11 +40,11 @@
 #include "editor_client_projection.h"
 #include "editor_settings.h"
 #include "export_dialog.h"
-#include "folder_scan_controller.h"
 #include "log.h"
 #include "photo_identity.h"
 #include "preview_widget.h"
 #include "qt_activity_adapter.h"
+#include "qt_preview_presentation_event_adapter.h"
 #include "settings_dialog.h"
 #include "shared_storage_locator.h"
 #include "source_binding.h"
@@ -60,6 +61,15 @@ namespace
 [[nodiscard]] QString fromClientString(const std::string& value)
 {
     return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+// 목적: Qt presentation path를 Qt-free client command용 UTF-8 string으로 변환
+// 입력: value: native file dialog 또는 Qt adapter가 보유한 path
+// 출력: byte length가 보존된 UTF-8 string
+[[nodiscard]] std::string toClientString(const QString& value)
+{
+    const QByteArray utf8 = value.toUtf8();
+    return {utf8.constData(), static_cast<std::size_t>(utf8.size())};
 }
 
 // 목적: optional Qt Folder scope를 Qt-free UTF-8 client scope로 변환
@@ -99,33 +109,159 @@ namespace
     return request;
 }
 
+// 목적: Qt-free Folder item kind를 기존 Folder list용 domain kind로 변환
+// 입력: kind: client snapshot file 분류
+// 출력: 같은 의미의 supported file kind
+[[nodiscard]] core::types::SupportedFileKind toSupportedFileKind(core::client::CatalogFileKind kind) noexcept
+{
+    switch (kind)
+    {
+    case core::client::CatalogFileKind::Raw:
+        return core::types::SupportedFileKind::Raw;
+    case core::client::CatalogFileKind::RasterImage:
+        return core::types::SupportedFileKind::RasterImage;
+    case core::client::CatalogFileKind::Unknown:
+        return core::types::SupportedFileKind::Unknown;
+    }
+    return core::types::SupportedFileKind::Unknown;
+}
+
+// 목적: Folder presentation의 Core file kind를 Editor client command enum으로 변환
+// 입력: kind: scan entry의 지원 file 종류
+// 출력: 같은 의미의 Qt-free client enum
+[[nodiscard]] core::client::CatalogFileKind toClientFileKind(core::types::SupportedFileKind kind) noexcept
+{
+    switch (kind)
+    {
+    case core::types::SupportedFileKind::Raw:
+        return core::client::CatalogFileKind::Raw;
+    case core::types::SupportedFileKind::RasterImage:
+        return core::client::CatalogFileKind::RasterImage;
+    case core::types::SupportedFileKind::Unknown:
+        return core::client::CatalogFileKind::Unknown;
+    }
+    return core::client::CatalogFileKind::Unknown;
+}
+
+// 목적: Qt-free Folder item snapshot을 기존 Folder list presentation record로 변환
+// 입력: item: UTF-8 source/display state와 file kind
+// 출력: Ready 상태의 CatalogEntry
+[[nodiscard]] core::catalog::CatalogEntry toCatalogEntry(const core::client::FolderItemSnapshot& item)
+{
+    return {
+        {fromClientString(item.sourcePath),
+         fromClientString(item.extension),
+         fromClientString(item.displayName),
+         toSupportedFileKind(item.kind)},
+        core::types::FileScanStatus::Ready,
+    };
+}
+
+// 목적: 선택된 Folder entry를 Qt-free Editor source activation command로 변환
+// 입력: entry: scan 결과의 normalized source와 표시 metadata
+// 출력: Catalog 등록과 Editor 선택에 사용할 client command
+[[nodiscard]] core::client::ActivateEditorSourceCommand toActivateEditorSourceCommand(
+    const core::catalog::CatalogEntry& entry)
+{
+    return {toClientString(entry.file.path),
+            toClientString(entry.file.extension),
+            toClientString(entry.file.displayName),
+            toClientFileKind(entry.file.kind)};
+}
+
+// 목적: Qt-free Editor client snapshot을 현재 Qt presentation model로 변환
+// 입력: editorClient: authoritative Editor state contract
+// 출력: 기존 Qt widget이 소비하는 transitional Editor state
+[[nodiscard]] core::orchestration::EditorState currentEditorState(const core::client::IEditorClient& editorClient)
+{
+    return core::orchestration::fromClientEditorSnapshot(editorClient.editorSnapshot());
+}
+
+// 목적: Qt widget viewport를 fixed-width Preview presentation command로 동기화
+// 입력: previewClient: authoritative Preview command contract, size: 현재 widget pixel 크기
+// 출력: 유효한 크기만 전달하고 실패는 diagnostics log로 기록
+void syncPreviewViewport(core::client::IPreviewPresentationClient& previewClient, const QSize& size)
+{
+    if (size.width() <= 0 || size.height() <= 0)
+    {
+        return;
+    }
+    const core::client::PreviewViewportResult updated = previewClient.setPreviewViewport(
+        {{static_cast<std::uint32_t>(size.width()), static_cast<std::uint32_t>(size.height())}});
+    if (updated.hasError())
+    {
+        LOG_WARN("preview", "Unable to update Preview viewport: {}", updated.error().technicalMessage);
+    }
+}
+
+// 목적: source request가 사용자 명시적 resolution command인지 구분
+// 입력: kind: baseline/verification/resolution request 종류
+// 출력: Accept/Register/Relink이면 true
+[[nodiscard]] bool isExplicitSourceResolution(core::client::SourceRequestKind kind) noexcept
+{
+    return kind == core::client::SourceRequestKind::AcceptReplacement ||
+           kind == core::client::SourceRequestKind::RegisterReplacementAsNew ||
+           kind == core::client::SourceRequestKind::RelinkSource;
+}
+
 }  // namespace
 
 // 목적: Flexraw 첫 catalog-to-preview window를 editor session adapter로 초기화
-// 입력: catalogEditorFacade: GUI boundary, catalogOrchestrator: console catalog use case,
-//       exportOrchestrator: Local/Remote/Auto export use case, parent: Qt 부모 widget
+// 입력: catalogEditorFacade: GUI와 Folder lifecycle boundary,
+//       Export command/event/default contract, applicationSettings/profile client, optional Worker health와
+//       Catalog startup settings capability, parent: Qt 부모 widget
 // 출력: 초기화된 MainWindow 객체
 MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
-                       core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                       core::orchestration::ExportOrchestrator& exportOrchestrator,
+                       core::client::IExportClient& exportClient,
+                       core::client::IExportEventSource& exportEventSource,
+                       core::client::IExportDefaultsClient& exportDefaultsClient,
+                       QSettings& applicationSettings,
+                       core::client::IWorkerProfileClient& workerProfileClient,
+                       core::client::IWorkerHealthClient* const workerHealthClient,
+                       core::client::IWorkerHealthEventSource* const workerHealthEventSource,
+                       core::client::ICatalogStartupSettingsClient* const catalogStartupSettingsClient,
                        QWidget* parent)
     : QMainWindow(parent),
       m_catalogWidget(new catalog::CatalogListWidget(this)),
       m_developPanel(new editor::DevelopPanel(this)),
       m_sourceResolutionWidget(new catalog::SourceResolutionWidget(this)),
       m_previewWidget(new editor::PreviewWidget(this)),
-      m_consoleWidget(new cli::ConsoleModeWidget(catalogOrchestrator, exportOrchestrator, this)),
-      m_folderScanController(new FolderScanController(this)),
-      m_catalogEditorFacade(&catalogEditorFacade),
-      m_activityAdapter(new QtActivityAdapter(catalogEditorFacade, *m_folderScanController, this)),
-      m_exportOrchestrator(&exportOrchestrator),
+      m_consoleWidget(new cli::ConsoleModeWidget(
+          catalogEditorFacade, catalogEditorFacade, exportClient, exportEventSource, exportDefaultsClient, this)),
+      m_catalogPhotoClient(&catalogEditorFacade),
+      m_catalogProjectClient(&catalogEditorFacade),
+      m_catalogFolderClient(&catalogEditorFacade),
+      m_catalogSessionClient(&catalogEditorFacade),
+      m_editorClient(&catalogEditorFacade),
+      m_editorStateEventSource(&catalogEditorFacade),
+      m_folderImportClient(&catalogEditorFacade),
+      m_folderImportEventSource(&catalogEditorFacade),
+      m_catalogThumbnailClient(&catalogEditorFacade),
+      m_catalogThumbnailEventSource(&catalogEditorFacade),
+      m_previewPresentationClient(&catalogEditorFacade),
+      m_previewPresentationEventSource(&catalogEditorFacade),
+      m_sourceResolutionClient(&catalogEditorFacade),
+      m_sourceResolutionEventSource(&catalogEditorFacade),
+      m_activityAdapter(new QtActivityAdapter(catalogEditorFacade,
+                                              catalogEditorFacade,
+                                              catalogEditorFacade,
+                                              catalogEditorFacade,
+                                              catalogEditorFacade,
+                                              this)),
+      m_exportClient(&exportClient),
+      m_exportEventSource(&exportEventSource),
+      m_exportDefaultsClient(&exportDefaultsClient),
+      m_applicationSettings(&applicationSettings),
+      m_workerProfileClient(&workerProfileClient),
+      m_workerHealthClient(workerHealthClient),
+      m_workerHealthEventSource(workerHealthEventSource),
+      m_catalogStartupSettingsClient(catalogStartupSettingsClient),
       m_contentStack(new QStackedWidget(this))
 {
     setWindowTitle(tr("Flexraw"));
     resize(1200, 800);
-    QSettings applicationSettings;
     m_developPanel->setAdjustmentControlStyle(
-        settings::EditorSettings(applicationSettings).loadAdjustmentControlStyle());
+        settings::EditorSettings(*m_applicationSettings).loadAdjustmentControlStyle());
 
     QMenu* fileMenu = menuBar()->addMenu(tr("&File"));
     m_newCatalogAction = fileMenu->addAction(tr("New Catalog..."));
@@ -243,6 +379,10 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     setCentralWidget(m_contentStack);
     initializeActivityStatus();
     subscribeToActivityEvents();
+    subscribeToFolderOperationEvents();
+    subscribeToCatalogThumbnailEvents();
+    subscribeToPreviewPresentationEvents();
+    subscribeToSourceResolutionEvents();
 
     connect(m_catalogWidget, &catalog::CatalogListWidget::entrySelected, this, &MainWindow::showSelectedEntry);
     connect(m_catalogWidget, &catalog::CatalogListWidget::photoSelected, this, &MainWindow::showSelectedCatalogPhoto);
@@ -266,38 +406,33 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     connect(m_catalogWidget,
             &catalog::CatalogListWidget::thumbnailWindowChanged,
             this,
-            [this](QVector<core::types::FileDescriptor> sources, const QSize& targetSize) {
-                const core::orchestration::CatalogThumbnailWindowResult result =
-                    m_catalogEditorFacade->updateThumbnailWindow(std::move(sources), targetSize);
+            [this](const core::client::ReplaceCatalogThumbnailWindowCommand& command) {
+                const core::client::CatalogThumbnailWindowResult result =
+                    m_catalogThumbnailClient->replaceThumbnailWindow(command);
                 if (result.hasError())
                 {
-                    LOG_WARN("catalog", "Unable to update thumbnail window: {}", result.error().message.toStdString());
+                    m_catalogWidget->clearThumbnailWindowGeneration();
+                    LOG_WARN("catalog", "Unable to replace thumbnail window: {}", result.error().technicalMessage);
+                    return;
                 }
+                m_catalogWidget->acceptThumbnailWindow(result.value().generation);
             });
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::catalogThumbnailReady,
-            this,
-            [this](const core::orchestration::CatalogThumbnailFrame& frame) {
-                m_catalogWidget->applyThumbnail(frame.sourcePath, frame.image);
-            });
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::catalogThumbnailFailed,
-            this,
-            [this](const core::orchestration::CatalogThumbnailIssue& issue) {
-                m_catalogWidget->markThumbnailFailed(issue.sourcePath);
-                LOG_DEBUG("catalog",
-                          "Catalog thumbnail unavailable for {}: {}",
-                          issue.sourcePath.toStdString(),
-                          issue.error.message.toStdString());
-            });
+    connect(m_catalogWidget, &catalog::CatalogListWidget::thumbnailWindowCleared, this, [this] {
+        m_catalogWidget->clearThumbnailWindowGeneration();
+        const core::client::CatalogThumbnailClearResult result = m_catalogThumbnailClient->clearThumbnailWindow();
+        if (result.hasError())
+        {
+            LOG_WARN("catalog", "Unable to clear thumbnail window: {}", result.error().technicalMessage);
+        }
+    });
     connect(m_developPanel, &editor::DevelopPanel::paramsChanged, this, &MainWindow::applyDevelopParams);
     connect(m_developPanel, &editor::DevelopPanel::adjustmentStarted, this, &MainWindow::beginDevelopAdjustment);
     connect(m_developPanel, &editor::DevelopPanel::adjustmentFinished, this, &MainWindow::finishDevelopAdjustment);
     connect(m_previewWidget, &editor::PreviewWidget::viewportSizeChanged, this, [this](const QSize& size) {
-        (void)m_catalogEditorFacade->updatePreviewTargetSize(size);
+        syncPreviewViewport(*m_previewPresentationClient, size);
     });
     const core::client::EditorStateSubscriptionResult editorStateSubscription =
-        m_catalogEditorFacade->subscribeToEditorState([this](const core::client::EditorStateEvent& event) {
+        m_editorStateEventSource->subscribeToEditorState([this](const core::client::EditorStateEvent& event) {
             updateEditorStateUi(core::orchestration::fromClientEditorSnapshot(event.snapshot));
         });
     if (editorStateSubscription.hasValue())
@@ -308,10 +443,7 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
     {
         LOG_ERROR(
             "app", "Unable to subscribe to Editor state events: {}", editorStateSubscription.error().technicalMessage);
-        connect(m_catalogEditorFacade,
-                &facade::CatalogEditorFacade::editorStateChanged,
-                this,
-                &MainWindow::updateEditorStateUi);
+        updateEditorStateUi(currentEditorState(*m_editorClient));
     }
     connect(m_sourceResolutionWidget,
             &catalog::SourceResolutionWidget::acceptReplacementRequested,
@@ -325,168 +457,12 @@ MainWindow::MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
             &catalog::SourceResolutionWidget::relinkSourceRequested,
             this,
             &MainWindow::relinkSource);
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::sourceBindingUpdated,
-            this,
-            &MainWindow::handleSourceBindingUpdated);
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::sourceBindingFailed,
-            this,
-            &MainWindow::handleSourceBindingFailed);
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::sourceBindingCancelled,
-            this,
-            &MainWindow::handleSourceBindingCancelled);
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::displayFrameUpdated,
-            this,
-            [this](const core::client::DisplayFrame& frame) {
-                const QImage image = facade::toQImage(frame);
-                if (!image.isNull())
-                {
-                    m_previewWidget->showPreview(image);
-                }
-            });
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::previewUpdated,
-            this,
-            [this](const core::orchestration::PreviewResult& result) {
-                if (result.renderMode == core::orchestration::PreviewRenderMode::Final)
-                {
-                    m_developPanel->setHistogram(result.histogram);
-                    m_previewWidget->setClippingSummary(result.clipping);
-                }
-
-                m_developPanel->setEnabled(true);
-                const QString displayName = m_catalogEditorFacade->editorState().source.displayName;
-
-                if (result.tier == core::orchestration::PreviewTier::Standard)
-                {
-                    statusBar()->showMessage(tr("Showing standard preview for %1.").arg(displayName));
-                }
-                else
-                {
-                    statusBar()->showMessage(tr("Showing %1.").arg(displayName));
-                }
-            });
-    connect(m_catalogEditorFacade,
-            &facade::CatalogEditorFacade::previewFailed,
-            this,
-            [this](const core::orchestration::PreviewIssue&) {
-                m_developPanel->setEnabled(false);
-                m_previewWidget->showMessage(tr("Unable to load preview."));
-                statusBar()->showMessage(
-                    tr("Preview unavailable for %1.").arg(m_catalogEditorFacade->editorState().source.displayName));
-            });
     connect(m_consoleWidget, &cli::ConsoleModeWidget::exitRequested, this, [this] {
         m_consoleModeAction->setChecked(false);
     });
-    connect(m_folderScanController, &FolderScanController::scanStarted, this, [this](const QString&) {
-        m_newCatalogAction->setEnabled(false);
-        m_openCatalogAction->setEnabled(false);
-        m_openFolderAction->setEnabled(false);
-        m_importFolderAction->setEnabled(false);
-        m_previousCatalogPageButton->setEnabled(false);
-        m_nextCatalogPageButton->setEnabled(false);
-        m_catalogFolderScopeComboBox->setEnabled(false);
-        m_catalogProjectScopeComboBox->setEnabled(false);
-        m_catalogProjectMenuButton->setEnabled(false);
-
-        if (m_importingFolder)
-        {
-            statusBar()->showMessage(tr("Scanning folder for import..."));
-            return;
-        }
-
-        m_developPanel->setEnabled(false);
-        m_developPanel->clearHistogram();
-        m_previewWidget->clearClippingSummary();
-        m_catalogEditorFacade->clearSelection();
-        resetCatalogPhotoPage();
-        m_catalogFolderPath.reset();
-        m_catalogProjectId.reset();
-        {
-            const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
-            m_catalogFolderScopeComboBox->setCurrentIndex(-1);
-            m_catalogFolderScopeComboBox->setPlaceholderText(tr("Open Folder"));
-        }
-        {
-            const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
-            m_catalogProjectScopeComboBox->setCurrentIndex(0);
-        }
-        m_previewWidget->showMessage(tr("Scanning folder..."));
-        statusBar()->showMessage(tr("Scanning folder..."));
-    });
-    connect(m_folderScanController,
-            &FolderScanController::scanFinished,
-            this,
-            [this](const core::catalog::CatalogScanResult& scanResult) {
-                const bool importingFolder = m_importingFolder;
-                m_importingFolder = false;
-                m_newCatalogAction->setEnabled(true);
-                m_openCatalogAction->setEnabled(true);
-                m_openFolderAction->setEnabled(true);
-                m_importFolderAction->setEnabled(m_catalogEditorFacade->catalogState().isOpen);
-                updateProjectActions();
-
-                if (scanResult.hasError())
-                {
-                    if (!importingFolder)
-                    {
-                        m_catalogWidget->clearEntries();
-                        m_previewWidget->showMessage(tr("Unable to scan folder."));
-                    }
-                    statusBar()->showMessage(tr("Folder scan failed."));
-                    updateCatalogPageActions();
-                    return;
-                }
-
-                if (importingFolder)
-                {
-                    if (scanResult.value().isEmpty())
-                    {
-                        updateCatalogPageActions();
-                        statusBar()->showMessage(tr("No supported files found in this folder."));
-                        return;
-                    }
-
-                    const core::orchestration::CatalogImportResult imported =
-                        m_catalogEditorFacade->importScannedEntries(scanResult.value());
-                    if (imported.hasError())
-                    {
-                        LOG_WARN("catalog", "Unable to import GUI folder: {}", imported.error().message.toStdString());
-                        updateCatalogPageActions();
-                        statusBar()->showMessage(tr("Folder import failed."));
-                        return;
-                    }
-
-                    if (!refreshCatalogPhotos())
-                    {
-                        return;
-                    }
-
-                    statusBar()->showMessage(tr("Imported %1 photos.").arg(imported.value().storedCount));
-                    return;
-                }
-
-                resetCatalogPhotoPage();
-                m_catalogWidget->setEntries(scanResult.value());
-
-                if (scanResult.value().isEmpty())
-                {
-                    m_previewWidget->showMessage(tr("No supported files found in this folder."));
-                }
-                else
-                {
-                    m_previewWidget->showMessage(tr("Select a photo to edit."));
-                }
-
-                statusBar()->showMessage(tr("Loaded %1 files.").arg(scanResult.value().size()));
-            });
-
     m_developPanel->setEnabled(false);
     updateEditorActions();
-    if (m_catalogEditorFacade->catalogState().isOpen)
+    if (m_catalogSessionClient->catalogSnapshot().isOpen)
     {
         (void)refreshCatalogPhotos();
     }
@@ -537,6 +513,300 @@ void MainWindow::subscribeToActivityEvents()
     LOG_ERROR("app", "Unable to subscribe to Activity events: {}", subscription.error().technicalMessage);
 }
 
+// 목적: Qt-free Folder operation event source를 MainWindow presentation에 연결
+// 입력: 없음
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void MainWindow::subscribeToFolderOperationEvents()
+{
+    const core::client::FolderOperationSubscriptionResult subscription =
+        m_folderImportEventSource->subscribeToFolderOperations(
+            [this](const core::client::FolderOperationEvent& event) { handleFolderOperationEvent(event); });
+    if (subscription.hasValue())
+    {
+        m_folderOperationSubscription = subscription.value();
+        return;
+    }
+    LOG_ERROR("app", "Unable to subscribe to Folder operations: {}", subscription.error().technicalMessage);
+}
+
+// 목적: Qt-free Catalog thumbnail event source를 MainWindow view에 연결
+// 입력: 없음
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void MainWindow::subscribeToCatalogThumbnailEvents()
+{
+    const core::client::CatalogThumbnailSubscriptionResult subscription =
+        m_catalogThumbnailEventSource->subscribeToCatalogThumbnails(
+            [this](const core::client::CatalogThumbnailEvent& event) { handleCatalogThumbnailEvent(event); });
+    if (subscription.hasError())
+    {
+        LOG_ERROR(
+            "catalog", "Unable to subscribe to Catalog thumbnail events: {}", subscription.error().technicalMessage);
+        return;
+    }
+    m_catalogThumbnailSubscription = subscription.value();
+}
+
+// 목적: Qt-free Source Resolution event source를 MainWindow presentation에 연결
+// 입력: 없음
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void MainWindow::subscribeToSourceResolutionEvents()
+{
+    const core::client::SourceResolutionSubscriptionResult subscription =
+        m_sourceResolutionEventSource->subscribeToSourceResolution(
+            [this](const core::client::SourceResolutionEvent& event) { handleSourceResolutionEvent(event); });
+    if (subscription.hasError())
+    {
+        LOG_ERROR(
+            "catalog", "Unable to subscribe to Source Resolution events: {}", subscription.error().technicalMessage);
+        return;
+    }
+    m_sourceResolutionSubscription = subscription.value();
+}
+
+// 목적: Qt-free Preview presentation event source를 MainWindow view에 연결
+// 입력: 없음
+// 출력: RAII subscription 보관 또는 구조화된 오류 logging
+void MainWindow::subscribeToPreviewPresentationEvents()
+{
+    const core::client::PreviewPresentationSubscriptionResult subscription =
+        m_previewPresentationEventSource->subscribeToPreviewPresentation(
+            [this](const core::client::PreviewPresentationEvent& event) { handlePreviewPresentationEvent(event); });
+    if (subscription.hasError())
+    {
+        LOG_ERROR(
+            "preview", "Unable to subscribe to Preview presentation events: {}", subscription.error().technicalMessage);
+        return;
+    }
+    m_previewPresentationSubscription = subscription.value();
+}
+
+// 목적: immutable Preview snapshot/event를 image·analysis·status presentation에 반영
+// 입력: event: initial state, frame update, warning 또는 terminal
+// 출력: PreviewWidget과 DevelopPanel 표시 갱신
+void MainWindow::handlePreviewPresentationEvent(const core::client::PreviewPresentationEvent& event)
+{
+    const core::client::EditorSnapshot editor = m_editorClient->editorSnapshot();
+    const core::client::PreviewFrameSnapshot* frame = nullptr;
+    if ((event.frameUpdated || event.initial) && event.snapshot.currentFrame.has_value())
+    {
+        frame = &*event.snapshot.currentFrame;
+        if (!editor.hasSelection || editor.photoId != frame->photoId ||
+            editor.developRevision != frame->developRevision)
+        {
+            frame = nullptr;
+        }
+    }
+    if (frame != nullptr)
+    {
+        const QImage image = facade::toQImage(frame->frame);
+        if (!image.isNull())
+        {
+            m_previewWidget->showPreview(image);
+        }
+        if (frame->mode == core::client::PreviewPresentationMode::Final && frame->analysis.has_value())
+        {
+            m_developPanel->setHistogram(facade::toDevelopHistogram(frame->analysis->histogram));
+            m_previewWidget->setClippingSummary(facade::toDevelopClipping(frame->analysis->clipping));
+        }
+        m_developPanel->setEnabled(true);
+
+        const QString displayName =
+            editor.source.has_value() ? fromClientString(editor.source->displayName) : QString{};
+        statusBar()->showMessage(frame->tier == core::client::PreviewFrameTier::Standard
+                                     ? tr("Showing standard preview for %1.").arg(displayName)
+                                     : tr("Showing %1.").arg(displayName));
+    }
+    if (event.warning.has_value())
+    {
+        LOG_WARN("preview", "Preview warning: {}", event.warning->error.technicalMessage);
+    }
+    if (!event.terminal.has_value() || event.terminal->state != core::client::PreviewTerminalState::Failed)
+    {
+        return;
+    }
+
+    if (event.terminal->photoId.has_value() && (!editor.hasSelection || editor.photoId != *event.terminal->photoId ||
+                                                editor.developRevision != event.terminal->developRevision))
+    {
+        return;
+    }
+
+    if (event.terminal->error.has_value())
+    {
+        LOG_WARN("preview", "Preview failed: {}", event.terminal->error->technicalMessage);
+    }
+    m_developPanel->setEnabled(false);
+    m_previewWidget->showMessage(tr("Unable to load preview."));
+    const QString displayName = editor.source.has_value() ? fromClientString(editor.source->displayName) : QString{};
+    statusBar()->showMessage(tr("Preview unavailable for %1.").arg(displayName));
+}
+
+// 목적: immutable Catalog thumbnail frame/issue/terminal을 list presentation에 반영
+// 입력: event: initial state 또는 window lifecycle transition
+// 출력: current generation row icon/terminal 상태 갱신
+void MainWindow::handleCatalogThumbnailEvent(const core::client::CatalogThumbnailEvent& event)
+{
+    if (event.frame.has_value())
+    {
+        const QImage image = facade::toQImage(event.frame->frame);
+        m_catalogWidget->applyThumbnail(event.frame->generation, event.frame->identity, image);
+    }
+    if (event.issue.has_value())
+    {
+        m_catalogWidget->markThumbnailFailed(event.issue->generation, event.issue->identity);
+        const std::string identity =
+            event.issue->identity.kind == core::client::CatalogThumbnailIdentityKind::CatalogPhoto
+                ? std::string("PhotoId ") + std::to_string(event.issue->identity.photoId.value)
+                : event.issue->identity.transientSourceLocator;
+        LOG_DEBUG("catalog", "Catalog thumbnail unavailable for {}: {}", identity, event.issue->error.technicalMessage);
+    }
+    if (event.terminal.has_value() && event.terminal->state == core::client::CatalogThumbnailTerminalState::Failed &&
+        event.terminal->error.has_value())
+    {
+        LOG_WARN("catalog", "Catalog thumbnail window failed: {}", event.terminal->error->technicalMessage);
+    }
+}
+
+// 목적: initial/active/terminal Folder lifecycle을 MainWindow 상태로 투영
+// 입력: event: immutable Folder operation event
+// 출력: action enablement와 scan/import presentation 갱신
+void MainWindow::handleFolderOperationEvent(const core::client::FolderOperationEvent& event)
+{
+    if (event.terminal.has_value())
+    {
+        handleFolderOperationTerminal(*event.terminal);
+        return;
+    }
+    if (event.activeOperation.has_value())
+    {
+        handleFolderOperationStarted(*event.activeOperation);
+        return;
+    }
+    if (event.initial)
+    {
+        m_folderOperationActive = false;
+        updateProjectActions();
+    }
+}
+
+// 목적: accepted Folder scan/import 시작 상태를 action과 preview presentation에 반영
+// 입력: receipt: operation kind와 normalized folder path
+// 출력: 중복 command 차단과 scan 종류별 status 표시
+void MainWindow::handleFolderOperationStarted(const core::client::FolderOperationReceipt& receipt)
+{
+    m_folderOperationActive = true;
+    m_newCatalogAction->setEnabled(false);
+    m_openCatalogAction->setEnabled(false);
+    m_openFolderAction->setEnabled(false);
+    m_importFolderAction->setEnabled(false);
+    m_previousCatalogPageButton->setEnabled(false);
+    m_nextCatalogPageButton->setEnabled(false);
+    m_catalogFolderScopeComboBox->setEnabled(false);
+    m_catalogProjectScopeComboBox->setEnabled(false);
+    m_catalogProjectMenuButton->setEnabled(false);
+    if (receipt.kind == core::client::FolderOperationKind::Import)
+    {
+        statusBar()->showMessage(tr("Scanning folder for import..."));
+        return;
+    }
+
+    m_developPanel->setEnabled(false);
+    m_developPanel->clearHistogram();
+    m_previewWidget->clearClippingSummary();
+    (void)m_editorClient->clearEditorSelection();
+    resetCatalogPhotoPage();
+    m_catalogFolderPath.reset();
+    m_catalogProjectId.reset();
+    {
+        const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
+        m_catalogFolderScopeComboBox->setCurrentIndex(-1);
+        m_catalogFolderScopeComboBox->setPlaceholderText(tr("Open Folder"));
+    }
+    {
+        const QSignalBlocker blocker(m_catalogProjectScopeComboBox);
+        m_catalogProjectScopeComboBox->setCurrentIndex(0);
+    }
+    m_previewWidget->showMessage(tr("Scanning folder..."));
+    statusBar()->showMessage(tr("Scanning folder..."));
+}
+
+// 목적: Folder scan/import exact terminal을 list 또는 Catalog navigation에 적용
+// 입력: terminal: completion snapshot 또는 구조화된 실패
+// 출력: action 복원과 scan/import 결과 표시
+void MainWindow::handleFolderOperationTerminal(const core::client::FolderOperationTerminal& terminal)
+{
+    m_folderOperationActive = false;
+    m_newCatalogAction->setEnabled(true);
+    m_openCatalogAction->setEnabled(true);
+    m_openFolderAction->setEnabled(true);
+    m_importFolderAction->setEnabled(m_catalogSessionClient->catalogSnapshot().isOpen);
+    updateProjectActions();
+
+    if (terminal.state != core::client::FolderOperationTerminalState::Completed || !terminal.completion.has_value())
+    {
+        if (terminal.error.has_value())
+        {
+            LOG_WARN("catalog", "Folder operation failed: {}", terminal.error->technicalMessage);
+        }
+        if (terminal.receipt.kind == core::client::FolderOperationKind::Scan)
+        {
+            m_catalogWidget->clearEntries();
+            m_previewWidget->showMessage(tr("Unable to scan folder."));
+            statusBar()->showMessage(tr("Folder scan failed."));
+        }
+        else
+        {
+            statusBar()->showMessage(tr("Folder import failed."));
+        }
+        updateCatalogPageActions();
+        return;
+    }
+
+    if (terminal.receipt.kind == core::client::FolderOperationKind::Import)
+    {
+        if (!std::holds_alternative<core::client::FolderImportCompletion>(*terminal.completion))
+        {
+            LOG_ERROR("catalog", "Folder import terminal did not contain an import completion");
+            statusBar()->showMessage(tr("Folder import failed."));
+            return;
+        }
+        const core::client::FolderImportCompletion& completion =
+            std::get<core::client::FolderImportCompletion>(*terminal.completion);
+        if (completion.discoveredCount == 0)
+        {
+            updateCatalogPageActions();
+            statusBar()->showMessage(tr("No supported files found in this folder."));
+            return;
+        }
+        if (!refreshCatalogPhotos())
+        {
+            return;
+        }
+        statusBar()->showMessage(tr("Imported %1 photos.").arg(completion.appliedCount));
+        return;
+    }
+
+    if (!std::holds_alternative<core::client::FolderScanCompletion>(*terminal.completion))
+    {
+        LOG_ERROR("catalog", "Folder scan terminal did not contain a scan completion");
+        statusBar()->showMessage(tr("Folder scan failed."));
+        return;
+    }
+    const core::client::FolderScanCompletion& completion =
+        std::get<core::client::FolderScanCompletion>(*terminal.completion);
+    QVector<core::catalog::CatalogEntry> entries;
+    entries.reserve(static_cast<qsizetype>(completion.items.size()));
+    for (const core::client::FolderItemSnapshot& item : completion.items)
+    {
+        entries.push_back(toCatalogEntry(item));
+    }
+    resetCatalogPhotoPage();
+    m_catalogWidget->setEntries(entries);
+    m_previewWidget->showMessage(entries.isEmpty() ? tr("No supported files found in this folder.")
+                                                   : tr("Select a photo to edit."));
+    statusBar()->showMessage(tr("Loaded %1 files.").arg(entries.size()));
+}
+
 // 목적: immutable active 목록을 status bar progress와 owner cancel target에 투영
 // 입력: event: initial 또는 lifecycle transition 뒤 Activity snapshot
 // 출력: active 여부와 cancellability에 맞는 compact status UI
@@ -560,6 +830,9 @@ void MainWindow::updateActivityUi(const core::client::ActivityEvent& event)
         break;
     case core::client::ActivityKind::FolderScan:
         activityName = tr("Scanning folder...");
+        break;
+    case core::client::ActivityKind::FolderImport:
+        activityName = tr("Importing folder...");
         break;
     case core::client::ActivityKind::SourceVerification:
         activityName = tr("Verifying source...");
@@ -643,7 +916,7 @@ void MainWindow::createCatalog()
         return;
     }
 
-    if (openCatalogPath(catalogPath))
+    if (openCatalogPath(catalogPath, core::client::CatalogOpenMode::CreateNew))
     {
         statusBar()->showMessage(tr("Catalog created. Import a folder to add photos."));
     }
@@ -658,17 +931,17 @@ void MainWindow::openCatalog()
         this, tr("Open Catalog"), {}, tr("Flexraw Catalog (*.flexraw-catalog);;All Files (*)"));
     if (!catalogPath.isEmpty())
     {
-        (void)openCatalogPath(catalogPath);
+        (void)openCatalogPath(catalogPath, core::client::CatalogOpenMode::OpenExisting);
     }
 }
 
 // 목적: 지정 catalog를 단일 active session으로 열고 stable PhotoId 목록 표시
-// 입력: catalogPath: 생성하거나 열 catalog file 경로
+// 입력: catalogPath: 생성하거나 열 catalog file 경로, openMode: explicit create/open 의도
 // 출력: catalog와 photo list를 모두 열었으면 true
-bool MainWindow::openCatalogPath(const QString& catalogPath)
+bool MainWindow::openCatalogPath(const QString& catalogPath, core::client::CatalogOpenMode openMode)
 {
-    const core::orchestration::CatalogSessionState session = m_catalogEditorFacade->catalogState();
-    if (session.isOpen && QFileInfo(catalogPath).absoluteFilePath() == session.catalogPath)
+    const core::client::CatalogSessionSnapshot session = m_catalogSessionClient->catalogSnapshot();
+    if (session.isOpen && QFileInfo(catalogPath).absoluteFilePath() == fromClientString(session.catalogPath))
     {
         m_importFolderAction->setEnabled(true);
         statusBar()->showMessage(tr("This catalog is already open."));
@@ -680,7 +953,6 @@ bool MainWindow::openCatalogPath(const QString& catalogPath)
         return false;
     }
 
-    m_catalogEditorFacade->clearSelection();
     resetCatalogPhotoPage();
     m_catalogFolderPath.reset();
     m_catalogProjectId.reset();
@@ -699,15 +971,15 @@ bool MainWindow::openCatalogPath(const QString& catalogPath)
     m_catalogProjectMenuButton->setEnabled(false);
     m_catalogWidget->clearEntries();
     m_importFolderAction->setEnabled(false);
-    if (session.isOpen)
-    {
-        (void)m_catalogEditorFacade->closeCatalog();
-    }
-
-    const core::orchestration::CatalogSessionResult opened = m_catalogEditorFacade->openCatalog(catalogPath);
+    const core::client::CatalogSessionResult opened = m_catalogSessionClient->openCatalog(
+        {toClientString(catalogPath), openMode, core::client::CatalogReplacementPolicy::ReplaceCurrent});
     if (opened.hasError())
     {
-        LOG_WARN("catalog", "Unable to open GUI catalog: {}", opened.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to open GUI catalog: {}", opened.error().technicalMessage);
+        if (m_catalogSessionClient->catalogSnapshot().isOpen)
+        {
+            (void)refreshCatalogPhotos();
+        }
         m_previewWidget->showMessage(tr("Unable to open catalog."));
         statusBar()->showMessage(tr("Catalog open failed."));
         return false;
@@ -724,19 +996,19 @@ bool MainWindow::refreshCatalogPhotos()
     if (!refreshCatalogFolders() || !refreshCatalogProjects(m_catalogProjectId))
     {
         resetCatalogPhotoPage();
-        (void)m_catalogEditorFacade->closeCatalog();
+        (void)m_catalogSessionClient->closeCatalog();
         m_previewWidget->showMessage(tr("Unable to load catalog navigation."));
         statusBar()->showMessage(tr("Catalog navigation failed."));
         return false;
     }
 
     const core::client::CatalogPhotoPageRequest request = makePhotoPageRequest(m_catalogFolderPath, m_catalogProjectId);
-    const core::client::CatalogPhotoPageResult photos = m_catalogEditorFacade->queryPhotoPage(request);
+    const core::client::CatalogPhotoPageResult photos = m_catalogPhotoClient->queryPhotoPage(request);
     if (photos.hasError())
     {
         LOG_WARN("catalog", "Unable to list GUI catalog photos: {}", photos.error().technicalMessage);
         resetCatalogPhotoPage();
-        (void)m_catalogEditorFacade->closeCatalog();
+        (void)m_catalogSessionClient->closeCatalog();
         m_catalogFolderScopeComboBox->setEnabled(false);
         m_catalogProjectScopeComboBox->setEnabled(false);
         m_catalogProjectMenuButton->setEnabled(false);
@@ -763,10 +1035,10 @@ bool MainWindow::refreshCatalogPhotos()
 // 출력: Folder summary 조회와 control 갱신에 성공하면 true
 bool MainWindow::refreshCatalogFolders()
 {
-    const core::orchestration::CatalogFolderListResult folders = m_catalogEditorFacade->queryFolders();
+    const core::client::CatalogFolderListResult folders = m_catalogFolderClient->listFolders();
     if (folders.hasError())
     {
-        LOG_WARN("catalog", "Unable to list GUI catalog folders: {}", folders.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to list GUI catalog folders: {}", folders.error().technicalMessage);
         const QSignalBlocker blocker(m_catalogFolderScopeComboBox);
         m_catalogFolderScopeComboBox->clear();
         m_catalogFolderScopeComboBox->setPlaceholderText(tr("No catalog"));
@@ -778,13 +1050,14 @@ bool MainWindow::refreshCatalogFolders()
     m_catalogFolderScopeComboBox->clear();
     m_catalogFolderScopeComboBox->addItem(tr("All Photos"), QString{});
     int selectedIndex = m_catalogFolderPath.has_value() ? -1 : 0;
-    for (const core::catalog::CatalogFolderSummary& folder : folders.value())
+    for (const core::client::CatalogFolderSnapshot& folder : folders.value())
     {
-        const QString displayPath = QDir::toNativeSeparators(folder.path);
+        const QString folderPath = fromClientString(folder.path);
+        const QString displayPath = QDir::toNativeSeparators(folderPath);
         const int index = m_catalogFolderScopeComboBox->count();
-        m_catalogFolderScopeComboBox->addItem(tr("%1 (%2)").arg(displayPath).arg(folder.photoCount), folder.path);
+        m_catalogFolderScopeComboBox->addItem(tr("%1 (%2)").arg(displayPath).arg(folder.photoCount), folderPath);
         m_catalogFolderScopeComboBox->setItemData(index, displayPath, Qt::ToolTipRole);
-        if (m_catalogFolderPath.has_value() && folder.path == *m_catalogFolderPath)
+        if (m_catalogFolderPath.has_value() && folderPath == *m_catalogFolderPath)
         {
             selectedIndex = index;
         }
@@ -805,7 +1078,7 @@ bool MainWindow::refreshCatalogFolders()
 // 출력: Project 조회와 control 갱신에 성공하면 true
 bool MainWindow::refreshCatalogProjects(std::optional<core::catalog::ProjectId> preferredProjectId)
 {
-    const core::client::CatalogProjectListResult projects = m_catalogEditorFacade->listProjects();
+    const core::client::CatalogProjectListResult projects = m_catalogProjectClient->listProjects();
     if (projects.hasError())
     {
         LOG_WARN("catalog", "Unable to list GUI catalog projects: {}", projects.error().technicalMessage);
@@ -849,7 +1122,7 @@ bool MainWindow::refreshCatalogProjects(std::optional<core::catalog::ProjectId> 
 // 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
 void MainWindow::changeCatalogFolderScope(int index)
 {
-    if (index < 0 || !m_catalogEditorFacade->catalogState().isOpen)
+    if (index < 0 || !m_catalogSessionClient->catalogSnapshot().isOpen)
     {
         return;
     }
@@ -896,7 +1169,7 @@ void MainWindow::changeCatalogFolderScope(int index)
 // 출력: active adjustment와 dirty state 정리 후 선택 scope의 첫 page 표시
 void MainWindow::changeCatalogProjectScope(int index)
 {
-    if (index < 0 || !m_catalogEditorFacade->catalogState().isOpen)
+    if (index < 0 || !m_catalogSessionClient->catalogSnapshot().isOpen)
     {
         return;
     }
@@ -952,7 +1225,7 @@ void MainWindow::createProject()
     }
 
     const core::client::CatalogProjectResult created =
-        m_catalogEditorFacade->createProject({name.toUtf8().toStdString()});
+        m_catalogProjectClient->createProject({name.toUtf8().toStdString()});
     if (created.hasError())
     {
         LOG_WARN("catalog", "Unable to create GUI project: {}", created.error().technicalMessage);
@@ -990,7 +1263,7 @@ void MainWindow::renameCurrentProject()
     }
 
     const core::client::CatalogProjectResult renamed =
-        m_catalogEditorFacade->renameProject({{m_catalogProjectId->value}, name.toUtf8().toStdString()});
+        m_catalogProjectClient->renameProject({{m_catalogProjectId->value}, name.toUtf8().toStdString()});
     if (renamed.hasError())
     {
         LOG_WARN("catalog", "Unable to rename GUI project: {}", renamed.error().technicalMessage);
@@ -1018,7 +1291,7 @@ void MainWindow::removeCurrentProject()
     }
 
     const core::client::CatalogProjectDeleteResult removed =
-        m_catalogEditorFacade->deleteProject({{m_catalogProjectId->value}});
+        m_catalogProjectClient->deleteProject({{m_catalogProjectId->value}});
     if (removed.hasError())
     {
         LOG_WARN("catalog", "Unable to remove GUI project: {}", removed.error().technicalMessage);
@@ -1041,7 +1314,7 @@ void MainWindow::removeCurrentProject()
 void MainWindow::addSelectedPhotosToProject()
 {
     const QVector<core::catalog::CatalogPhotoRecord> selectedPhotos = m_catalogWidget->selectedPhotos();
-    const core::client::CatalogProjectListResult projects = m_catalogEditorFacade->listProjects();
+    const core::client::CatalogProjectListResult projects = m_catalogProjectClient->listProjects();
     if (selectedPhotos.isEmpty() || projects.hasError() || projects.value().empty())
     {
         statusBar()->showMessage(tr("Select catalog photos and create a project first."));
@@ -1068,7 +1341,7 @@ void MainWindow::addSelectedPhotosToProject()
     for (const core::catalog::CatalogPhotoRecord& photo : selectedPhotos)
     {
         const core::client::CatalogProjectMembershipResult stored =
-            m_catalogEditorFacade->addPhotoToProject({project.id, {photo.id.value}});
+            m_catalogProjectClient->addPhotoToProject({project.id, {photo.id.value}});
         if (stored.hasError())
         {
             LOG_WARN("catalog", "Unable to add GUI project membership: {}", stored.error().technicalMessage);
@@ -1097,7 +1370,7 @@ void MainWindow::removeSelectedPhotosFromProject()
     for (const core::catalog::CatalogPhotoRecord& photo : selectedPhotos)
     {
         const core::client::CatalogProjectMembershipResult removed =
-            m_catalogEditorFacade->removePhotoFromProject({{m_catalogProjectId->value}, {photo.id.value}});
+            m_catalogProjectClient->removePhotoFromProject({{m_catalogProjectId->value}, {photo.id.value}});
         if (removed.hasError())
         {
             LOG_WARN("catalog", "Unable to remove GUI project membership: {}", removed.error().technicalMessage);
@@ -1118,7 +1391,7 @@ void MainWindow::removeSelectedPhotosFromProject()
 // 출력: 유효한 Project command만 활성화
 void MainWindow::updateProjectActions()
 {
-    const bool available = m_catalogEditorFacade->catalogState().isOpen && !m_folderScanController->isScanning();
+    const bool available = m_catalogSessionClient->catalogSnapshot().isOpen && !m_folderOperationActive;
     const bool hasProject = m_catalogProjectId.has_value();
     const bool hasSelectedPhotos = !m_catalogWidget->selectedPhotos().isEmpty();
     m_catalogFolderScopeComboBox->setEnabled(available && !hasProject);
@@ -1136,7 +1409,7 @@ void MainWindow::updateProjectActions()
 // 출력: 조회와 UI 적용에 성공하면 true
 bool MainWindow::loadCatalogPhotoPage(const core::client::CatalogPhotoPageRequest& request)
 {
-    const core::client::CatalogPhotoPageResult result = m_catalogEditorFacade->queryPhotoPage(request);
+    const core::client::CatalogPhotoPageResult result = m_catalogPhotoClient->queryPhotoPage(request);
     if (result.hasError())
     {
         LOG_WARN("catalog", "Unable to navigate GUI catalog photos: {}", result.error().technicalMessage);
@@ -1145,7 +1418,7 @@ bool MainWindow::loadCatalogPhotoPage(const core::client::CatalogPhotoPageReques
     }
 
     m_catalogPhotoPage = result.value();
-    m_catalogEditorFacade->clearSelection();
+    (void)m_editorClient->clearEditorSelection();
     m_developPanel->setEnabled(false);
     m_developPanel->clearHistogram();
     m_previewWidget->clearClippingSummary();
@@ -1220,7 +1493,7 @@ void MainWindow::updateCatalogPageActions()
 // 출력: 없음
 void MainWindow::importFolder()
 {
-    if (!m_catalogEditorFacade->catalogState().isOpen || m_folderScanController->isScanning())
+    if (!m_catalogSessionClient->catalogSnapshot().isOpen || m_folderOperationActive)
     {
         statusBar()->showMessage(tr("Open or create a catalog before importing photos."));
         return;
@@ -1232,8 +1505,22 @@ void MainWindow::importFolder()
         return;
     }
 
-    m_importingFolder = true;
-    m_folderScanController->scanFolder(folderPath);
+    submitFolderImport(folderPath);
+}
+
+// 목적: 현재 Catalog snapshot을 baseline으로 Folder import command 제출
+// 입력: folderPath: file dialog에서 선택한 folder
+// 출력: accepted lifecycle 또는 non-modal submission 실패 표시
+void MainWindow::submitFolderImport(const QString& folderPath)
+{
+    const core::client::CatalogSessionSnapshot session = m_catalogSessionClient->catalogSnapshot();
+    const core::client::FolderOperationResult submitted =
+        m_folderImportClient->submitFolderImport({toClientString(folderPath), session.catalogPath});
+    if (submitted.hasError())
+    {
+        LOG_WARN("catalog", "Unable to submit GUI folder import: {}", submitted.error().technicalMessage);
+        statusBar()->showMessage(tr("Folder import failed."));
+    }
 }
 
 // 목적: folder 선택 dialog를 열고 shared-storage root marker를 보장한 뒤 scan 시작
@@ -1260,7 +1547,13 @@ void MainWindow::openFolder()
 // 출력: 비동기 scan 시작
 void MainWindow::loadFolder(const QString& folderPath)
 {
-    m_folderScanController->scanFolder(folderPath);
+    const core::client::FolderOperationResult submitted =
+        m_folderImportClient->submitFolderScan({toClientString(folderPath)});
+    if (submitted.hasError())
+    {
+        LOG_WARN("catalog", "Unable to submit GUI folder scan: {}", submitted.error().technicalMessage);
+        statusBar()->showMessage(tr("Folder scan failed."));
+    }
 }
 
 // 목적: 선택된 Folder photo를 active Catalog에 등록·resolve하고 Editor에 연결
@@ -1268,7 +1561,7 @@ void MainWindow::loadFolder(const QString& folderPath)
 // 출력: stable PhotoId activation 성공 시 preview 예약, 실패 시 이전 선택 복원
 void MainWindow::showSelectedEntry(const core::catalog::CatalogEntry& entry)
 {
-    const core::orchestration::EditorState previousState = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState previousState = currentEditorState(*m_editorClient);
     if (!persistCurrentPhoto())
     {
         m_catalogWidget->restoreEntrySelection(previousState.source.path);
@@ -1279,18 +1572,18 @@ void MainWindow::showSelectedEntry(const core::catalog::CatalogEntry& entry)
     m_developPanel->clearHistogram();
     m_previewWidget->clearClippingSummary();
     m_previewWidget->showMessage(tr("Loading preview..."));
-    const core::orchestration::EditorStateResult selected =
-        m_catalogEditorFacade->activatePhoto(entry, m_previewWidget->size());
+    syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+    const core::client::EditorResult selected = m_editorClient->activateSource(toActivateEditorSourceCommand(entry));
     if (selected.hasError())
     {
-        LOG_WARN("catalog", "Unable to activate Folder photo: {}", selected.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to activate Folder photo: {}", selected.error().technicalMessage);
         m_catalogWidget->restoreEntrySelection(previousState.source.path);
         m_previewWidget->showMessage(tr("Unable to register this photo in the catalog."));
         statusBar()->showMessage(tr("Photo activation failed."));
         return;
     }
 
-    m_developPanel->setParams(selected.value().params);
+    m_developPanel->setParams(core::orchestration::fromClientDevelopParams(selected.value().params));
 }
 
 // 목적: 선택된 catalog-backed photo를 persisted develop state와 함께 editor에 연결
@@ -1298,7 +1591,7 @@ void MainWindow::showSelectedEntry(const core::catalog::CatalogEntry& entry)
 // 출력: 없음
 void MainWindow::showSelectedCatalogPhoto(const core::catalog::CatalogPhotoRecord& photo)
 {
-    const core::orchestration::EditorState currentState = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState currentState = currentEditorState(*m_editorClient);
     if (currentState.hasSelection && currentState.photo.photoId.value == photo.id.value)
     {
         return;
@@ -1314,19 +1607,19 @@ void MainWindow::showSelectedCatalogPhoto(const core::catalog::CatalogPhotoRecor
     m_developPanel->clearHistogram();
     m_previewWidget->clearClippingSummary();
     m_previewWidget->showMessage(tr("Loading preview..."));
-    const core::orchestration::EditorStateResult selected =
-        m_catalogEditorFacade->selectCatalogPhoto(photo.id, m_previewWidget->size());
+    syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+    const core::client::EditorResult selected = m_editorClient->selectPhoto({{photo.id.value}});
 
     if (selected.hasError())
     {
-        LOG_WARN("catalog", "Unable to select GUI catalog photo: {}", selected.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to select GUI catalog photo: {}", selected.error().technicalMessage);
         m_catalogWidget->restorePhotoSelection(currentState.photo.photoId);
         m_previewWidget->showMessage(tr("Unable to select catalog photo."));
         statusBar()->showMessage(tr("Catalog photo selection failed."));
         return;
     }
 
-    m_developPanel->setParams(selected.value().params);
+    m_developPanel->setParams(core::orchestration::fromClientDevelopParams(selected.value().params));
 }
 
 // 목적: 선택 photo의 replacement source를 기존 identity의 새 baseline으로 수용
@@ -1334,13 +1627,13 @@ void MainWindow::showSelectedCatalogPhoto(const core::catalog::CatalogPhotoRecor
 // 출력: accepted source request를 inline pending 상태로 표시
 void MainWindow::acceptReplacement()
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!core::types::isValidPhotoId(state.photo.photoId) || !state.sourceResolution.canAcceptReplacement)
     {
         return;
     }
 
-    (void)beginSourceResolution(m_catalogEditorFacade->acceptReplacement(state.photo.photoId),
+    (void)beginSourceResolution(m_sourceResolutionClient->acceptReplacement({{state.photo.photoId.value}}),
                                 tr("Unable to accept the replacement source."));
 }
 
@@ -1354,13 +1647,13 @@ void MainWindow::registerReplacementAsNew()
         return;
     }
 
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!core::types::isValidPhotoId(state.photo.photoId) || !state.sourceResolution.canRegisterReplacementAsNew)
     {
         return;
     }
 
-    (void)beginSourceResolution(m_catalogEditorFacade->registerReplacementAsNew(state.photo.photoId),
+    (void)beginSourceResolution(m_sourceResolutionClient->registerReplacementAsNew({{state.photo.photoId.value}}),
                                 tr("Unable to register the replacement as a new photo."));
 }
 
@@ -1369,7 +1662,7 @@ void MainWindow::registerReplacementAsNew()
 // 출력: file 선택 후 accepted relink request 표시
 void MainWindow::relinkSource()
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!core::types::isValidPhotoId(state.photo.photoId) || !state.sourceResolution.canRelinkSource)
     {
         return;
@@ -1383,59 +1676,96 @@ void MainWindow::relinkSource()
         return;
     }
 
+    const QString normalizedSourcePath =
+        QDir::cleanPath(QDir::fromNativeSeparators(QFileInfo(sourcePath).absoluteFilePath()));
     (void)beginSourceResolution(
-        m_catalogEditorFacade->relinkSource(state.photo.photoId, core::types::SourceLocator{sourcePath}),
+        m_sourceResolutionClient->relinkSource({{state.photo.photoId.value}, toClientString(normalizedSourcePath)}),
         tr("Unable to relink this source."));
 }
 
 // 목적: source resolution command 제출 결과를 공통 inline 상태로 변환
 // 입력: result: request ID 또는 오류, failureMessage: 사용자용 실패 안내
 // 출력: request가 accepted되면 true
-bool MainWindow::beginSourceResolution(const core::orchestration::CatalogSourceSubmissionResult& result,
-                                       const QString& failureMessage)
+bool MainWindow::beginSourceResolution(const core::client::SourceRequestResult& result, const QString& failureMessage)
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (result.hasError())
     {
-        LOG_WARN("catalog", "Unable to submit source resolution: {}", result.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to submit Source Resolution: {}", result.error().technicalMessage);
         m_sourceResolutionWidget->setRequestPending(m_sourceResolutionRequests.contains(state.photo.photoId.value));
         statusBar()->showMessage(failureMessage);
         return false;
     }
 
-    m_sourceResolutionRequests.insert(state.photo.photoId.value, result.value());
+    m_sourceResolutionRequests.insert(result.value().photoId.value, result.value().id);
     m_sourceResolutionWidget->setRequestPending(true);
     statusBar()->showMessage(tr("Resolving source..."));
     return true;
 }
 
+// 목적: immutable source request lifecycle을 inline control과 Catalog presentation에 반영
+// 입력: event: initial active requests 또는 accepted·update·issue·terminal transition
+// 출력: pending 상태와 source transition 결과 갱신
+void MainWindow::handleSourceResolutionEvent(const core::client::SourceResolutionEvent& event)
+{
+    m_sourceResolutionRequests.clear();
+    for (const core::client::SourceRequestReceipt& request : event.snapshot.activeRequests)
+    {
+        if (isExplicitSourceResolution(request.kind))
+        {
+            m_sourceResolutionRequests.insert(request.photoId.value, request.id);
+        }
+    }
+
+    if (event.update.has_value())
+    {
+        handleSourceBindingUpdated(*event.update);
+    }
+    if (event.issue.has_value())
+    {
+        handleSourceBindingFailed(*event.issue);
+    }
+    if (event.terminal.has_value() && event.terminal->state == core::client::SourceResolutionTerminalState::Cancelled)
+    {
+        handleSourceBindingCancelled(*event.terminal);
+    }
+
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
+    m_sourceResolutionWidget->setRequestPending(m_sourceResolutionRequests.contains(state.photo.photoId.value));
+}
+
 // 목적: source transition을 현재 Editor selection과 catalog list에 반영
 // 입력: update: 갱신된 기존 photo와 optional 신규 photo
 // 출력: 현재 selection의 Register as New이면 신규 PhotoId로 전환
-void MainWindow::handleSourceBindingUpdated(const core::orchestration::CatalogSourceUpdate& update)
+void MainWindow::handleSourceBindingUpdated(const core::client::SourceResolutionUpdate& update)
 {
-    core::orchestration::EditorState editorState = m_catalogEditorFacade->editorState();
-    const bool currentPhoto = editorState.photo.photoId.value == update.photoId.value;
-    const std::optional<core::types::PhotoId> explicitPhoto = takeSourceResolutionRequest(update.requestId);
-    const bool explicitRequest = explicitPhoto.has_value() && explicitPhoto->value == update.photoId.value;
+    core::orchestration::EditorState editorState = currentEditorState(*m_editorClient);
+    const bool currentPhoto = editorState.photo.photoId.value == update.receipt.photoId.value;
+    const bool explicitRequest = isExplicitSourceResolution(update.receipt.kind);
 
     if (update.createdPhoto.has_value() && currentPhoto)
     {
-        const core::orchestration::EditorStateResult selected =
-            m_catalogEditorFacade->selectCatalogPhoto(update.createdPhoto->id, m_previewWidget->size());
+        syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+        const core::client::EditorResult selected = m_editorClient->selectPhoto({update.createdPhoto->id});
         if (selected.hasError())
         {
-            LOG_WARN("catalog", "Unable to select newly registered photo: {}", selected.error().message.toStdString());
+            LOG_WARN("catalog", "Unable to select newly registered photo: {}", selected.error().technicalMessage);
             statusBar()->showMessage(tr("New photo was registered but could not be selected."));
         }
         else
         {
-            editorState = selected.value();
+            editorState = core::orchestration::fromClientEditorSnapshot(selected.value());
             m_developPanel->setParams(editorState.params);
         }
     }
 
-    m_catalogWidget->applyPhotoUpdate(update.photo, update.createdPhoto, editorState.photo.photoId);
+    const core::catalog::CatalogPhotoRecord updatedPhoto = facade::toCatalogPhotoRecord(update.photo);
+    std::optional<core::catalog::CatalogPhotoRecord> createdPhoto;
+    if (update.createdPhoto.has_value())
+    {
+        createdPhoto = facade::toCatalogPhotoRecord(*update.createdPhoto);
+    }
+    m_catalogWidget->applyPhotoUpdate(updatedPhoto, createdPhoto, editorState.photo.photoId);
     if (explicitRequest && currentPhoto)
     {
         m_sourceResolutionWidget->setRequestPending(
@@ -1447,12 +1777,11 @@ void MainWindow::handleSourceBindingUpdated(const core::orchestration::CatalogSo
 // 목적: current photo의 source verification/resolution 실패를 inline 상태로 표시
 // 입력: issue: request·photo identity와 technical 오류
 // 출력: pending 해제와 사용자용 실패 안내
-void MainWindow::handleSourceBindingFailed(const core::orchestration::CatalogIssue& issue)
+void MainWindow::handleSourceBindingFailed(const core::client::SourceResolutionIssue& issue)
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
-    const bool currentPhoto = state.photo.photoId.value == issue.photoId.value;
-    const std::optional<core::types::PhotoId> explicitPhoto = takeSourceResolutionRequest(issue.requestId);
-    const bool explicitRequest = explicitPhoto.has_value() && explicitPhoto->value == issue.photoId.value;
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
+    const bool currentPhoto = state.photo.photoId.value == issue.receipt.photoId.value;
+    const bool explicitRequest = isExplicitSourceResolution(issue.receipt.kind);
     if (!currentPhoto)
     {
         return;
@@ -1462,45 +1791,26 @@ void MainWindow::handleSourceBindingFailed(const core::orchestration::CatalogIss
     {
         m_sourceResolutionWidget->setRequestPending(m_sourceResolutionRequests.contains(state.photo.photoId.value));
     }
-    LOG_WARN("catalog", "Source binding request failed: {}", issue.error.message.toStdString());
+    LOG_WARN("catalog", "Source binding request failed: {}", issue.error.technicalMessage);
     statusBar()->showMessage(explicitRequest ? tr("Source resolution failed.") : tr("Source verification failed."));
 }
 
 // 목적: source request terminal cancellation을 inline 상태에 반영
-// 입력: requestId: 취소된 request identity
+// 입력: terminal: 취소된 request context와 terminal state
 // 출력: pending 상태 해제
-void MainWindow::handleSourceBindingCancelled(core::types::RequestId requestId)
+void MainWindow::handleSourceBindingCancelled(const core::client::SourceResolutionTerminal& terminal)
 {
-    const std::optional<core::types::PhotoId> explicitPhoto = takeSourceResolutionRequest(requestId);
-    if (!explicitPhoto.has_value())
+    if (!isExplicitSourceResolution(terminal.receipt.kind))
     {
         return;
     }
 
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
-    if (state.photo.photoId.value == explicitPhoto->value)
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
+    if (state.photo.photoId.value == terminal.receipt.photoId.value)
     {
         m_sourceResolutionWidget->setRequestPending(m_sourceResolutionRequests.contains(state.photo.photoId.value));
         statusBar()->showMessage(tr("Source resolution cancelled."));
     }
-}
-
-// 목적: terminal event와 일치하는 explicit source request 추적을 제거
-// 입력: requestId: 완료·실패·취소된 request identity
-// 출력: 해당 request가 명시적 GUI command이면 대상 PhotoId
-std::optional<core::types::PhotoId> MainWindow::takeSourceResolutionRequest(core::types::RequestId requestId)
-{
-    for (auto request = m_sourceResolutionRequests.begin(); request != m_sourceResolutionRequests.end(); ++request)
-    {
-        if (request.value() == requestId)
-        {
-            const core::types::PhotoId photoId{request.key()};
-            m_sourceResolutionRequests.erase(request);
-            return photoId;
-        }
-    }
-
-    return std::nullopt;
 }
 
 // 목적: 현재 catalog-backed photo의 develop state를 explicit user command로 저장
@@ -1516,7 +1826,7 @@ void MainWindow::saveCurrentPhoto()
 // 출력: 처리 가능한 선택 photo를 item별 output 목록으로 제공하는 modal export workflow 실행
 void MainWindow::exportCurrentPhoto()
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!state.hasSelection || !state.sourceProcessingAllowed)
     {
         statusBar()->showMessage(tr("Select an available photo before exporting."));
@@ -1524,7 +1834,7 @@ void MainWindow::exportCurrentPhoto()
     }
 
     QVector<export_::ExportDialogSource> sources;
-    const QString catalogPath = m_catalogEditorFacade->catalogState().catalogPath;
+    const QString catalogPath = fromClientString(m_catalogSessionClient->catalogSnapshot().catalogPath);
     const QVector<core::catalog::CatalogPhotoRecord> selectedPhotos = m_catalogWidget->selectedPhotos();
     for (const core::catalog::CatalogPhotoRecord& photo : selectedPhotos)
     {
@@ -1564,8 +1874,12 @@ void MainWindow::exportCurrentPhoto()
         sources.push_back({state.source, {}, state.params});
     }
 
-    QSettings settings;
-    export_::ExportDialog dialog(*m_exportOrchestrator, std::move(sources), settings, this);
+    export_::ExportDialog dialog(*m_exportClient,
+                                 *m_exportEventSource,
+                                 std::move(sources),
+                                 *m_workerProfileClient,
+                                 *m_exportDefaultsClient,
+                                 this);
     (void)dialog.exec();
 }
 
@@ -1575,21 +1889,23 @@ void MainWindow::exportCurrentPhoto()
 bool MainWindow::persistCurrentPhoto()
 {
     m_developPanel->finishActiveAdjustment();
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!state.hasSelection || !core::types::isValidPhotoId(state.photo.photoId) || !state.dirty)
     {
         return true;
     }
 
-    const core::orchestration::EditorStateResult saved = m_catalogEditorFacade->saveCurrentPhoto();
+    const core::client::EditorResult saved = m_editorClient->saveDevelopState();
     if (saved.hasError())
     {
-        LOG_WARN("catalog", "Unable to save GUI develop state: {}", saved.error().message.toStdString());
+        LOG_WARN("catalog", "Unable to save GUI develop state: {}", saved.error().technicalMessage);
         statusBar()->showMessage(tr("Develop settings were not saved."));
         return false;
     }
 
-    statusBar()->showMessage(tr("Develop settings saved for %1.").arg(saved.value().source.displayName));
+    const QString displayName =
+        saved.value().source.has_value() ? fromClientString(saved.value().source->displayName) : QString{};
+    statusBar()->showMessage(tr("Develop settings saved for %1.").arg(displayName));
     return true;
 }
 
@@ -1599,7 +1915,7 @@ bool MainWindow::persistCurrentPhoto()
 bool MainWindow::confirmPendingSave()
 {
     m_developPanel->finishActiveAdjustment();
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     if (!state.hasSelection || !core::types::isValidPhotoId(state.photo.photoId) || !state.dirty)
     {
         return true;
@@ -1617,7 +1933,19 @@ bool MainWindow::confirmPendingSave()
         return false;
     }
 
-    return choice == QMessageBox::Discard || persistCurrentPhoto();
+    if (choice == QMessageBox::Discard)
+    {
+        const core::client::EditorResult cleared = m_editorClient->clearEditorSelection();
+        if (cleared.hasError())
+        {
+            LOG_WARN("catalog", "Unable to discard GUI develop state: {}", cleared.error().technicalMessage);
+            statusBar()->showMessage(tr("Develop settings could not be discarded."));
+            return false;
+        }
+        return true;
+    }
+
+    return persistCurrentPhoto();
 }
 
 // 목적: 중앙 UI를 graphical 또는 console mode로 전환
@@ -1635,13 +1963,18 @@ void MainWindow::setConsoleMode(bool enabled)
     }
 }
 
-// 목적: application UI preference를 편집하고 accepted style을 즉시 DevelopPanel에 반영
+// 목적: application UI preference와 product setting을 편집하는 Settings dialog 표시
 // 입력: 없음
-// 출력: Settings dialog가 modal로 표시되고 accept 시 preference 저장
+// 출력: accept 시 Export 기본값 저장과 adjustment style 즉시 반영
 void MainWindow::openSettings()
 {
-    QSettings applicationSettings;
-    settings::SettingsDialog dialog(applicationSettings, this);
+    settings::SettingsDialog dialog(*m_applicationSettings,
+                                    *m_workerProfileClient,
+                                    *m_exportDefaultsClient,
+                                    m_workerHealthClient,
+                                    m_workerHealthEventSource,
+                                    m_catalogStartupSettingsClient,
+                                    this);
     if (dialog.exec() == QDialog::Accepted)
     {
         m_developPanel->setAdjustmentControlStyle(dialog.adjustmentControlStyle());
@@ -1653,7 +1986,13 @@ void MainWindow::openSettings()
 // 출력: 없음
 void MainWindow::applyDevelopParams(const core::types::DevelopParams& params)
 {
-    (void)m_catalogEditorFacade->updateDevelopParams(params, m_previewWidget->size());
+    syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+    const core::client::EditorResult updated =
+        m_editorClient->updateDevelopParams({core::orchestration::toClientDevelopParams(params)});
+    if (updated.hasError())
+    {
+        LOG_WARN("catalog", "Unable to update Develop parameters: {}", updated.error().technicalMessage);
+    }
 }
 
 // 목적: 현재 사진의 연속 parameter 조작을 하나의 undo 단계로 시작
@@ -1661,7 +2000,11 @@ void MainWindow::applyDevelopParams(const core::types::DevelopParams& params)
 // 출력: 없음
 void MainWindow::beginDevelopAdjustment()
 {
-    m_catalogEditorFacade->beginEdit();
+    const core::client::EditorResult started = m_editorClient->beginAdjustment();
+    if (started.hasError())
+    {
+        LOG_WARN("catalog", "Unable to begin Develop Adjustment: {}", started.error().technicalMessage);
+    }
 }
 
 // 목적: 현재 사진의 연속 parameter 조작을 완료하고 undo action 상태 갱신
@@ -1669,7 +2012,11 @@ void MainWindow::beginDevelopAdjustment()
 // 출력: 없음
 void MainWindow::finishDevelopAdjustment()
 {
-    m_catalogEditorFacade->endEdit();
+    const core::client::EditorResult finished = m_editorClient->endAdjustment();
+    if (finished.hasError())
+    {
+        LOG_WARN("catalog", "Unable to finish Develop Adjustment: {}", finished.error().technicalMessage);
+    }
 }
 
 // 목적: 현재 사진의 마지막 develop parameter 변경을 undo
@@ -1677,11 +2024,12 @@ void MainWindow::finishDevelopAdjustment()
 // 출력: 없음
 void MainWindow::undoDevelopAdjustment()
 {
-    const std::optional<core::orchestration::EditorState> state = m_catalogEditorFacade->undo(m_previewWidget->size());
+    syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+    const core::client::EditorResult state = m_editorClient->undoDevelop();
 
-    if (state.has_value())
+    if (state.hasValue())
     {
-        m_developPanel->setParams(state->params);
+        m_developPanel->setParams(core::orchestration::fromClientDevelopParams(state.value().params));
     }
 }
 
@@ -1690,11 +2038,12 @@ void MainWindow::undoDevelopAdjustment()
 // 출력: 없음
 void MainWindow::redoDevelopAdjustment()
 {
-    const std::optional<core::orchestration::EditorState> state = m_catalogEditorFacade->redo(m_previewWidget->size());
+    syncPreviewViewport(*m_previewPresentationClient, m_previewWidget->size());
+    const core::client::EditorResult state = m_editorClient->redoDevelop();
 
-    if (state.has_value())
+    if (state.hasValue())
     {
-        m_developPanel->setParams(state->params);
+        m_developPanel->setParams(core::orchestration::fromClientDevelopParams(state.value().params));
     }
 }
 
@@ -1754,7 +2103,7 @@ void MainWindow::updateEditorStateUi(const core::orchestration::EditorState& sta
 // 출력: 없음
 void MainWindow::updateEditorActions()
 {
-    const core::orchestration::EditorState state = m_catalogEditorFacade->editorState();
+    const core::orchestration::EditorState state = currentEditorState(*m_editorClient);
     m_saveDevelopAction->setEnabled(state.hasSelection && core::types::isValidPhotoId(state.photo.photoId) &&
                                     state.dirty);
     m_exportAction->setEnabled(state.hasSelection && state.sourceProcessingAllowed && !state.source.path.isEmpty());

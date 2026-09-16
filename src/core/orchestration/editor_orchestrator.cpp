@@ -1,6 +1,13 @@
 #include "editor_orchestrator.h"
 
+#include <limits>
+
+#include <QByteArray>
+#include <QDir>
+#include <QFileInfo>
+
 #include "catalog_orchestrator.h"
+#include "client_error_projection.h"
 #include "develop.h"
 #include "editor_client_projection.h"
 #include "preview_orchestrator.h"
@@ -28,6 +35,33 @@ constexpr int InteractivePreviewIntervalMs = 33;
 [[nodiscard]] client::EditorResult makeClientFailure(types::ErrorCode code, const QString& message)
 {
     return client::EditorResult::failure(toClientError({code, message}));
+}
+
+// 목적: Qt-free UTF-8 contract string을 손실 없이 internal QString으로 변환
+// 입력: value: UTF-8로 선언된 byte string
+// 출력: round-trip 가능한 Unicode text 또는 invalid UTF-8이면 빈 값
+[[nodiscard]] std::optional<QString> decodeClientString(const std::string& value)
+{
+    const QByteArray bytes(value.data(), static_cast<qsizetype>(value.size()));
+    const QString decoded = QString::fromUtf8(bytes);
+    return decoded.toUtf8() == bytes ? std::optional<QString>{decoded} : std::nullopt;
+}
+
+// 목적: Qt-free Catalog file kind를 internal processing kind로 변환
+// 입력: kind: Editor source command의 file 종류
+// 출력: 같은 의미의 Core enum
+[[nodiscard]] types::SupportedFileKind fromClientFileKind(client::CatalogFileKind kind) noexcept
+{
+    switch (kind)
+    {
+    case client::CatalogFileKind::Raw:
+        return types::SupportedFileKind::Raw;
+    case client::CatalogFileKind::RasterImage:
+        return types::SupportedFileKind::RasterImage;
+    case client::CatalogFileKind::Unknown:
+        return types::SupportedFileKind::Unknown;
+    }
+    return types::SupportedFileKind::Unknown;
 }
 
 // 목적: catalog photo record의 current locator를 preview source descriptor로 변환
@@ -151,6 +185,99 @@ client::EditorSnapshot EditorOrchestrator::editorSnapshot() const
     return toClientEditorSnapshot(state(), m_editInProgress);
 }
 
+// 목적: Qt-free viewport command를 기존 Preview target과 resize coalescing에 전달
+// 입력: command: 양수 fixed-width pixel 크기
+// 출력: 적용된 viewport 또는 validation 오류
+client::PreviewViewportResult EditorOrchestrator::setPreviewViewport(const client::SetPreviewViewportCommand& command)
+{
+    constexpr std::uint32_t MaximumQtDimension = static_cast<std::uint32_t>(std::numeric_limits<int>::max());
+    if (command.viewport.width == 0 || command.viewport.height == 0 || command.viewport.width > MaximumQtDimension ||
+        command.viewport.height > MaximumQtDimension)
+    {
+        return client::PreviewViewportResult::failure(
+            {client::ClientErrorCode::InvalidArgument,
+             "Preview viewport dimensions must be positive Qt pixel values."});
+    }
+
+    (void)updatePreviewTargetSize(
+        QSize{static_cast<int>(command.viewport.width), static_cast<int>(command.viewport.height)});
+    return client::PreviewViewportResult::success(command.viewport);
+}
+
+// 목적: 현재 accepted Preview request의 향후 frame publication과 processing 취소
+// 입력: requestId: owner가 발급해 presentation snapshot에 공개한 identity
+// 출력: 취소된 identity 또는 stale·validation 오류
+client::PreviewRequestCancelResult EditorOrchestrator::cancelPreviewRequest(client::PreviewRequestId requestId)
+{
+    if (requestId.value == 0)
+    {
+        return client::PreviewRequestCancelResult::failure(
+            {client::ClientErrorCode::InvalidArgument, "Preview request identity must be positive."});
+    }
+    if (!cancelPreviewRequest(static_cast<types::RequestId>(requestId.value)))
+    {
+        return client::PreviewRequestCancelResult::failure(
+            {client::ClientErrorCode::NotFound, "Preview request is no longer active."});
+    }
+    return client::PreviewRequestCancelResult::success(requestId);
+}
+
+// 목적: Preview presentation adapter가 현재 target 크기를 owner context에서 조회
+// 입력: 없음
+// 출력: 아직 설정되지 않았으면 빈 QSize, 아니면 양수 pixel 크기
+QSize EditorOrchestrator::previewTargetSize() const noexcept
+{
+    return m_previewTargetSize;
+}
+
+// 목적: Preview presentation adapter가 현재 latest-wins sequence를 조회
+// 입력: 없음
+// 출력: 선택·편집·resize transition에 따라 증가한 sequence
+types::PreviewSequence EditorOrchestrator::previewSequence() const noexcept
+{
+    return m_previewSequence;
+}
+
+// 목적: Preview presentation adapter가 현재 accepted request identity를 조회
+// 입력: 없음
+// 출력: active request가 없으면 0, 있으면 owner-issued identity
+types::RequestId EditorOrchestrator::activePreviewRequestId() const noexcept
+{
+    return m_activePreviewRequestId;
+}
+
+// 목적: Folder scan source를 active Catalog에 등록·resolve하고 Editor session으로 선택
+// 입력: command: normalized absolute UTF-8 source와 표시 metadata
+// 출력: stable Photo identity가 발급된 snapshot 또는 validation·Catalog 오류
+client::EditorResult EditorOrchestrator::activateSource(const client::ActivateEditorSourceCommand& command)
+{
+    const std::optional<QString> sourceLocator = decodeClientString(command.sourceLocator);
+    const std::optional<QString> extension = decodeClientString(command.extension);
+    const std::optional<QString> displayName = decodeClientString(command.displayName);
+    if (!sourceLocator.has_value() || !extension.has_value() || !displayName.has_value() ||
+        command.kind == client::CatalogFileKind::Unknown)
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument,
+                                 QStringLiteral("Editor source command contains invalid UTF-8 or file kind."));
+    }
+
+    const QString normalizedLocator = QDir::cleanPath(QDir::fromNativeSeparators(sourceLocator->trimmed()));
+    if (normalizedLocator.isEmpty() || normalizedLocator == QStringLiteral(".") ||
+        !QFileInfo(normalizedLocator).isAbsolute() || normalizedLocator != *sourceLocator ||
+        extension->trimmed().isEmpty() || displayName->trimmed().isEmpty())
+    {
+        return makeClientFailure(types::ErrorCode::InvalidArgument,
+                                 QStringLiteral("Editor source command metadata is invalid or not normalized."));
+    }
+
+    const catalog::CatalogEntry entry{
+        {normalizedLocator, extension->trimmed(), displayName->trimmed(), fromClientFileKind(command.kind)},
+        types::FileScanStatus::Ready};
+    const EditorStateResult selected = activatePhoto(entry, m_previewTargetSize);
+    return selected.hasError() ? client::EditorResult::failure(toClientError(selected.error()))
+                               : client::EditorResult::success(toClientEditorSnapshot(selected.value(), false));
+}
+
 // 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
 // 입력: command: 선택할 fixed-width Photo identity
 // 출력: 선택 후 snapshot 또는 validation·Catalog·Develop load 오류
@@ -166,9 +293,9 @@ client::EditorResult EditorOrchestrator::selectPhoto(const client::SelectEditorP
                                : client::EditorResult::success(toClientEditorSnapshot(selected.value(), false));
 }
 
-// 목적: 현재 Editor selection과 진행 중 Adjustment를 정리
+// 목적: 현재 Editor selection과 해당 Photo의 session-local Develop state를 폐기
 // 입력: 없음
-// 출력: 선택되지 않은 snapshot
+// 출력: 다른 Photo history와 persisted data를 유지한 선택되지 않은 snapshot
 client::EditorResult EditorOrchestrator::clearEditorSelection()
 {
     clearSelection();
@@ -405,7 +532,7 @@ EditorStateResult EditorOrchestrator::selectCatalogPhoto(types::PhotoId photoId,
     }
 
     const EditorState currentState = state();
-    publishStateChanged(currentState);
+    publishStateChanged();
     return EditorStateResult::success(currentState);
 }
 
@@ -446,19 +573,26 @@ EditorStateResult EditorOrchestrator::saveCurrentPhoto()
     m_currentSource = makeSourceDescriptor(saved.value().photo);
     m_sourceResolution = makeSourceResolutionCapabilities(saved.value().photo);
     const EditorState currentState = state();
-    publishStateChanged(currentState);
+    publishStateChanged();
     return EditorStateResult::success(currentState);
 }
 
-// 목적: 현재 선택과 진행 중 preview를 정리하되 사진별 in-memory history 유지
+// 목적: 현재 선택과 해당 Photo의 session-local Develop state 및 진행 중 preview 정리
 // 입력: 없음
-// 출력: 선택되지 않은 editor state
+// 출력: 다른 Photo history와 persisted data를 유지한 선택되지 않은 editor state
 void EditorOrchestrator::clearSelection()
 {
+    const QString photoKey = currentHistoryKey();
     finishEdit(false);
     m_previewDebounceTimer.stop();
     m_previewResizeDebounceTimer.stop();
     cancelActivePreview();
+    if (!photoKey.isEmpty())
+    {
+        m_developHistory.discardPhoto(photoKey);
+        m_sessionBaselines.remove(photoKey);
+        m_persistedRevisions.remove(photoKey);
+    }
     ++m_previewSequence;
     m_currentCatalogPhotoId.reset();
     m_currentCatalogIdentity.clear();
@@ -468,7 +602,7 @@ void EditorOrchestrator::clearSelection()
     m_previewTargetSize = {};
     m_sourceProcessingAllowed = false;
     m_sourceResolution = {};
-    publishStateChanged(state());
+    publishStateChanged();
 }
 
 // 목적: 현재 사진의 develop params를 갱신하고 debounce된 preview 예약
@@ -503,7 +637,7 @@ bool EditorOrchestrator::updateDevelopParams(const types::DevelopParams& params,
         scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
     }
 
-    publishStateChanged(state());
+    publishStateChanged();
     return true;
 }
 
@@ -520,11 +654,13 @@ bool EditorOrchestrator::updatePreviewTargetSize(const QSize& targetSize)
     m_previewTargetSize = targetSize;
     if (m_currentSource.path.isEmpty() || !m_sourceProcessingAllowed)
     {
+        emit previewPresentationStateChanged();
         return true;
     }
 
     if (m_previewDebounceTimer.isActive())
     {
+        emit previewPresentationStateChanged();
         return true;
     }
 
@@ -536,6 +672,7 @@ bool EditorOrchestrator::updatePreviewTargetSize(const QSize& targetSize)
     ++m_previewSequence;
     cancelActivePreview();
     m_previewResizeDebounceTimer.start();
+    emit previewPresentationStateChanged();
     return true;
 }
 
@@ -599,7 +736,7 @@ std::optional<EditorState> EditorOrchestrator::undo(const QSize& targetSize)
         scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
     }
     const EditorState currentState = state();
-    publishStateChanged(currentState);
+    publishStateChanged();
     return currentState;
 }
 
@@ -627,7 +764,7 @@ std::optional<EditorState> EditorOrchestrator::redo(const QSize& targetSize)
         scheduleFinalPreview(targetSize, PreviewProgression::FinalOnly, PreviewTiming::Debounced);
     }
     const EditorState currentState = state();
-    publishStateChanged(currentState);
+    publishStateChanged();
     return currentState;
 }
 
@@ -820,16 +957,16 @@ void EditorOrchestrator::handleSourceBindingUpdated(const CatalogSourceUpdate& u
         scheduleFinalPreview(m_previewTargetSize, PreviewProgression::Progressive, PreviewTiming::Immediate);
     }
 
-    publishStateChanged(state());
+    publishStateChanged();
 }
 
-// 목적: transitional Qt state와 Qt-free snapshot invalidation을 한 state transition에서 publish
-// 입력: currentState: 변경이 끝난 현재 Editor state
-// 출력: 기존 GUI signal과 client event adapter 알림
-void EditorOrchestrator::publishStateChanged(const EditorState& currentState)
+// 목적: Editor와 Preview의 Qt-free snapshot invalidation을 한 state transition에서 publish
+// 입력: 없음
+// 출력: client event adapter 알림
+void EditorOrchestrator::publishStateChanged()
 {
-    emit stateChanged(currentState);
     emit editorSnapshotChanged();
+    emit previewPresentationStateChanged();
 }
 
 // 목적: 현재 선택 사진의 persisted 또는 session baseline 대비 dirty 여부 계산

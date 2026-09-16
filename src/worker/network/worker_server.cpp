@@ -8,17 +8,12 @@ namespace flexraw::worker::network
 {
 
 // 목적: shared Worker runtime 위에 TCP acceptor 구성
-// 입력: resolver/scheduler: 모든 session이 공유할 runtime, configuration: connection/session 한도
+// 입력: runtime: 모든 session이 공유할 Runtime port, configuration: connection/session 한도
 // 출력: 아직 listen하지 않는 server
-WorkerServer::WorkerServer(const runtime::WorkerPathResolver& resolver,
-                           runtime::JobScheduler& scheduler,
+WorkerServer::WorkerServer(runtime::IRenderWorkerRuntime& runtime,
                            WorkerServerConfiguration configuration,
                            QObject* const parent)
-    : QObject(parent),
-      m_resolver(resolver),
-      m_scheduler(scheduler),
-      m_configuration(std::move(configuration)),
-      m_server(this)
+    : QObject(parent), m_runtime(runtime), m_configuration(std::move(configuration)), m_server(this)
 {
     connect(&m_server, &QTcpServer::newConnection, this, &WorkerServer::acceptPendingConnections);
 }
@@ -109,8 +104,7 @@ void WorkerServer::acceptPendingConnections()
             continue;
         }
 
-        auto* const session =
-            new ProtocolSession(nextSessionId(), socket, m_resolver, m_scheduler, m_configuration.session, this);
+        auto* const session = new ProtocolSession(nextSessionId(), socket, m_runtime, m_configuration.session, this);
         m_sessions.insert(session);
         connect(session, &ProtocolSession::finished, this, [this, session]() {
             m_sessions.remove(session);

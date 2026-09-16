@@ -3,6 +3,8 @@
 add_library(flexraw_platform_windows STATIC)
 
 target_sources(flexraw_platform_windows PRIVATE
+    windows_path_identity_service.cpp
+    windows_path_identity_service.h
     windows_process_memory_probe.cpp
     windows_process_memory_probe.h
     windows_system_memory_probe.cpp

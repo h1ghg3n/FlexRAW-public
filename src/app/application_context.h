@@ -4,23 +4,44 @@
 
 #include "mainwindow.h"
 
+class QSettings;
+
 namespace flexraw::core::orchestration
 {
 class CatalogThumbnailOrchestrator;
-class EditorOrchestrator;
+class CatalogSessionOrchestrator;
 class ExportOrchestrator;
-class PreviewOrchestrator;
+class WorkerHealthOrchestrator;
 }  // namespace flexraw::core::orchestration
+
+namespace flexraw::runtime
+{
+class ProductRuntime;
+}
 
 namespace flexraw::platform
 {
+class IPathIdentityService;
 class ISystemMemoryProbe;
-}
+}  // namespace flexraw::platform
 
 namespace flexraw::ui::facade
 {
 class CatalogEditorFacade;
 }
+
+namespace flexraw::ui::export_
+{
+class QtExportClientAdapter;
+}
+
+namespace flexraw::ui::settings
+{
+class QtCatalogStartupSettingsAdapter;
+class QtExportSettingsAdapter;
+class QtWorkerHealthEventAdapter;
+class QtWorkerProfileSettingsAdapter;
+}  // namespace flexraw::ui::settings
 
 namespace flexraw::app
 {
@@ -46,13 +67,21 @@ public:
     [[nodiscard]] ui::mainwindow::MainWindow& mainWindow();
 
 private:
-    std::unique_ptr<core::orchestration::PreviewOrchestrator> m_previewOrchestrator;
+    std::unique_ptr<runtime::ProductRuntime> m_productRuntime;
     std::unique_ptr<core::orchestration::CatalogThumbnailOrchestrator> m_catalogThumbnailOrchestrator;
+    std::unique_ptr<platform::IPathIdentityService> m_pathIdentityService;
     std::unique_ptr<platform::ISystemMemoryProbe> m_systemMemoryProbe;
     std::unique_ptr<core::orchestration::ExportOrchestrator> m_exportOrchestrator;
+    std::unique_ptr<QSettings> m_applicationSettings;
+    std::unique_ptr<ui::settings::QtCatalogStartupSettingsAdapter> m_catalogStartupSettings;
     std::unique_ptr<ManagedCatalogSession> m_managedCatalogSession;
-    std::unique_ptr<core::orchestration::EditorOrchestrator> m_editorOrchestrator;
+    std::unique_ptr<core::orchestration::CatalogSessionOrchestrator> m_catalogSessionOrchestrator;
     std::unique_ptr<ui::facade::CatalogEditorFacade> m_catalogEditorFacade;
+    std::unique_ptr<ui::settings::QtExportSettingsAdapter> m_exportSettings;
+    std::unique_ptr<ui::settings::QtWorkerProfileSettingsAdapter> m_workerProfileSettings;
+    std::unique_ptr<core::orchestration::WorkerHealthOrchestrator> m_workerHealthOrchestrator;
+    std::unique_ptr<ui::settings::QtWorkerHealthEventAdapter> m_workerHealthEventAdapter;
+    std::unique_ptr<ui::export_::QtExportClientAdapter> m_exportClientAdapter;
     std::unique_ptr<ui::mainwindow::MainWindow> m_mainWindow;
 };
 

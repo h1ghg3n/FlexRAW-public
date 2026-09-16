@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include <QIODevice>
 #include <QLabel>
 #include <QProgressBar>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QToolButton>
@@ -17,16 +19,21 @@
 
 #include "catalog_editor_facade.h"
 #include "catalog_orchestrator.h"
+#include "catalog_session_orchestrator.h"
 #include "catalog_thumbnail_orchestrator.h"
 #include "catalog_thumbnail_pipeline.h"
 #include "editor_orchestrator.h"
 #include "export_orchestrator.h"
 #include "export_pipeline.h"
-#include "folder_scan_controller.h"
 #include "mainwindow.h"
 #include "preview_orchestrator.h"
 #include "preview_pipeline.h"
 #include "qt_activity_adapter.h"
+#include "qt_export_client_adapter.h"
+#include "qt_export_settings_adapter.h"
+#include "qt_source_resolution_event_source.h"
+#include "qt_worker_profile_settings_adapter.h"
+#include "test_path_identity_service.h"
 
 namespace flexraw::ui::mainwindow
 {
@@ -58,16 +65,24 @@ public:
         : previewOrchestrator(std::make_unique<DormantActivityPreviewPipeline>()),
           catalogThumbnailOrchestrator(std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>()),
           editorOrchestrator(previewOrchestrator, catalogOrchestrator),
-          catalogEditorFacade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator),
-          activityAdapter(std::make_unique<QtActivityAdapter>(catalogEditorFacade, folderScanController))
+          catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator),
+          sourceResolutionEventSource(catalogOrchestrator),
+          catalogEditorFacade(catalogOrchestrator,
+                              catalogSessionOrchestrator,
+                              catalogThumbnailOrchestrator,
+                              editorOrchestrator,
+                              sourceResolutionEventSource),
+          activityAdapter(std::make_unique<QtActivityAdapter>(
+              catalogEditorFacade, catalogEditorFacade, catalogEditorFacade, catalogEditorFacade, catalogEditorFacade))
     {}
 
     core::orchestration::PreviewOrchestrator previewOrchestrator;
     core::orchestration::CatalogOrchestrator catalogOrchestrator;
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator;
     core::orchestration::EditorOrchestrator editorOrchestrator;
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator;
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource;
     facade::CatalogEditorFacade catalogEditorFacade;
-    FolderScanController folderScanController;
     std::unique_ptr<QtActivityAdapter> activityAdapter;
 };
 
@@ -92,6 +107,28 @@ public:
     return events.size() >= expectedCount;
 }
 
+// 목적: Qt delivery를 처리하며 지정 kind의 Activity terminal을 기다림
+// 입력: events: callback 누적 event, kind: 찾을 Activity 종류, timeoutMs: 제한 시간
+// 출력: 제한 시간 안에 matching terminal을 받으면 true
+[[nodiscard]] bool waitForActivityTerminal(const std::vector<core::client::ActivityEvent>& events,
+                                           core::client::ActivityKind kind,
+                                           int timeoutMs = 3000)
+{
+    QElapsedTimer timeout;
+    timeout.start();
+    const auto hasTerminal = [&events, kind] {
+        return std::any_of(events.cbegin(), events.cend(), [kind](const core::client::ActivityEvent& event) {
+            return event.terminal.has_value() && event.terminal->id.kind == kind;
+        });
+    };
+    while (timeout.elapsed() < timeoutMs && !hasTerminal())
+    {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    return hasTerminal();
+}
+
 // 목적: source verification Activity test용 file 생성
 // 입력: path: 기록할 source path, contents: fingerprint bytes
 // 출력: 전체 bytes 기록 성공 여부
@@ -100,6 +137,16 @@ public:
     QFile file(path);
     return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(contents) == contents.size() &&
            file.flush();
+}
+
+// 목적: Activity accepted event가 cancellation 전에 terminal과 경합하지 않도록 충분히 큰 source file 생성
+// 입력: path: 기록할 source path
+// 출력: 256 MiB 크기 설정과 flush 성공 여부
+[[nodiscard]] bool writeLargeSourceFile(const QString& path)
+{
+    constexpr qint64 TestSourceSize = 256LL * 1024LL * 1024LL;
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.resize(TestSourceSize) && file.flush();
 }
 
 TEST(QtActivityAdapterTest, DeliversInitialEmptySnapshotAsynchronouslyOnQtContext)
@@ -140,8 +187,8 @@ TEST(QtActivityAdapterTest, PreservesPreviewStartAndTerminalOrdering)
     ASSERT_TRUE(waitForActivityEvents(events, 1));
     events.clear();
 
-    context.catalogEditorFacade.previewStarted(41);
-    context.catalogEditorFacade.previewCompleted(41);
+    context.editorOrchestrator.previewStarted(41);
+    context.editorOrchestrator.previewCompleted(41);
     EXPECT_TRUE(events.empty());
     ASSERT_TRUE(waitForActivityEvents(events, 2));
 
@@ -164,7 +211,7 @@ TEST(QtActivityAdapterTest, RoutesSourceCancellationAndPublishesTerminalEvent)
     ASSERT_TRUE(directory.isValid());
     const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("source.jpg"));
     const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
-    ASSERT_TRUE(writeSourceFile(sourcePath));
+    ASSERT_TRUE(writeLargeSourceFile(sourcePath));
     ActivityAdapterContext context;
     std::vector<core::client::ActivityEvent> events;
     const core::client::ActivitySubscriptionResult subscription = context.activityAdapter->subscribeToActivities(
@@ -172,18 +219,23 @@ TEST(QtActivityAdapterTest, RoutesSourceCancellationAndPublishesTerminalEvent)
     ASSERT_TRUE(subscription.hasValue());
     ASSERT_TRUE(waitForActivityEvents(events, 1));
     events.clear();
-    ASSERT_TRUE(context.catalogEditorFacade.openCatalog(catalogPath).hasValue());
+    ASSERT_TRUE(context.catalogEditorFacade
+                    .openCatalog({catalogPath.toUtf8().toStdString(),
+                                  core::client::CatalogOpenMode::CreateNew,
+                                  core::client::CatalogReplacementPolicy::Reject})
+                    .hasValue());
     const core::catalog::CatalogEntry entry{
         {sourcePath, QStringLiteral("jpg"), QStringLiteral("source.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
-    const core::orchestration::CatalogImportResult imported = context.catalogEditorFacade.importScannedEntries({entry});
+    const core::orchestration::CatalogImportResult imported = context.catalogOrchestrator.importScannedEntries({entry});
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().fingerprintRequestIds.size());
     const core::client::ActivityId activityId{
         core::client::ActivityKind::SourceVerification,
         imported.value().fingerprintRequestIds.front(),
     };
+    ASSERT_TRUE(waitForActivityEvents(events, 1));
 
     const core::client::ActivityCancelResult cancelled = context.activityAdapter->cancelActivity(activityId);
 
@@ -213,7 +265,9 @@ TEST(QtActivityAdapterTest, ProjectsFolderScanAsNonCancellableActivity)
     ASSERT_TRUE(waitForActivityEvents(events, 1));
     events.clear();
 
-    context.folderScanController.scanFolder(directory.path());
+    const core::client::FolderOperationResult submitted =
+        context.catalogEditorFacade.submitFolderScan({directory.path().toUtf8().toStdString()});
+    ASSERT_TRUE(submitted.hasValue());
     ASSERT_TRUE(waitForActivityEvents(events, 2));
 
     ASSERT_EQ(2U, events.size());
@@ -228,6 +282,51 @@ TEST(QtActivityAdapterTest, ProjectsFolderScanAsNonCancellableActivity)
     EXPECT_EQ(core::client::ActivityTerminalState::Completed, events[1].terminal->state);
 }
 
+TEST(QtActivityAdapterTest, ProjectsFolderImportTerminalAfterCatalogPersistence)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    ASSERT_TRUE(writeSourceFile(QDir(directory.path()).filePath(QStringLiteral("imported.jpg"))));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ActivityAdapterContext context;
+    ASSERT_TRUE(context.catalogEditorFacade
+                    .openCatalog({catalogPath.toUtf8().toStdString(),
+                                  core::client::CatalogOpenMode::CreateNew,
+                                  core::client::CatalogReplacementPolicy::Reject})
+                    .hasValue());
+    std::vector<core::client::ActivityEvent> events;
+    const core::client::ActivitySubscriptionResult subscription = context.activityAdapter->subscribeToActivities(
+        [&events](const core::client::ActivityEvent& event) { events.push_back(event); });
+    ASSERT_TRUE(subscription.hasValue());
+    ASSERT_TRUE(waitForActivityEvents(events, 1));
+    events.clear();
+
+    const core::client::FolderOperationResult submitted = context.catalogEditorFacade.submitFolderImport(
+        {directory.path().toUtf8().toStdString(), context.catalogEditorFacade.catalogSnapshot().catalogPath});
+    ASSERT_TRUE(submitted.hasValue());
+    ASSERT_TRUE(waitForActivityTerminal(events, core::client::ActivityKind::FolderImport));
+
+    const core::client::ActivityId expectedId{core::client::ActivityKind::FolderImport, submitted.value().id.value};
+    const auto started = std::find_if(events.cbegin(), events.cend(), [&expectedId](const auto& event) {
+        return std::any_of(event.activeActivities.cbegin(),
+                           event.activeActivities.cend(),
+                           [&expectedId](const auto& activity) { return activity.id == expectedId; });
+    });
+    const auto terminal = std::find_if(events.cbegin(), events.cend(), [&expectedId](const auto& event) {
+        return event.terminal.has_value() && event.terminal->id == expectedId;
+    });
+    ASSERT_NE(events.cend(), started);
+    ASSERT_NE(events.cend(), terminal);
+    EXPECT_FALSE(std::find_if(started->activeActivities.cbegin(),
+                              started->activeActivities.cend(),
+                              [&expectedId](const auto& activity) { return activity.id == expectedId; })
+                     ->canCancel);
+    EXPECT_EQ(core::client::ActivityTerminalState::Completed, terminal->terminal->state);
+    const core::client::CatalogPhotoPageResult photos = context.catalogEditorFacade.queryPhotoPage({});
+    ASSERT_TRUE(photos.hasValue());
+    EXPECT_EQ(1U, photos.value().photos.size());
+}
+
 TEST(QtActivityAdapterTest, UnsubscribeAndAdapterDestructionSuppressQueuedCallbacks)
 {
     ActivityAdapterContext context;
@@ -238,7 +337,7 @@ TEST(QtActivityAdapterTest, UnsubscribeAndAdapterDestructionSuppressQueuedCallba
     core::client::ActivitySubscriptionHandle handle = subscription.value();
 
     handle->unsubscribe();
-    context.catalogEditorFacade.previewStarted(9);
+    context.editorOrchestrator.previewStarted(9);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     EXPECT_TRUE(events.empty());
     EXPECT_FALSE(handle->isActive());
@@ -257,8 +356,16 @@ TEST(QtActivityAdapterTest, MainWindowConsumesActivitySnapshotInStatusBar)
 {
     ActivityAdapterContext context;
     core::orchestration::ExportOrchestrator exportOrchestrator(
-        std::make_unique<core::orchestration::FileExportPipeline>());
-    MainWindow window(context.catalogEditorFacade, context.catalogOrchestrator, exportOrchestrator);
+        std::make_unique<core::orchestration::FileExportPipeline>(::flexraw::test::testPathIdentityService()));
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    QSettings applicationSettings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")),
+                                  QSettings::IniFormat);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(applicationSettings);
+    settings::QtExportSettingsAdapter exportDefaults(applicationSettings);
+    export_::QtExportClientAdapter exportAdapter(exportOrchestrator, workerProfiles);
+    MainWindow window(
+        context.catalogEditorFacade, exportAdapter, exportAdapter, exportDefaults, applicationSettings, workerProfiles);
     QLabel* label = window.findChild<QLabel*>(QStringLiteral("activityStatusLabel"));
     QProgressBar* progress = window.findChild<QProgressBar*>(QStringLiteral("activityProgressBar"));
     QToolButton* cancelButton = window.findChild<QToolButton*>(QStringLiteral("cancelActivityButton"));
@@ -270,14 +377,14 @@ TEST(QtActivityAdapterTest, MainWindowConsumesActivitySnapshotInStatusBar)
     EXPECT_TRUE(progress->isHidden());
     EXPECT_TRUE(cancelButton->isHidden());
 
-    context.catalogEditorFacade.previewStarted(73);
+    context.editorOrchestrator.previewStarted(73);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     EXPECT_FALSE(label->isHidden());
     EXPECT_FALSE(progress->isHidden());
     EXPECT_FALSE(cancelButton->isHidden());
     EXPECT_EQ(QObject::tr("Rendering preview..."), label->text());
 
-    context.catalogEditorFacade.previewCompleted(73);
+    context.editorOrchestrator.previewCompleted(73);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
     EXPECT_TRUE(label->isHidden());
     EXPECT_TRUE(progress->isHidden());

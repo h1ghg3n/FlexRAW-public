@@ -381,6 +381,19 @@ TEST_F(CatalogDatabaseTest, RejectsEmptyCatalogPath)
     EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
 }
 
+TEST_F(CatalogDatabaseTest, RejectsOuterWhitespaceWithoutOpeningASiblingCatalog)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath + QLatin1Char(' '));
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath));
+}
+
 TEST_F(CatalogDatabaseTest, RejectsMissingParentDirectory)
 {
     QTemporaryDir directory;

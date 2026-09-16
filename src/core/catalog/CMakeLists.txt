@@ -15,6 +15,8 @@ target_sources(flexraw_core_catalog PRIVATE
     catalog_photo_page.h
     catalog_photo_repository.cpp
     catalog_photo_repository.h
+    catalog_path.cpp
+    catalog_path.h
     catalog_project.h
     catalog_project_repository.cpp
     catalog_project_repository.h

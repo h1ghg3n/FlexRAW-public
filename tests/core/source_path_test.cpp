@@ -9,11 +9,18 @@ namespace
 
 TEST(SourcePathTest, NormalizesFolderSeparatorsAndSegments)
 {
-    EXPECT_EQ(QStringLiteral("C:/photos/session"),
-              normalizeSourceFolderPath(QStringLiteral(" C:\\photos\\session\\.\\ ")));
+    EXPECT_EQ(QStringLiteral("C:/photos/session"), normalizeSourceFolderPath(QStringLiteral("C:\\photos\\session\\.")));
     EXPECT_EQ(QStringLiteral("/photos/session"),
               normalizeSourceFolderPath(QStringLiteral("/photos/archive/../session")));
     EXPECT_TRUE(normalizeSourceFolderPath(QStringLiteral(" ")).isEmpty());
+}
+
+TEST(SourcePathTest, RejectsOuterWhitespaceInsteadOfChangingTheLocator)
+{
+    EXPECT_TRUE(normalizeSourceFolderPath(QStringLiteral(" /photos/session")).isEmpty());
+    EXPECT_TRUE(normalizeSourceFolderPath(QStringLiteral("/photos/session ")).isEmpty());
+    EXPECT_TRUE(sourceParentPath(QStringLiteral(" /photos/image.CR3")).isEmpty());
+    EXPECT_TRUE(sourceParentPath(QStringLiteral("/photos/image.CR3 ")).isEmpty());
 }
 
 TEST(SourcePathTest, DerivesDrivePosixAndUncParentsLexically)

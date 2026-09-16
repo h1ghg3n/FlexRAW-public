@@ -58,7 +58,6 @@ struct CatalogIssue
 };
 
 using CatalogSessionResult = types::Result<CatalogSessionState, types::CoreError>;
-using CatalogFolderListResult = types::Result<QVector<catalog::CatalogFolderSummary>, types::CoreError>;
 using CatalogPhotoPageResult = types::Result<catalog::CatalogPhotoPage, types::CoreError>;
 using CatalogProjectResult = types::Result<catalog::CatalogProjectRecord, types::CoreError>;
 using CatalogProjectListResult = types::Result<QVector<catalog::CatalogProjectRecord>, types::CoreError>;

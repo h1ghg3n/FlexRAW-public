@@ -1,4 +1,6 @@
+#include <filesystem>
 #include <memory>
+#include <system_error>
 
 #include <QCoreApplication>
 #include <QDir>
@@ -60,12 +62,12 @@ void ensureCoreApplication()
 }
 
 // 목적: shutdown persistence가 선택할 custom Catalog를 만들고 active session으로 전환
-// 입력: session: 현재 기본 Catalog owner, catalogPath: 생성할 custom Catalog 경로
+// 입력: orchestrator: 현재 Catalog resource owner, catalogPath: 생성할 custom Catalog 경로
 // 출력: custom Catalog open 성공 여부
-[[nodiscard]] bool switchToCatalog(ManagedCatalogSession& session, const QString& catalogPath)
+[[nodiscard]] bool switchToCatalog(core::orchestration::CatalogOrchestrator& orchestrator, const QString& catalogPath)
 {
-    (void)session.orchestrator().closeCatalog();
-    return session.orchestrator().openCatalog(catalogPath).hasValue();
+    (void)orchestrator.closeCatalog();
+    return orchestrator.openCatalog(catalogPath).hasValue();
 }
 
 // 목적: corruption recovery test에 사용할 비-SQLite file content 기록
@@ -86,6 +88,17 @@ void ensureCoreApplication()
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
 }
 
+// 목적: Managed Catalog recovery 비교에 사용할 기존 Catalog hard-link alias 생성
+// 입력: existingPath/linkPath: 기본 Catalog와 설정에 기록할 alias 경로
+// 출력: hard link 생성 성공 여부
+[[nodiscard]] bool createHardLink(const QString& existingPath, const QString& linkPath)
+{
+    std::error_code error;
+    std::filesystem::create_hard_link(
+        QFileInfo(existingPath).filesystemAbsoluteFilePath(), QFileInfo(linkPath).filesystemAbsoluteFilePath(), error);
+    return !error;
+}
+
 TEST(ManagedCatalogSessionTest, CreatesAndReopensDefaultCatalog)
 {
     ensureCoreApplication();
@@ -97,7 +110,8 @@ TEST(ManagedCatalogSessionTest, CreatesAndReopensDefaultCatalog)
         QDir(directory.path()).filePath(QStringLiteral("managed/Flexraw.flexraw-catalog"));
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
         const ManagedCatalogStartupState& startup = session.startupState();
         ASSERT_TRUE(startup.session.isOpen);
         EXPECT_EQ(startup.session.catalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
@@ -107,12 +121,33 @@ TEST(ManagedCatalogSessionTest, CreatesAndReopensDefaultCatalog)
         EXPECT_TRUE(QFileInfo::exists(defaultCatalogPath));
     }
 
-    ManagedCatalogSession reopened(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator reopenedCatalogOrchestrator;
+    ManagedCatalogSession reopened(reopenedCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     const ManagedCatalogStartupState& startup = reopened.startupState();
     ASSERT_TRUE(startup.session.isOpen);
     EXPECT_EQ(startup.requestedCatalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
     EXPECT_FALSE(startup.usedFallback);
     EXPECT_FALSE(startup.recoveryIssue.has_value());
+}
+
+TEST(ManagedCatalogSessionTest, DoesNotOwnInjectedCatalogResourceLifetime)
+{
+    ensureCoreApplication();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+
+    const QString settingsPath = QDir(directory.path()).filePath(QStringLiteral("settings.ini"));
+    const QString defaultCatalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    core::orchestration::CatalogOrchestrator catalogOrchestrator;
+
+    {
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(session.startupState().session.isOpen);
+    }
+
+    const core::orchestration::CatalogSessionState state = catalogOrchestrator.state();
+    EXPECT_TRUE(state.isOpen);
+    EXPECT_EQ(state.catalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
 }
 
 TEST(ManagedCatalogSessionTest, RemembersLastActiveCatalogAcrossCleanShutdown)
@@ -126,13 +161,43 @@ TEST(ManagedCatalogSessionTest, RemembersLastActiveCatalogAcrossCleanShutdown)
     const QString customCatalogPath = QDir(directory.path()).filePath(QStringLiteral("custom.flexraw-catalog"));
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
-        ASSERT_TRUE(switchToCatalog(session, customCatalogPath));
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(switchToCatalog(catalogOrchestrator, customCatalogPath));
     }
 
-    ManagedCatalogSession reopened(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator reopenedCatalogOrchestrator;
+    ManagedCatalogSession reopened(reopenedCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     ASSERT_TRUE(reopened.startupState().session.isOpen);
     EXPECT_EQ(reopened.startupState().session.catalogPath, QFileInfo(customCatalogPath).absoluteFilePath());
+    EXPECT_FALSE(reopened.startupState().usedFallback);
+}
+
+TEST(ManagedCatalogSessionTest, OpensManagedCatalogWhenConfiguredInsteadOfLastActiveCatalog)
+{
+    ensureCoreApplication();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+
+    const QString settingsPath = QDir(directory.path()).filePath(QStringLiteral("settings.ini"));
+    const QString defaultCatalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    const QString customCatalogPath = QDir(directory.path()).filePath(QStringLiteral("custom.flexraw-catalog"));
+
+    {
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(switchToCatalog(catalogOrchestrator, customCatalogPath));
+    }
+
+    core::orchestration::CatalogOrchestrator reopenedCatalogOrchestrator;
+    ManagedCatalogSession reopened(reopenedCatalogOrchestrator,
+                                   makeSettings(settingsPath),
+                                   defaultCatalogPath,
+                                   core::client::CatalogStartupBehavior::OpenManagedCatalog);
+
+    ASSERT_TRUE(reopened.startupState().session.isOpen);
+    EXPECT_EQ(reopened.startupState().requestedCatalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
+    EXPECT_EQ(reopened.startupState().session.catalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
     EXPECT_FALSE(reopened.startupState().usedFallback);
 }
 
@@ -156,10 +221,11 @@ TEST(ManagedCatalogSessionTest, RestoresActivatedEditorStateAfterApplicationRest
     editedParams.contrast = 0.15F;
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
         auto pipeline = std::make_unique<DormantPreviewPipeline>();
         core::orchestration::PreviewOrchestrator previewOrchestrator(std::move(pipeline));
-        core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, session.orchestrator());
+        core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
         const core::orchestration::EditorStateResult activated =
             editorOrchestrator.activatePhoto(entry, QSize{640, 480});
         ASSERT_TRUE(activated.hasValue());
@@ -170,10 +236,11 @@ TEST(ManagedCatalogSessionTest, RestoresActivatedEditorStateAfterApplicationRest
         ASSERT_TRUE(editorOrchestrator.saveCurrentPhoto().hasValue());
     }
 
-    ManagedCatalogSession reopened(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator reopenedCatalogOrchestrator;
+    ManagedCatalogSession reopened(reopenedCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     auto pipeline = std::make_unique<DormantPreviewPipeline>();
     core::orchestration::PreviewOrchestrator previewOrchestrator(std::move(pipeline));
-    core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, reopened.orchestrator());
+    core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, reopenedCatalogOrchestrator);
     const core::orchestration::EditorStateResult restored =
         editorOrchestrator.selectCatalogPhoto(photoId, QSize{640, 480});
 
@@ -195,12 +262,14 @@ TEST(ManagedCatalogSessionTest, FallsBackWhenLastActiveCatalogIsMissing)
     const QString missingCatalogPath = QDir(directory.path()).filePath(QStringLiteral("missing.flexraw-catalog"));
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
-        ASSERT_TRUE(switchToCatalog(session, missingCatalogPath));
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(switchToCatalog(catalogOrchestrator, missingCatalogPath));
     }
     ASSERT_TRUE(QFile::remove(missingCatalogPath));
 
-    ManagedCatalogSession recovered(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator recoveredCatalogOrchestrator;
+    ManagedCatalogSession recovered(recoveredCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     const ManagedCatalogStartupState& startup = recovered.startupState();
     ASSERT_TRUE(startup.session.isOpen);
     EXPECT_EQ(startup.session.catalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
@@ -232,12 +301,14 @@ TEST(ManagedCatalogSessionTest, FallsBackWithoutReplacingCorruptLastActiveCatalo
     const QByteArray corruptContent("not-a-sqlite-catalog");
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
-        ASSERT_TRUE(switchToCatalog(session, corruptCatalogPath));
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(switchToCatalog(catalogOrchestrator, corruptCatalogPath));
     }
     ASSERT_TRUE(overwriteFile(corruptCatalogPath, corruptContent));
 
-    ManagedCatalogSession recovered(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator recoveredCatalogOrchestrator;
+    ManagedCatalogSession recovered(recoveredCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     const ManagedCatalogStartupState& startup = recovered.startupState();
     ASSERT_TRUE(startup.session.isOpen);
     EXPECT_EQ(startup.session.catalogPath, QFileInfo(defaultCatalogPath).absoluteFilePath());
@@ -260,12 +331,14 @@ TEST(ManagedCatalogSessionTest, ReportsFatalErrorWithoutOverwritingCorruptDefaul
     const QByteArray corruptContent("broken-default-catalog");
 
     {
-        ManagedCatalogSession session(makeSettings(settingsPath), defaultCatalogPath);
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
         ASSERT_TRUE(session.startupState().session.isOpen);
     }
     ASSERT_TRUE(overwriteFile(defaultCatalogPath, corruptContent));
 
-    ManagedCatalogSession failed(makeSettings(settingsPath), defaultCatalogPath);
+    core::orchestration::CatalogOrchestrator failedCatalogOrchestrator;
+    ManagedCatalogSession failed(failedCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
     const ManagedCatalogStartupState& startup = failed.startupState();
     EXPECT_FALSE(startup.session.isOpen);
     EXPECT_FALSE(startup.usedFallback);
@@ -273,6 +346,46 @@ TEST(ManagedCatalogSessionTest, ReportsFatalErrorWithoutOverwritingCorruptDefaul
     ASSERT_TRUE(startup.fatalError.has_value());
     EXPECT_EQ(startup.fatalError->code, core::types::ErrorCode::DatabaseError);
     EXPECT_EQ(readFile(defaultCatalogPath), corruptContent);
+}
+
+TEST(ManagedCatalogSessionTest, DoesNotFallbackThroughAnAliasOfTheFailedDefaultCatalog)
+{
+    ensureCoreApplication();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+
+    const QString settingsPath = QDir(directory.path()).filePath(QStringLiteral("settings.ini"));
+    const QString defaultCatalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    const QString aliasPath = QDir(directory.path()).filePath(QStringLiteral("managed-alias.flexraw-catalog"));
+    const QByteArray corruptContent("broken-default-catalog-alias");
+    {
+        core::orchestration::CatalogOrchestrator catalogOrchestrator;
+        ManagedCatalogSession session(catalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+        ASSERT_TRUE(session.startupState().session.isOpen);
+    }
+    if (!createHardLink(defaultCatalogPath, aliasPath))
+    {
+        GTEST_SKIP() << "The test filesystem does not support hard links.";
+    }
+    ASSERT_TRUE(overwriteFile(defaultCatalogPath, corruptContent));
+    {
+        QSettings settings(settingsPath, QSettings::IniFormat);
+        settings.beginGroup(QStringLiteral("catalog"));
+        settings.setValue(QStringLiteral("lastActivePath"), aliasPath);
+        settings.endGroup();
+        settings.sync();
+    }
+
+    core::orchestration::CatalogOrchestrator failedCatalogOrchestrator;
+    ManagedCatalogSession failed(failedCatalogOrchestrator, makeSettings(settingsPath), defaultCatalogPath);
+    const ManagedCatalogStartupState& startup = failed.startupState();
+
+    EXPECT_FALSE(startup.session.isOpen);
+    EXPECT_FALSE(startup.usedFallback);
+    ASSERT_TRUE(startup.recoveryIssue.has_value());
+    ASSERT_TRUE(startup.fatalError.has_value());
+    EXPECT_EQ(core::types::ErrorCode::DatabaseError, startup.fatalError->code);
+    EXPECT_EQ(corruptContent, readFile(defaultCatalogPath));
 }
 
 }  // namespace

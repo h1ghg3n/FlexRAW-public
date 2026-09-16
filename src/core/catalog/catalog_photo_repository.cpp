@@ -37,9 +37,9 @@ namespace
 // 출력: 유효 여부
 [[nodiscard]] bool isPersistableEntry(const CatalogEntry& entry)
 {
-    return !entry.file.path.trimmed().isEmpty() && !entry.file.extension.trimmed().isEmpty() &&
-           !entry.file.displayName.trimmed().isEmpty() && entry.file.kind != types::SupportedFileKind::Unknown &&
-           !sourceParentPath(entry.file.path).isEmpty();
+    return !entry.file.path.isEmpty() && entry.file.path == entry.file.path.trimmed() &&
+           !entry.file.extension.trimmed().isEmpty() && !entry.file.displayName.trimmed().isEmpty() &&
+           entry.file.kind != types::SupportedFileKind::Unknown && !sourceParentPath(entry.file.path).isEmpty();
 }
 
 // 목적: source 상태만 기록해도 되는 미해결 observation state인지 확인
@@ -100,7 +100,8 @@ namespace
     const types::SourceFingerprint fingerprint{
         query.value(7).toLongLong(), query.value(8).toLongLong(), query.value(9).toByteArray()};
 
-    if (!types::isValidPhotoId(photoId) || query.value(2).toString().trimmed().isEmpty() ||
+    const QString lastKnownPath = query.value(2).toString();
+    if (!types::isValidPhotoId(photoId) || lastKnownPath.isEmpty() || lastKnownPath != lastKnownPath.trimmed() ||
         !isSupportedFileKind(kindValue) || !isFileScanStatus(scanStatusValue) ||
         !isSourceBindingState(sourceStateValue) || !types::isValidSourceFingerprint(fingerprint))
     {
@@ -112,7 +113,7 @@ namespace
     if (!query.value(1).isNull())
     {
         const QString sourcePath = query.value(1).toString();
-        if (sourcePath.trimmed().isEmpty())
+        if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed())
         {
             return types::Result<CatalogPhotoRecord, types::CoreError>::failure(
                 makeDatabaseError(QStringLiteral("The catalog contains an empty source locator.")));
@@ -442,7 +443,7 @@ CatalogFolderQueryResult CatalogPhotoRepository::queryFolders() const
     while (query.next())
     {
         CatalogFolderSummary folder{query.value(0).toString(), query.value(1).toLongLong()};
-        if (folder.path.trimmed().isEmpty() || folder.photoCount <= 0)
+        if (folder.path.isEmpty() || folder.path != folder.path.trimmed() || folder.photoCount <= 0)
         {
             return CatalogFolderQueryResult::failure(
                 makeDatabaseError(QStringLiteral("The catalog contains an invalid folder summary.")));
@@ -488,10 +489,10 @@ CatalogPhotoRecordResult CatalogPhotoRepository::findById(types::PhotoId photoId
 // 출력: path에 binding된 record 또는 없으면 빈 값
 CatalogPhotoRecordResult CatalogPhotoRepository::findBySourcePath(const QString& sourcePath) const
 {
-    if (sourcePath.trimmed().isEmpty())
+    if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed())
     {
         return CatalogPhotoRecordResult::failure(
-            {types::ErrorCode::InvalidArgument, QStringLiteral("Source path is empty.")});
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Source path is empty or contains outer whitespace.")});
     }
 
     QSqlQuery query(m_database.m_database);

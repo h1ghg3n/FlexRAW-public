@@ -81,8 +81,8 @@ core::orchestration::RemoteExportExecutionResult RemoteExportExecutionAdapter::e
     }
     if (item.request.source.kind != core::types::SupportedFileKind::Raw || !item.request.developParams.has_value())
     {
-        return makeIneligible({core::types::ErrorCode::UnsupportedFormat,
-                               QStringLiteral("Remote export requires a resolved RAW item.")});
+        return makeIneligible(
+            {core::types::ErrorCode::UnsupportedFormat, QStringLiteral("Remote export requires a resolved RAW item.")});
     }
 
     RemoteWorkerProfile profile;
@@ -91,10 +91,8 @@ core::orchestration::RemoteExportExecutionResult RemoteExportExecutionAdapter::e
     profile.expectedSourceStorageId = QUuid::fromString(target.expectedSourceStorageId);
     profile.expectedOutputStorageId = QUuid::fromString(target.expectedOutputStorageId);
 
-    const core::render::ResolvedRenderRequest resolved{item.request.source.path,
-                                                       item.request.outputPath,
-                                                       *item.request.developParams,
-                                                       item.request.options};
+    const core::render::ResolvedRenderRequest resolved{
+        item.request.source.path, item.request.outputPath, *item.request.developParams, item.request.options};
     RemoteRenderPreflightResult mapped = prepareRemoteRenderRequest(profile, resolved);
     if (mapped.hasError())
     {
@@ -102,11 +100,12 @@ core::orchestration::RemoteExportExecutionResult RemoteExportExecutionAdapter::e
     }
 
     bool workerAccepted = false;
-    const RemoteRenderResult rendered = m_executor->execute(
-        profile.endpoint,
-        mapped.value(),
-        cancellationToken,
-        [&workerAccepted, &accepted] {
+    const RemoteRenderResult rendered =
+        m_executor->execute(profile.endpoint, mapped.value(), cancellationToken, [&workerAccepted, &accepted] {
+            if (workerAccepted)
+            {
+                return;
+            }
             workerAccepted = true;
             if (accepted)
             {
@@ -115,15 +114,18 @@ core::orchestration::RemoteExportExecutionResult RemoteExportExecutionAdapter::e
         });
     if (rendered.hasError())
     {
-        return core::orchestration::RemoteExportExecutionResult::failure(
-            {mapFailureCode(rendered.error().code),
-             rendered.error().cause,
-             rendered.error().retryAfter,
-             workerAccepted});
+        return core::orchestration::RemoteExportExecutionResult::failure({mapFailureCode(rendered.error().code),
+                                                                          rendered.error().cause,
+                                                                          rendered.error().retryAfter,
+                                                                          workerAccepted});
     }
 
     return core::orchestration::RemoteExportExecutionResult::success(
-        {item.request.source.path, item.request.outputPath, true, {}, core::orchestration::ExportItemFailureKind::None});
+        {item.request.source.path,
+         item.request.outputPath,
+         true,
+         {},
+         core::orchestration::ExportItemFailureKind::None});
 }
 
 }  // namespace flexraw::worker::client

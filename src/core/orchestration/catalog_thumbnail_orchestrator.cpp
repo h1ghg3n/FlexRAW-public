@@ -2,11 +2,15 @@
 
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
+#include <QByteArray>
+#include <QDir>
+#include <QFileInfo>
 #include <QFutureWatcher>
-#include <QSet>
 #include <QtConcurrentRun>
 
 namespace flexraw::core::orchestration
@@ -14,29 +18,131 @@ namespace flexraw::core::orchestration
 namespace
 {
 
-// 목적: thumbnail window request의 크기, target과 source 값 검증
-// 입력: request: UI adapter가 제출한 viewport source set
-// 출력: 유효하면 빈 값, 아니면 InvalidArgument 오류
-[[nodiscard]] std::optional<types::CoreError> validateWindowRequest(const CatalogThumbnailWindowRequest& request)
+struct ValidatedThumbnailItem
 {
-    if (request.sources.size() > MaximumCatalogThumbnailWindowSize)
+    client::CatalogThumbnailItemIdentity identity;
+    types::FileDescriptor source;
+};
+
+using ValidatedThumbnailItemResult = client::ClientResult<ValidatedThumbnailItem, client::ClientError>;
+
+// 목적: Catalog thumbnail contract validation 실패 생성
+// 입력: message: diagnostics 전용 UTF-8 설명
+// 출력: InvalidArgument client error
+[[nodiscard]] client::ClientError makeInvalidArgument(std::string message)
+{
+    return {client::ClientErrorCode::InvalidArgument, std::move(message)};
+}
+
+// 목적: contract UTF-8 byte string을 손실 없이 QString으로 변환
+// 입력: value: UTF-8로 선언된 client string
+// 출력: round-trip 가능한 Unicode 문자열 또는 invalid UTF-8이면 빈 값
+[[nodiscard]] std::optional<QString> decodeClientString(const std::string& value)
+{
+    const QByteArray bytes(value.data(), static_cast<qsizetype>(value.size()));
+    const QString decoded = QString::fromUtf8(bytes);
+    return decoded.toUtf8() == bytes ? std::optional<QString>{decoded} : std::nullopt;
+}
+
+// 목적: Qt-free file kind를 thumbnail pipeline 입력 enum으로 변환
+// 입력: kind: client contract file 분류
+// 출력: 지원되는 RAW/raster kind 또는 Unknown
+[[nodiscard]] types::SupportedFileKind toInternalFileKind(client::CatalogFileKind kind) noexcept
+{
+    switch (kind)
     {
-        return types::CoreError{types::ErrorCode::InvalidArgument,
-                                QStringLiteral("Catalog thumbnail window exceeds its bounded size.")};
+    case client::CatalogFileKind::Raw:
+        return types::SupportedFileKind::Raw;
+    case client::CatalogFileKind::RasterImage:
+        return types::SupportedFileKind::RasterImage;
+    case client::CatalogFileKind::Unknown:
+        return types::SupportedFileKind::Unknown;
     }
-    if (!request.sources.isEmpty() && (request.targetSize.width() <= 0 || request.targetSize.height() <= 0))
+    return types::SupportedFileKind::Unknown;
+}
+
+// 목적: tagged thumbnail identity를 window 중복 제거용 deterministic key로 변환
+// 입력: identity: Catalog PhotoId 또는 transient normalized locator
+// 출력: kind prefix를 포함한 window-local key
+[[nodiscard]] std::string identityKey(const client::CatalogThumbnailItemIdentity& identity)
+{
+    return identity.kind == client::CatalogThumbnailIdentityKind::CatalogPhoto
+               ? std::string("photo:") + std::to_string(identity.photoId.value)
+               : std::string("source:") + identity.transientSourceLocator;
+}
+
+// 목적: Qt-free thumbnail item identity와 locator를 pipeline 입력으로 검증·변환
+// 입력: item: tagged identity, normalized UTF-8 locator와 file metadata
+// 출력: internal descriptor 또는 InvalidArgument 오류
+[[nodiscard]] ValidatedThumbnailItemResult validateThumbnailItem(const client::CatalogThumbnailItem& item)
+{
+    const std::optional<QString> sourceLocator = decodeClientString(item.sourceLocator);
+    const std::optional<QString> extension = decodeClientString(item.extension);
+    const std::optional<QString> displayName = decodeClientString(item.displayName);
+    if (!sourceLocator.has_value() || !extension.has_value() || !displayName.has_value())
     {
-        return types::CoreError{types::ErrorCode::InvalidArgument,
-                                QStringLiteral("Catalog thumbnail target size must be positive.")};
+        return ValidatedThumbnailItemResult::failure(
+            makeInvalidArgument("Catalog thumbnail item contains invalid UTF-8 text."));
     }
-    for (const types::FileDescriptor& source : request.sources)
+
+    const QString normalizedLocator = QDir::cleanPath(QDir::fromNativeSeparators(sourceLocator->trimmed()));
+    if (normalizedLocator.isEmpty() || normalizedLocator == QStringLiteral(".") ||
+        !QFileInfo(normalizedLocator).isAbsolute() || normalizedLocator != *sourceLocator)
     {
-        if (source.path.isEmpty() ||
-            (source.kind != types::SupportedFileKind::Raw && source.kind != types::SupportedFileKind::RasterImage))
+        return ValidatedThumbnailItemResult::failure(
+            makeInvalidArgument("Catalog thumbnail source locator must be normalized and absolute."));
+    }
+
+    switch (item.identity.kind)
+    {
+    case client::CatalogThumbnailIdentityKind::CatalogPhoto:
+        if (item.identity.photoId.value <= 0 || !item.identity.transientSourceLocator.empty())
         {
-            return types::CoreError{types::ErrorCode::InvalidArgument,
-                                    QStringLiteral("Catalog thumbnail source is invalid.")};
+            return ValidatedThumbnailItemResult::failure(
+                makeInvalidArgument("Catalog thumbnail Photo identity is invalid."));
         }
+        break;
+    case client::CatalogThumbnailIdentityKind::TransientSource:
+        if (item.identity.photoId.value != 0 || item.identity.transientSourceLocator != item.sourceLocator)
+        {
+            return ValidatedThumbnailItemResult::failure(
+                makeInvalidArgument("Transient thumbnail identity must equal its normalized source locator."));
+        }
+        break;
+    default:
+        return ValidatedThumbnailItemResult::failure(
+            makeInvalidArgument("Catalog thumbnail identity kind is invalid."));
+    }
+
+    const types::SupportedFileKind kind = toInternalFileKind(item.kind);
+    if (kind != types::SupportedFileKind::Raw && kind != types::SupportedFileKind::RasterImage)
+    {
+        return ValidatedThumbnailItemResult::failure(
+            makeInvalidArgument("Catalog thumbnail file kind is unsupported."));
+    }
+
+    return ValidatedThumbnailItemResult::success({item.identity, {*sourceLocator, *extension, *displayName, kind}});
+}
+
+// 목적: thumbnail window의 bounded item 수와 target pixel extent 검증
+// 입력: command: frontend가 계산한 visible/adjacent window
+// 출력: 유효하면 빈 값, 아니면 InvalidArgument 오류
+[[nodiscard]] std::optional<client::ClientError> validateWindowCommand(
+    const client::ReplaceCatalogThumbnailWindowCommand& command)
+{
+    if (command.items.empty())
+    {
+        return makeInvalidArgument("Catalog thumbnail replacement window must not be empty; use clear instead.");
+    }
+    if (command.items.size() > client::MaximumCatalogThumbnailWindowSize)
+    {
+        return makeInvalidArgument("Catalog thumbnail window exceeds its bounded size.");
+    }
+    if (command.targetExtent.width == 0 || command.targetExtent.height == 0 ||
+        command.targetExtent.width > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        command.targetExtent.height > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    {
+        return makeInvalidArgument("Catalog thumbnail target extent must be a positive supported pixel size.");
     }
     return std::nullopt;
 }
@@ -54,8 +160,10 @@ CatalogThumbnailOrchestrator::CatalogThumbnailOrchestrator(std::unique_ptr<ICata
     {
         throw std::invalid_argument("Catalog thumbnail pipeline must not be null.");
     }
+    qRegisterMetaType<CatalogThumbnailWindowStarted>();
     qRegisterMetaType<CatalogThumbnailFrame>();
     qRegisterMetaType<CatalogThumbnailIssue>();
+    qRegisterMetaType<CatalogThumbnailWindowTerminal>();
     m_workerPool.setObjectName(QStringLiteral("CatalogThumbnailPool"));
     m_workerPool.setMaxThreadCount(1);
 }
@@ -66,9 +174,9 @@ CatalogThumbnailOrchestrator::CatalogThumbnailOrchestrator(std::unique_ptr<ICata
 CatalogThumbnailOrchestrator::~CatalogThumbnailOrchestrator()
 {
     m_acceptingRequests = false;
-    ++m_windowRevision;
     m_pendingJobs.clear();
     cancelActiveJobs();
+    m_activeWindow.reset();
     m_workerPool.clear();
     m_workerPool.waitForDone();
     for (ActiveJob& job : m_activeJobs)
@@ -79,40 +187,88 @@ CatalogThumbnailOrchestrator::~CatalogThumbnailOrchestrator()
     m_activeJobs.clear();
 }
 
-// 목적: 현재 viewport와 인접 범위에 필요한 source set으로 pending thumbnail window 교체
-// 입력: request: 최대 200개 source와 thumbnail target 크기
-// 출력: 수락 성공 또는 validation·shutdown 오류
-CatalogThumbnailWindowResult CatalogThumbnailOrchestrator::updateWindow(CatalogThumbnailWindowRequest request)
+// 목적: 현재 viewport와 인접 범위의 Qt-free tagged thumbnail window 교체
+// 입력: command: 최대 200개 item과 양수 target pixel 크기
+// 출력: owner generation과 중복 제거 item 수 또는 validation·shutdown 오류
+client::CatalogThumbnailWindowResult CatalogThumbnailOrchestrator::replaceThumbnailWindow(
+    const client::ReplaceCatalogThumbnailWindowCommand& command)
 {
     if (!m_acceptingRequests)
     {
-        return CatalogThumbnailWindowResult::failure(
-            {types::ErrorCode::Unknown, QStringLiteral("Catalog thumbnail orchestrator is shutting down.")});
+        return client::CatalogThumbnailWindowResult::failure(
+            {client::ClientErrorCode::Conflict, "Catalog thumbnail orchestrator is shutting down."});
     }
-    if (const std::optional<types::CoreError> error = validateWindowRequest(request); error.has_value())
+    if (const std::optional<client::ClientError> error = validateWindowCommand(command); error.has_value())
     {
-        return CatalogThumbnailWindowResult::failure(*error);
+        return client::CatalogThumbnailWindowResult::failure(*error);
     }
-    if (m_windowRevision == std::numeric_limits<quint64>::max())
+    if (m_windowRevision == std::numeric_limits<std::uint64_t>::max())
     {
-        return CatalogThumbnailWindowResult::failure(
-            {types::ErrorCode::Unknown, QStringLiteral("Catalog thumbnail window revision space is exhausted.")});
+        return client::CatalogThumbnailWindowResult::failure(
+            {client::ClientErrorCode::Unknown, "Catalog thumbnail window generation space is exhausted."});
     }
 
-    ++m_windowRevision;
-    cancelActiveJobs();
-    m_pendingJobs.clear();
-    QSet<QString> acceptedPaths;
-    for (types::FileDescriptor& source : request.sources)
+    QVector<PendingJob> validatedJobs;
+    validatedJobs.reserve(static_cast<qsizetype>(command.items.size()));
+    std::set<std::string> acceptedIdentities;
+    for (const client::CatalogThumbnailItem& item : command.items)
     {
-        if (!acceptedPaths.contains(source.path))
+        const ValidatedThumbnailItemResult validated = validateThumbnailItem(item);
+        if (validated.hasError())
         {
-            acceptedPaths.insert(source.path);
-            m_pendingJobs.push_back({m_windowRevision, std::move(source), request.targetSize});
+            return client::CatalogThumbnailWindowResult::failure(validated.error());
+        }
+        if (acceptedIdentities.insert(identityKey(validated.value().identity)).second)
+        {
+            validatedJobs.push_back({{}, validated.value().identity, validated.value().source, {}});
         }
     }
+
+    cancelCurrentWindow();
+    const client::CatalogThumbnailWindowGeneration generation{++m_windowRevision};
+    const client::CatalogThumbnailTargetExtent targetExtent = command.targetExtent;
+    const QSize targetSize{static_cast<int>(targetExtent.width), static_cast<int>(targetExtent.height)};
+    for (PendingJob& job : validatedJobs)
+    {
+        job.generation = generation;
+        job.targetSize = targetSize;
+    }
+    m_pendingJobs = std::move(validatedJobs);
+    const auto acceptedItemCount = static_cast<std::uint32_t>(m_pendingJobs.size());
+    m_activeWindow = ActiveWindow{generation, targetExtent, acceptedItemCount, 0};
+    const client::CatalogThumbnailWindowReceipt receipt{generation, acceptedItemCount};
+    emit thumbnailWindowStarted({receipt, targetExtent});
     startNextJob();
-    return CatalogThumbnailWindowResult::success(std::monostate{});
+    return client::CatalogThumbnailWindowResult::success(receipt);
+}
+
+// 목적: active thumbnail window와 pending decode를 idempotent하게 정리
+// 입력: 없음
+// 출력: active generation이 있으면 Cancelled terminal을 발행한 성공 또는 shutdown 오류
+client::CatalogThumbnailClearResult CatalogThumbnailOrchestrator::clearThumbnailWindow()
+{
+    if (!m_acceptingRequests)
+    {
+        return client::CatalogThumbnailClearResult::failure(
+            {client::ClientErrorCode::Conflict, "Catalog thumbnail orchestrator is shutting down."});
+    }
+    cancelCurrentWindow();
+    return client::CatalogThumbnailClearResult::success(std::monostate{});
+}
+
+// 목적: event adapter initial delivery에 사용할 current thumbnail lifecycle 조회
+// 입력: 없음
+// 출력: active generation, target과 요청·settled item count
+client::CatalogThumbnailWindowSnapshot CatalogThumbnailOrchestrator::thumbnailWindowSnapshot() const noexcept
+{
+    if (!m_activeWindow.has_value())
+    {
+        return {};
+    }
+    return {m_activeWindow->generation,
+            m_activeWindow->targetExtent,
+            m_activeWindow->requestedItemCount,
+            m_activeWindow->settledItemCount};
 }
 
 // 목적: worker slot이 비어 있으면 최신 window의 다음 thumbnail decode 시작
@@ -145,9 +301,9 @@ void CatalogThumbnailOrchestrator::startNextJob()
     }));
 }
 
-// 목적: background decode 결과를 stale filtering 후 terminal signal로 변환
+// 목적: background decode 결과를 tagged identity와 generation 기반 stale filtering 후 event로 변환
 // 입력: requestId: 완료된 active thumbnail 작업 identity
-// 출력: current window면 ready/failed signal 하나 발생 후 다음 작업 시작
+// 출력: current window면 frame/issue 하나와 마지막 item의 Completed terminal 발생
 void CatalogThumbnailOrchestrator::handleJobFinished(types::RequestId requestId)
 {
     auto iterator = m_activeJobs.find(requestId);
@@ -160,18 +316,56 @@ void CatalogThumbnailOrchestrator::handleJobFinished(types::RequestId requestId)
     m_activeJobs.erase(iterator);
     const CatalogThumbnailPipelineResult result = job.watcher->result();
     job.watcher->deleteLater();
-    if (job.request.windowRevision == m_windowRevision && !job.cancellationSource.token().isCancellationRequested())
+    const bool current = m_activeWindow.has_value() && job.request.generation == m_activeWindow->generation &&
+                         !job.cancellationSource.token().isCancellationRequested();
+    if (current)
     {
+        ++m_activeWindow->settledItemCount;
         if (result.hasValue())
         {
-            emit thumbnailReady({job.request.source.path, result.value()});
+            emit thumbnailReady({job.request.generation, job.request.identity, result.value()});
         }
-        else if (result.error().code != types::ErrorCode::Cancelled)
+        else
         {
-            emit thumbnailFailed({job.request.source.path, result.error()});
+            emit thumbnailFailed({job.request.generation, job.request.identity, result.error()});
         }
+        completeCurrentWindowIfSettled();
     }
     startNextJob();
+}
+
+// 목적: current thumbnail window의 pending/active 작업 취소와 exact terminal 확정
+// 입력: 없음
+// 출력: active window가 없고 stale worker 결과 publish가 차단됨
+void CatalogThumbnailOrchestrator::cancelCurrentWindow()
+{
+    if (!m_activeWindow.has_value())
+    {
+        m_pendingJobs.clear();
+        return;
+    }
+
+    const client::CatalogThumbnailWindowGeneration generation = m_activeWindow->generation;
+    cancelActiveJobs();
+    m_pendingJobs.clear();
+    m_activeWindow.reset();
+    emit thumbnailWindowTerminal({generation, client::CatalogThumbnailTerminalState::Cancelled, std::nullopt});
+}
+
+// 목적: current window의 모든 item이 settled되면 Completed terminal 확정
+// 입력: 없음
+// 출력: 완료 조건이면 active window가 제거되고 terminal signal 발생
+void CatalogThumbnailOrchestrator::completeCurrentWindowIfSettled()
+{
+    if (!m_activeWindow.has_value() || m_activeWindow->settledItemCount < m_activeWindow->requestedItemCount ||
+        !m_pendingJobs.isEmpty() || !m_activeJobs.isEmpty())
+    {
+        return;
+    }
+
+    const client::CatalogThumbnailWindowGeneration generation = m_activeWindow->generation;
+    m_activeWindow.reset();
+    emit thumbnailWindowTerminal({generation, client::CatalogThumbnailTerminalState::Completed, std::nullopt});
 }
 
 // 목적: active decode에 cooperative cancellation 요청

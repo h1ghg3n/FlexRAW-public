@@ -1,3 +1,5 @@
+#include <vector>
+
 #include <QApplication>
 #include <QItemSelection>
 #include <QItemSelectionModel>
@@ -198,15 +200,12 @@ TEST(CatalogListWidgetTest, MaterializesOnlyVisibleAndAdjacentThumbnailRows)
     CatalogListWidget widget;
     widget.resize(280, 240);
     widget.show();
-    QVector<QVector<core::types::FileDescriptor>> requestedWindows;
+    std::vector<core::client::ReplaceCatalogThumbnailWindowCommand> requestedWindows;
     QObject::connect(&widget,
                      &CatalogListWidget::thumbnailWindowChanged,
                      &widget,
-                     [&requestedWindows](const QVector<core::types::FileDescriptor>& sources, const QSize&) {
-                         if (!sources.isEmpty())
-                         {
-                             requestedWindows.push_back(sources);
-                         }
+                     [&requestedWindows](const core::client::ReplaceCatalogThumbnailWindowCommand& command) {
+                         requestedWindows.push_back(command);
                      });
     QVector<core::catalog::CatalogPhotoRecord> photos;
     for (int index = 0; index < 20; ++index)
@@ -218,13 +217,15 @@ TEST(CatalogListWidgetTest, MaterializesOnlyVisibleAndAdjacentThumbnailRows)
     QApplication::processEvents();
     QApplication::processEvents();
 
-    ASSERT_FALSE(requestedWindows.isEmpty());
-    const QVector<core::types::FileDescriptor> firstWindow = requestedWindows.back();
-    EXPECT_GT(firstWindow.size(), 0);
-    EXPECT_LT(firstWindow.size(), photos.size());
+    ASSERT_FALSE(requestedWindows.empty());
+    const core::client::ReplaceCatalogThumbnailWindowCommand firstWindow = requestedWindows.back();
+    ASSERT_FALSE(firstWindow.items.empty());
+    EXPECT_LT(firstWindow.items.size(), static_cast<std::size_t>(photos.size()));
+    EXPECT_EQ(core::client::CatalogThumbnailIdentityKind::CatalogPhoto, firstWindow.items.front().identity.kind);
+    widget.acceptThumbnailWindow({7});
     QImage thumbnail(2, 1, QImage::Format_RGB32);
     thumbnail.fill(Qt::blue);
-    widget.applyThumbnail(firstWindow.front().path, thumbnail);
+    widget.applyThumbnail({7}, firstWindow.items.front().identity, thumbnail);
     EXPECT_FALSE(widget.item(0)->icon().isNull());
 
     widget.verticalScrollBar()->setValue(widget.verticalScrollBar()->maximum());
@@ -233,8 +234,8 @@ TEST(CatalogListWidgetTest, MaterializesOnlyVisibleAndAdjacentThumbnailRows)
 
     EXPECT_TRUE(widget.item(0)->icon().isNull());
     ASSERT_GE(requestedWindows.size(), 2);
-    EXPECT_LT(requestedWindows.back().size(), photos.size());
-    EXPECT_NE(firstWindow.front().path, requestedWindows.back().front().path);
+    EXPECT_LT(requestedWindows.back().items.size(), static_cast<std::size_t>(photos.size()));
+    EXPECT_NE(firstWindow.items.front().identity, requestedWindows.back().items.front().identity);
 }
 
 }  // namespace

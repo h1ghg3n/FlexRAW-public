@@ -15,16 +15,13 @@ target_sources(flexraw_core_tests PRIVATE
     color_test.cpp
     folder_scanner_test.cpp
     develop_test.cpp
-    display_frame_test.cpp
     histogram_test.cpp
     measurement_test.cpp
     render_test.cpp
     develop_history_test.cpp
     export_test.cpp
     preview_cache_test.cpp
-    progressive_preview_controller_test.cpp
     raw_file_reader_test.cpp
-    standard_preview_worker_test.cpp
     source_binding_test.cpp
     source_fingerprint_test.cpp
     source_path_test.cpp

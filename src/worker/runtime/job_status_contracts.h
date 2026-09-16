@@ -23,6 +23,9 @@ struct RenderJobStatus
     RenderJobState state{RenderJobState::Queued};
 };
 
+// callback은 submit/cancel/shutdown caller 또는 worker thread에서 직렬 호출될 수 있다. callback 안에서는 snapshot 같은
+// read-only 조회만 허용하며 신속히 반환해야 한다. scheduler shutdown, owner 파괴 또는 callback lifetime 종료를 유발하면
+// 안 된다.
 using RenderJobStatusCallback = std::function<void(RenderJobStatus)>;
 
 // 목적: render job state가 더 이상 전이하지 않는 terminal 상태인지 판정

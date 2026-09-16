@@ -1,43 +1,46 @@
 #pragma once
 
-#include <variant>
+#include <optional>
 
 #include <QImage>
 #include <QMetaType>
-#include <QSize>
-#include <QString>
-#include <QVector>
 
+#include "catalog_thumbnail_client.h"
 #include "error.h"
-#include "file_types.h"
-#include "result.h"
 
 namespace flexraw::core::orchestration
 {
 
-inline constexpr int MaximumCatalogThumbnailWindowSize = 200;
-
-struct CatalogThumbnailWindowRequest
+struct CatalogThumbnailWindowStarted
 {
-    QVector<types::FileDescriptor> sources;
-    QSize targetSize;
+    client::CatalogThumbnailWindowReceipt receipt;
+    client::CatalogThumbnailTargetExtent targetExtent;
 };
 
 struct CatalogThumbnailFrame
 {
-    QString sourcePath;
+    client::CatalogThumbnailWindowGeneration generation;
+    client::CatalogThumbnailItemIdentity identity;
     QImage image;
 };
 
 struct CatalogThumbnailIssue
 {
-    QString sourcePath;
+    client::CatalogThumbnailWindowGeneration generation;
+    client::CatalogThumbnailItemIdentity identity;
     types::CoreError error;
 };
 
-using CatalogThumbnailWindowResult = types::Result<std::monostate, types::CoreError>;
+struct CatalogThumbnailWindowTerminal
+{
+    client::CatalogThumbnailWindowGeneration generation;
+    client::CatalogThumbnailTerminalState state{client::CatalogThumbnailTerminalState::Completed};
+    std::optional<types::CoreError> error;
+};
 
 }  // namespace flexraw::core::orchestration
 
+Q_DECLARE_METATYPE(flexraw::core::orchestration::CatalogThumbnailWindowStarted)
 Q_DECLARE_METATYPE(flexraw::core::orchestration::CatalogThumbnailFrame)
 Q_DECLARE_METATYPE(flexraw::core::orchestration::CatalogThumbnailIssue)
+Q_DECLARE_METATYPE(flexraw::core::orchestration::CatalogThumbnailWindowTerminal)

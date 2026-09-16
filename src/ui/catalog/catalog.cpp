@@ -1,6 +1,12 @@
 #include <algorithm>
+#include <cstddef>
+#include <optional>
+#include <string>
 #include <utility>
 
+#include <QByteArray>
+#include <QDir>
+#include <QFileInfo>
 #include <QItemSelectionModel>
 #include <QListWidgetItem>
 #include <QPixmap>
@@ -18,6 +24,60 @@ namespace
 
 constexpr QSize CatalogThumbnailSize{96, 72};
 constexpr int CatalogThumbnailRowHeight = 80;
+
+// 목적: QString을 길이를 보존한 Qt-free UTF-8 string으로 변환
+// 입력: value: source/display metadata text
+// 출력: 같은 Unicode text의 UTF-8 byte string
+[[nodiscard]] std::string toClientString(const QString& value)
+{
+    const QByteArray bytes = value.toUtf8();
+    return {bytes.constData(), static_cast<std::size_t>(bytes.size())};
+}
+
+// 목적: transient thumbnail identity에 사용할 absolute lexical source locator 생성
+// 입력: sourcePath: scanner 또는 Catalog record의 local path
+// 출력: separator와 dot segment를 정리한 UTF-8 absolute locator, 실패하면 빈 문자열
+[[nodiscard]] std::string normalizedSourceLocator(const QString& sourcePath)
+{
+    if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed())
+    {
+        return {};
+    }
+    const QString absolute = QFileInfo(QDir::fromNativeSeparators(sourcePath)).absoluteFilePath();
+    const QString normalized = QDir::cleanPath(QDir::fromNativeSeparators(absolute));
+    return normalized.isEmpty() || normalized == QStringLiteral(".") ? std::string{} : toClientString(normalized);
+}
+
+// 목적: internal file kind를 Qt-free Catalog thumbnail kind로 변환
+// 입력: kind: scanner/Catalog record file 분류
+// 출력: 같은 의미의 client enum
+[[nodiscard]] core::client::CatalogFileKind toClientFileKind(core::types::SupportedFileKind kind) noexcept
+{
+    switch (kind)
+    {
+    case core::types::SupportedFileKind::Raw:
+        return core::client::CatalogFileKind::Raw;
+    case core::types::SupportedFileKind::RasterImage:
+        return core::client::CatalogFileKind::RasterImage;
+    case core::types::SupportedFileKind::Unknown:
+        return core::client::CatalogFileKind::Unknown;
+    }
+    return core::client::CatalogFileKind::Unknown;
+}
+
+// 목적: tagged identity를 widget window/terminal set의 deterministic QString key로 변환
+// 입력: identity: stable PhotoId 또는 normalized transient locator
+// 출력: kind prefix를 포함한 presentation key
+[[nodiscard]] QString thumbnailIdentityKey(const core::client::CatalogThumbnailItemIdentity& identity)
+{
+    if (identity.kind == core::client::CatalogThumbnailIdentityKind::CatalogPhoto)
+    {
+        return QStringLiteral("photo:%1").arg(identity.photoId.value);
+    }
+    return QStringLiteral("source:") +
+           QString::fromUtf8(identity.transientSourceLocator.data(),
+                             static_cast<qsizetype>(identity.transientSourceLocator.size()));
+}
 
 }  // namespace
 
@@ -182,16 +242,11 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
     {
         if (m_photos.at(row).id.value == photo.id.value)
         {
-            const QString previousPath =
-                m_photos.at(row).source.has_value() ? m_photos.at(row).source->path : QString{};
             m_photos[row] = photo;
             item(row)->setText(photo.displayName);
             item(row)->setIcon({});
-            m_thumbnailTerminalPaths.remove(previousPath);
-            if (photo.source.has_value())
-            {
-                m_thumbnailTerminalPaths.remove(photo.source->path);
-            }
+            m_thumbnailTerminalKeys.remove(
+                thumbnailIdentityKey({core::client::CatalogThumbnailIdentityKind::CatalogPhoto, {photo.id.value}, {}}));
             break;
         }
     }
@@ -203,16 +258,11 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
         {
             if (m_photos.at(row).id.value == createdPhoto->id.value)
             {
-                const QString previousPath =
-                    m_photos.at(row).source.has_value() ? m_photos.at(row).source->path : QString{};
                 m_photos[row] = *createdPhoto;
                 item(row)->setText(createdPhoto->displayName);
                 item(row)->setIcon({});
-                m_thumbnailTerminalPaths.remove(previousPath);
-                if (createdPhoto->source.has_value())
-                {
-                    m_thumbnailTerminalPaths.remove(createdPhoto->source->path);
-                }
+                m_thumbnailTerminalKeys.remove(thumbnailIdentityKey(
+                    {core::client::CatalogThumbnailIdentityKind::CatalogPhoto, {createdPhoto->id.value}, {}}));
                 alreadyListed = true;
                 break;
             }
@@ -237,37 +287,62 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
     setCurrentRow(-1);
 }
 
-// 목적: current viewport thumbnail window에 해당하는 decoded image 적용
-// 입력: sourcePath: 결과 source identity, image: UI thread에서 QPixmap으로 변환할 frame
-// 출력: source가 여전히 adjacent window에 있을 때만 row icon 갱신
-void CatalogListWidget::applyThumbnail(const QString& sourcePath, const QImage& image)
+// 목적: current generation과 tagged identity에 해당하는 decoded image 적용
+// 입력: generation: accepted window identity, identity: Catalog PhotoId 또는 transient locator, image: Qt frame
+// 출력: item이 여전히 adjacent window에 있을 때만 row icon 갱신
+void CatalogListWidget::applyThumbnail(core::client::CatalogThumbnailWindowGeneration generation,
+                                       const core::client::CatalogThumbnailItemIdentity& identity,
+                                       const QImage& image)
 {
-    if (!m_thumbnailWindowPaths.contains(sourcePath) || image.isNull())
+    const QString key = thumbnailIdentityKey(identity);
+    if (!m_thumbnailWindowGeneration.has_value() || generation != *m_thumbnailWindowGeneration ||
+        !m_thumbnailWindowKeys.contains(key) || image.isNull())
     {
         return;
     }
 
     for (int row = 0; row < count(); ++row)
     {
-        const std::optional<core::types::FileDescriptor> source = thumbnailSourceAt(row);
-        if (source.has_value() && source->path == sourcePath)
+        const std::optional<core::client::CatalogThumbnailItem> thumbnail = thumbnailItemAt(row);
+        if (thumbnail.has_value() && thumbnail->identity == identity)
         {
             item(row)->setIcon(QPixmap::fromImage(image));
-            m_thumbnailTerminalPaths.insert(sourcePath);
+            m_thumbnailTerminalKeys.insert(key);
             return;
         }
     }
 }
 
-// 목적: current viewport source의 terminal thumbnail 실패 기록
-// 입력: sourcePath: 재요청 반복을 막을 source identity
+// 목적: current generation item의 terminal thumbnail 실패 기록
+// 입력: generation: accepted window identity, identity: 재요청 반복을 막을 tagged item identity
 // 출력: source가 window를 벗어나기 전까지 같은 decode 요청 생략
-void CatalogListWidget::markThumbnailFailed(const QString& sourcePath)
+void CatalogListWidget::markThumbnailFailed(core::client::CatalogThumbnailWindowGeneration generation,
+                                            const core::client::CatalogThumbnailItemIdentity& identity)
 {
-    if (m_thumbnailWindowPaths.contains(sourcePath))
+    const QString key = thumbnailIdentityKey(identity);
+    if (m_thumbnailWindowGeneration.has_value() && generation == *m_thumbnailWindowGeneration &&
+        m_thumbnailWindowKeys.contains(key))
     {
-        m_thumbnailTerminalPaths.insert(sourcePath);
+        m_thumbnailTerminalKeys.insert(key);
     }
+}
+
+// 목적: owner가 accepted한 generation을 이후 frame/issue filtering 기준으로 설정
+// 입력: generation: replace command receipt의 nonzero generation
+// 출력: 이전 generation event가 widget에 적용되지 않음
+void CatalogListWidget::acceptThumbnailWindow(core::client::CatalogThumbnailWindowGeneration generation)
+{
+    m_thumbnailWindowGeneration = generation.value == 0
+                                      ? std::nullopt
+                                      : std::optional<core::client::CatalogThumbnailWindowGeneration>{generation};
+}
+
+// 목적: rejected/cleared thumbnail command 뒤 event 적용 기준 제거
+// 입력: 없음
+// 출력: 새 generation accept 전까지 frame/issue가 적용되지 않음
+void CatalogListWidget::clearThumbnailWindowGeneration()
+{
+    m_thumbnailWindowGeneration.reset();
 }
 
 // 목적: 현재 catalog 목록과 선택 상태 초기화
@@ -276,9 +351,10 @@ void CatalogListWidget::markThumbnailFailed(const QString& sourcePath)
 void CatalogListWidget::clearEntries()
 {
     m_thumbnailRefreshTimer->stop();
-    m_thumbnailWindowPaths.clear();
-    m_thumbnailTerminalPaths.clear();
-    emit thumbnailWindowChanged({}, CatalogThumbnailSize);
+    m_thumbnailWindowKeys.clear();
+    m_thumbnailTerminalKeys.clear();
+    m_thumbnailWindowGeneration.reset();
+    emit thumbnailWindowCleared();
     clear();
     m_entries.clear();
     m_photos.clear();
@@ -309,8 +385,9 @@ void CatalogListWidget::refreshThumbnailWindow()
 {
     if (count() <= 0 || viewport()->height() <= 0)
     {
-        m_thumbnailWindowPaths.clear();
-        emit thumbnailWindowChanged({}, CatalogThumbnailSize);
+        m_thumbnailWindowKeys.clear();
+        m_thumbnailWindowGeneration.reset();
+        emit thumbnailWindowCleared();
         return;
     }
 
@@ -322,39 +399,48 @@ void CatalogListWidget::refreshThumbnailWindow()
     const int firstWindowRow = std::max(0, firstVisibleRow - visibleRowCount);
     const int lastWindowRow = std::min(count() - 1, lastVisibleRow + visibleRowCount);
 
-    QSet<QString> nextWindowPaths;
-    QVector<core::types::FileDescriptor> requestedSources;
+    QSet<QString> nextWindowKeys;
+    std::vector<core::client::CatalogThumbnailItem> requestedItems;
     for (int row = firstWindowRow; row <= lastWindowRow; ++row)
     {
-        const std::optional<core::types::FileDescriptor> source = thumbnailSourceAt(row);
-        if (!source.has_value())
+        const std::optional<core::client::CatalogThumbnailItem> thumbnail = thumbnailItemAt(row);
+        if (!thumbnail.has_value())
         {
             continue;
         }
-        nextWindowPaths.insert(source->path);
-        if (item(row)->icon().isNull() && !m_thumbnailTerminalPaths.contains(source->path))
+        const QString key = thumbnailIdentityKey(thumbnail->identity);
+        nextWindowKeys.insert(key);
+        if (item(row)->icon().isNull() && !m_thumbnailTerminalKeys.contains(key))
         {
-            requestedSources.push_back(*source);
+            requestedItems.push_back(*thumbnail);
         }
     }
 
     for (int row = 0; row < count(); ++row)
     {
-        const std::optional<core::types::FileDescriptor> source = thumbnailSourceAt(row);
-        if (source.has_value() && !nextWindowPaths.contains(source->path))
+        const std::optional<core::client::CatalogThumbnailItem> thumbnail = thumbnailItemAt(row);
+        if (thumbnail.has_value() && !nextWindowKeys.contains(thumbnailIdentityKey(thumbnail->identity)))
         {
             item(row)->setIcon({});
-            m_thumbnailTerminalPaths.remove(source->path);
+            m_thumbnailTerminalKeys.remove(thumbnailIdentityKey(thumbnail->identity));
         }
     }
-    m_thumbnailWindowPaths = std::move(nextWindowPaths);
-    emit thumbnailWindowChanged(requestedSources, CatalogThumbnailSize);
+    m_thumbnailWindowKeys = std::move(nextWindowKeys);
+    if (requestedItems.empty())
+    {
+        m_thumbnailWindowGeneration.reset();
+        emit thumbnailWindowCleared();
+        return;
+    }
+    emit thumbnailWindowChanged({std::move(requestedItems),
+                                 {static_cast<std::uint32_t>(CatalogThumbnailSize.width()),
+                                  static_cast<std::uint32_t>(CatalogThumbnailSize.height())}});
 }
 
-// 목적: row에 연결된 transient 또는 Catalog-backed file descriptor 반환
+// 목적: row를 Catalog PhotoId 또는 transient normalized locator thumbnail item으로 투영
 // 입력: row: 현재 list row index
-// 출력: source가 processing 가능하면 descriptor, 아니면 빈 값
-std::optional<core::types::FileDescriptor> CatalogListWidget::thumbnailSourceAt(int row) const
+// 출력: source가 processing 가능하면 Qt-free item, 아니면 빈 값
+std::optional<core::client::CatalogThumbnailItem> CatalogListWidget::thumbnailItemAt(int row) const
 {
     if (row < 0)
     {
@@ -363,11 +449,32 @@ std::optional<core::types::FileDescriptor> CatalogListWidget::thumbnailSourceAt(
     if (m_showingCatalogPhotos && row < m_photos.size() && m_photos.at(row).source.has_value())
     {
         const core::catalog::CatalogPhotoRecord& photo = m_photos.at(row);
-        return core::types::FileDescriptor{photo.source->path, photo.extension, photo.displayName, photo.kind};
+        const std::string locator = normalizedSourceLocator(photo.source->path);
+        if (locator.empty() || photo.id.value <= 0)
+        {
+            return std::nullopt;
+        }
+        return core::client::CatalogThumbnailItem{
+            {core::client::CatalogThumbnailIdentityKind::CatalogPhoto, {photo.id.value}, {}},
+            locator,
+            toClientString(photo.extension),
+            toClientString(photo.displayName),
+            toClientFileKind(photo.kind)};
     }
     if (!m_showingCatalogPhotos && row < m_entries.size())
     {
-        return m_entries.at(row).file;
+        const core::types::FileDescriptor& file = m_entries.at(row).file;
+        const std::string locator = normalizedSourceLocator(file.path);
+        if (locator.empty())
+        {
+            return std::nullopt;
+        }
+        return core::client::CatalogThumbnailItem{
+            {core::client::CatalogThumbnailIdentityKind::TransientSource, {}, locator},
+            locator,
+            toClientString(file.extension),
+            toClientString(file.displayName),
+            toClientFileKind(file.kind)};
     }
     return std::nullopt;
 }

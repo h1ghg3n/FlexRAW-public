@@ -9,6 +9,7 @@
 #include <QVector>
 
 #include "catalog_entry.h"
+#include "catalog_thumbnail_client.h"
 
 class QResizeEvent;
 class QTimer;
@@ -63,15 +64,28 @@ public:
                           const std::optional<core::catalog::CatalogPhotoRecord>& createdPhoto,
                           core::types::PhotoId selectedPhotoId);
 
-    // 목적: current viewport thumbnail window에 해당하는 decoded image 적용
-    // 입력: sourcePath: 결과 source identity, image: UI thread에서 QPixmap으로 변환할 frame
-    // 출력: source가 여전히 adjacent window에 있을 때만 row icon 갱신
-    void applyThumbnail(const QString& sourcePath, const QImage& image);
+    // 목적: current generation과 tagged identity에 해당하는 decoded image 적용
+    // 입력: generation: accepted window identity, identity: Catalog PhotoId 또는 transient locator, image: Qt frame
+    // 출력: item이 여전히 adjacent window에 있을 때만 row icon 갱신
+    void applyThumbnail(core::client::CatalogThumbnailWindowGeneration generation,
+                        const core::client::CatalogThumbnailItemIdentity& identity,
+                        const QImage& image);
 
-    // 목적: current viewport source의 terminal thumbnail 실패 기록
-    // 입력: sourcePath: 재요청 반복을 막을 source identity
+    // 목적: current generation item의 terminal thumbnail 실패 기록
+    // 입력: generation: accepted window identity, identity: 재요청 반복을 막을 tagged item identity
     // 출력: source가 window를 벗어나기 전까지 같은 decode 요청 생략
-    void markThumbnailFailed(const QString& sourcePath);
+    void markThumbnailFailed(core::client::CatalogThumbnailWindowGeneration generation,
+                             const core::client::CatalogThumbnailItemIdentity& identity);
+
+    // 목적: owner가 accepted한 generation을 이후 frame/issue filtering 기준으로 설정
+    // 입력: generation: replace command receipt의 nonzero generation
+    // 출력: 이전 generation event가 widget에 적용되지 않음
+    void acceptThumbnailWindow(core::client::CatalogThumbnailWindowGeneration generation);
+
+    // 목적: rejected/cleared thumbnail command 뒤 event 적용 기준 제거
+    // 입력: 없음
+    // 출력: 새 generation accept 전까지 frame/issue가 적용되지 않음
+    void clearThumbnailWindowGeneration();
 
     // 목적: 현재 catalog 목록과 선택 상태 초기화
     // 입력: 없음
@@ -89,10 +103,15 @@ signals:
     // 출력: 없음
     void photoSelected(const core::catalog::CatalogPhotoRecord& photo);
 
-    // 목적: viewport와 앞뒤 인접 범위에 필요한 bounded thumbnail source set 전달
-    // 입력: sources: 현재 row에서 materialize할 file descriptor, targetSize: icon 최대 크기
+    // 목적: viewport와 앞뒤 인접 범위에 필요한 Qt-free bounded thumbnail window 전달
+    // 입력: command: tagged identity, normalized locator와 target extent
     // 출력: 없음
-    void thumbnailWindowChanged(const QVector<core::types::FileDescriptor>& sources, const QSize& targetSize);
+    void thumbnailWindowChanged(const core::client::ReplaceCatalogThumbnailWindowCommand& command);
+
+    // 목적: 표시할 thumbnail item이 없을 때 active owner window 정리 요청
+    // 입력: 없음
+    // 출력: 없음
+    void thumbnailWindowCleared();
 
 protected:
     // 목적: viewport 크기 변경을 adjacent thumbnail window 재계산으로 변환
@@ -116,17 +135,20 @@ private:
     // 출력: 범위 밖 QPixmap 해제 및 아직 terminal 결과가 없는 source 요청
     void refreshThumbnailWindow();
 
-    // 목적: row에 연결된 transient 또는 Catalog-backed file descriptor 반환
+    // 목적: row를 Catalog PhotoId 또는 transient normalized locator thumbnail item으로 투영
     // 입력: row: 현재 list row index
-    // 출력: source가 processing 가능하면 descriptor, 아니면 빈 값
-    [[nodiscard]] std::optional<core::types::FileDescriptor> thumbnailSourceAt(int row) const;
+    // 출력: source가 processing 가능하면 Qt-free item, 아니면 빈 값
+    [[nodiscard]] std::optional<core::client::CatalogThumbnailItem> thumbnailItemAt(int row) const;
 
     QVector<core::catalog::CatalogEntry> m_entries;
     QVector<core::catalog::CatalogPhotoRecord> m_photos;
-    QSet<QString> m_thumbnailWindowPaths;
-    QSet<QString> m_thumbnailTerminalPaths;
+    QSet<QString> m_thumbnailWindowKeys;
+    QSet<QString> m_thumbnailTerminalKeys;
+    std::optional<core::client::CatalogThumbnailWindowGeneration> m_thumbnailWindowGeneration;
     QTimer* m_thumbnailRefreshTimer{nullptr};
     bool m_showingCatalogPhotos{false};
 };
 
 }  // namespace flexraw::ui::catalog
+
+Q_DECLARE_METATYPE(flexraw::core::client::ReplaceCatalogThumbnailWindowCommand)

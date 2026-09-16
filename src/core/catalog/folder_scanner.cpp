@@ -27,14 +27,13 @@ namespace {
 // 출력: 검증된 QFileInfo 또는 구조화된 오류
 [[nodiscard]] types::Result<QFileInfo, types::CoreError> validateFolderPath(const QString& folderPath)
 {
-    const QString normalizedPath = folderPath.trimmed();
-
-    if (normalizedPath.isEmpty()) {
-        return types::Result<QFileInfo, types::CoreError>::failure(
-            makeError(types::ErrorCode::InvalidArgument, QStringLiteral("Folder path is empty.")));
+    if (folderPath.isEmpty() || folderPath != folderPath.trimmed())
+    {
+        return types::Result<QFileInfo, types::CoreError>::failure(makeError(
+            types::ErrorCode::InvalidArgument, QStringLiteral("Folder path is empty or contains outer whitespace.")));
     }
 
-    const QFileInfo folderInfo(normalizedPath);
+    const QFileInfo folderInfo(folderPath);
 
     if (!folderInfo.exists()) {
         return types::Result<QFileInfo, types::CoreError>::failure(

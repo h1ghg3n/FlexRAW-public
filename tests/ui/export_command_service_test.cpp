@@ -79,12 +79,12 @@ TEST(ExportCommandServiceTest, ParsesRawExportOptions)
 TEST(ExportCommandServiceTest, JoinsLineWrappedQuotedPath)
 {
     const RasterExportCommandParseResult parsed = ExportCommandService::parseRawCommand(QStringLiteral(
-        "export raw --input \"D:\\Photos\\input.raw\" --output \"D:\\Output\\very-long-sample-\n"
+        "export raw --input \"D:\\Photos\\input.raw\" --output \"D:\\Output\\sample-export-\n"
         "  oriented.jpg\" --format jpeg"));
 
     ASSERT_TRUE(parsed.recognized);
     ASSERT_TRUE(parsed.valid);
-    EXPECT_EQ(QStringLiteral("D:\\Output\\very-long-sample-oriented.jpg"), parsed.command.outputPath);
+    EXPECT_EQ(QStringLiteral("D:\\Output\\sample-export-oriented.jpg"), parsed.command.outputPath);
 }
 
 TEST(ExportCommandServiceTest, ParsesBatchExportOptions)

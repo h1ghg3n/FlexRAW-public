@@ -28,10 +28,10 @@ constexpr qint64 HashChunkSize = 1024 * 1024;
 // 출력: 검증된 QFileInfo 또는 argument·not-found·permission 오류
 [[nodiscard]] types::Result<QFileInfo, types::CoreError> validateSource(const types::SourceLocator& locator)
 {
-    if (locator.path.trimmed().isEmpty())
+    if (locator.path.isEmpty() || locator.path != locator.path.trimmed())
     {
         return types::Result<QFileInfo, types::CoreError>::failure(
-            {types::ErrorCode::InvalidArgument, QStringLiteral("Source path is empty.")});
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Source path is empty or contains outer whitespace.")});
     }
 
     const QFileInfo fileInfo(locator.path);

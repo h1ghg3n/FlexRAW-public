@@ -77,6 +77,11 @@ public:
     [[nodiscard]] ExportSchedulingMetrics schedulingMetrics() const;
 
 signals:
+    // 목적: validation을 통과하고 owner state에 등록된 Export request identity 전달
+    // 입력: requestId: accepted aggregate request identity
+    // 출력: 없음
+    void exportAccepted(types::RequestId requestId);
+
     // 목적: active export request의 누적 진행 상태 전달
     // 입력: progress: request identity, 완료/성공/실패 수와 현재 source
     // 출력: 없음

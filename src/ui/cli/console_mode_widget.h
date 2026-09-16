@@ -5,11 +5,14 @@
 class QLineEdit;
 class QPlainTextEdit;
 
-namespace flexraw::core::orchestration
+namespace flexraw::core::client
 {
-class CatalogOrchestrator;
-class ExportOrchestrator;
-}  // namespace flexraw::core::orchestration
+class IFolderImportClient;
+class IFolderImportEventSource;
+class IExportClient;
+class IExportDefaultsClient;
+class IExportEventSource;
+}  // namespace flexraw::core::client
 
 namespace flexraw::ui::cli
 {
@@ -22,10 +25,13 @@ class ConsoleModeWidget : public QWidget
 
 public:
     // 목적: 전체 화면 console mode surface 초기화
-    // 입력: catalogOrchestrator: active catalog use case, exportOrchestrator: shared export use case, parent: Qt 부모
-    // widget 출력: 초기화된 ConsoleModeWidget 객체
-    ConsoleModeWidget(core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                      core::orchestration::ExportOrchestrator& exportOrchestrator,
+    // 입력: Folder/Export command/event와 Export default contract, parent: Qt 부모 widget
+    // 출력: 초기화된 ConsoleModeWidget 객체
+    ConsoleModeWidget(core::client::IFolderImportClient& folderImportClient,
+                      core::client::IFolderImportEventSource& folderImportEventSource,
+                      core::client::IExportClient& exportClient,
+                      core::client::IExportEventSource& exportEventSource,
+                      core::client::IExportDefaultsClient& exportDefaultsClient,
                       QWidget* parent = nullptr);
 
     // 목적: command 입력 필드에 keyboard focus 부여

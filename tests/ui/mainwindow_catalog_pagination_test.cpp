@@ -3,6 +3,7 @@
 #include <QComboBox>
 #include <QDir>
 #include <QImage>
+#include <QSettings>
 #include <QSlider>
 #include <QSplitter>
 #include <QTemporaryDir>
@@ -15,6 +16,7 @@
 #include "catalog_list_widget.h"
 #include "catalog_orchestrator.h"
 #include "catalog_photo_repository.h"
+#include "catalog_session_orchestrator.h"
 #include "catalog_thumbnail_orchestrator.h"
 #include "catalog_thumbnail_pipeline.h"
 #include "develop_panel.h"
@@ -24,7 +26,12 @@
 #include "mainwindow.h"
 #include "preview_orchestrator.h"
 #include "preview_pipeline.h"
+#include "qt_export_client_adapter.h"
+#include "qt_export_settings_adapter.h"
+#include "qt_source_resolution_event_source.h"
+#include "qt_worker_profile_settings_adapter.h"
 #include "source_fingerprint.h"
+#include "test_path_identity_service.h"
 
 namespace flexraw::ui::mainwindow
 {
@@ -123,11 +130,22 @@ TEST(MainWindowCatalogPaginationTest, FinishesAndPersistsAdjustmentBeforePageNav
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    facade::CatalogEditorFacade catalogEditorFacade(
-        catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    facade::CatalogEditorFacade catalogEditorFacade(catalogOrchestrator,
+                                                    catalogSessionOrchestrator,
+                                                    catalogThumbnailOrchestrator,
+                                                    editorOrchestrator,
+                                                    sourceResolutionEventSource);
     core::orchestration::ExportOrchestrator exportOrchestrator(
-        std::make_unique<core::orchestration::FileExportPipeline>());
-    MainWindow window(catalogEditorFacade, catalogOrchestrator, exportOrchestrator);
+        std::make_unique<core::orchestration::FileExportPipeline>(::flexraw::test::testPathIdentityService()));
+    QSettings applicationSettings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")),
+                                  QSettings::IniFormat);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(applicationSettings);
+    settings::QtExportSettingsAdapter exportDefaults(applicationSettings);
+    export_::QtExportClientAdapter exportAdapter(exportOrchestrator, workerProfiles);
+    MainWindow window(
+        catalogEditorFacade, exportAdapter, exportAdapter, exportDefaults, applicationSettings, workerProfiles);
     QToolButton* previousButton = window.findChild<QToolButton*>(QStringLiteral("catalogPreviousPageButton"));
     QToolButton* nextButton = window.findChild<QToolButton*>(QStringLiteral("catalogNextPageButton"));
     auto* developPanel = window.findChild<editor::DevelopPanel*>();
@@ -194,11 +212,22 @@ TEST(MainWindowCatalogPaginationTest, SelectsExactFolderScopeAndKeepsScopedPageN
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    facade::CatalogEditorFacade catalogEditorFacade(
-        catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    facade::CatalogEditorFacade catalogEditorFacade(catalogOrchestrator,
+                                                    catalogSessionOrchestrator,
+                                                    catalogThumbnailOrchestrator,
+                                                    editorOrchestrator,
+                                                    sourceResolutionEventSource);
     core::orchestration::ExportOrchestrator exportOrchestrator(
-        std::make_unique<core::orchestration::FileExportPipeline>());
-    MainWindow window(catalogEditorFacade, catalogOrchestrator, exportOrchestrator);
+        std::make_unique<core::orchestration::FileExportPipeline>(::flexraw::test::testPathIdentityService()));
+    QSettings applicationSettings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")),
+                                  QSettings::IniFormat);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(applicationSettings);
+    settings::QtExportSettingsAdapter exportDefaults(applicationSettings);
+    export_::QtExportClientAdapter exportAdapter(exportOrchestrator, workerProfiles);
+    MainWindow window(
+        catalogEditorFacade, exportAdapter, exportAdapter, exportDefaults, applicationSettings, workerProfiles);
     QComboBox* scopeCombo = window.findChild<QComboBox*>(QStringLiteral("catalogFolderScopeComboBox"));
     auto* catalogList = window.findChild<catalog::CatalogListWidget*>();
     QToolButton* previousButton = window.findChild<QToolButton*>(QStringLiteral("catalogPreviousPageButton"));
@@ -261,11 +290,22 @@ TEST(MainWindowCatalogPaginationTest, SelectsProjectScopeAndDisablesFolderScope)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    facade::CatalogEditorFacade catalogEditorFacade(
-        catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    facade::CatalogEditorFacade catalogEditorFacade(catalogOrchestrator,
+                                                    catalogSessionOrchestrator,
+                                                    catalogThumbnailOrchestrator,
+                                                    editorOrchestrator,
+                                                    sourceResolutionEventSource);
     core::orchestration::ExportOrchestrator exportOrchestrator(
-        std::make_unique<core::orchestration::FileExportPipeline>());
-    MainWindow window(catalogEditorFacade, catalogOrchestrator, exportOrchestrator);
+        std::make_unique<core::orchestration::FileExportPipeline>(::flexraw::test::testPathIdentityService()));
+    QSettings applicationSettings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")),
+                                  QSettings::IniFormat);
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(applicationSettings);
+    settings::QtExportSettingsAdapter exportDefaults(applicationSettings);
+    export_::QtExportClientAdapter exportAdapter(exportOrchestrator, workerProfiles);
+    MainWindow window(
+        catalogEditorFacade, exportAdapter, exportAdapter, exportDefaults, applicationSettings, workerProfiles);
     QComboBox* folderCombo = window.findChild<QComboBox*>(QStringLiteral("catalogFolderScopeComboBox"));
     QComboBox* projectCombo = window.findChild<QComboBox*>(QStringLiteral("catalogProjectScopeComboBox"));
     auto* catalogList = window.findChild<catalog::CatalogListWidget*>();

@@ -15,6 +15,7 @@
 #include <QTimer>
 #include <QUuid>
 
+#include "current_path_identity_service.h"
 #include "current_process_memory_probe.h"
 #include "current_system_memory_probe.h"
 #include "export_orchestrator.h"
@@ -509,8 +510,9 @@ struct ObservedExport
     scheduling.memoryClaimPerJobBytes = 1024ULL * Mebibyte;
     auto remoteAdapter = std::make_unique<flexraw::worker::client::RemoteExportExecutionAdapter>(
         std::make_unique<flexraw::worker::client::RemoteRenderExecutor>());
+    const auto pathIdentityService = flexraw::platform::createCurrentPathIdentityService();
     flexraw::core::orchestration::ExportOrchestrator orchestrator(
-        std::make_unique<flexraw::core::orchestration::FileExportPipeline>(),
+        std::make_unique<flexraw::core::orchestration::FileExportPipeline>(*pathIdentityService),
         std::move(remoteAdapter),
         systemMemoryProbe.get(),
         scheduling);

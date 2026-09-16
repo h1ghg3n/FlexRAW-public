@@ -7,8 +7,7 @@
 #include <QTimer>
 
 #include "frame_parser.h"
-#include "job_scheduler.h"
-#include "worker_path_resolver.h"
+#include "render_worker_runtime_port.h"
 
 class QTcpSocket;
 
@@ -27,12 +26,11 @@ class ProtocolSession final : public QObject
 
 public:
     // 목적: 연결된 socket을 session-scoped render protocol adapter로 구성
-    // 입력: sessionId/socket: 연결 identity와 소유 대상, resolver/scheduler: shared runtime, configuration: I/O 한도
+    // 입력: sessionId/socket: 연결 identity와 소유 대상, runtime: shared Runtime port, configuration: I/O 한도
     // 출력: readyRead/disconnect/timeout을 처리하는 session
     ProtocolSession(runtime::WorkerSessionId sessionId,
                     QTcpSocket* socket,
-                    const runtime::WorkerPathResolver& resolver,
-                    runtime::JobScheduler& scheduler,
+                    runtime::IRenderWorkerRuntime& runtime,
                     ProtocolSessionConfiguration configuration = {},
                     QObject* parent = nullptr);
 
@@ -81,6 +79,11 @@ private:
     // 출력: payload 방향 계약이 유효하면 true
     [[nodiscard]] bool handleCancelRequest(const protocol::ProtocolFrame& frame);
 
+    // 목적: Runtime read-only snapshot을 bounded health response로 투영
+    // 입력: frame: empty payload HealthRequest와 correlation identity
+    // 출력: payload 방향과 response write가 유효하면 true
+    [[nodiscard]] bool handleHealthRequest(const protocol::ProtocolFrame& frame);
+
     // 목적: session event-loop에서 active identity를 제거하고 terminal response 전송
     // 입력: outcome: scheduler가 완료한 job 결과
     // 출력: RenderSucceeded, RenderFailed 또는 ResourceBusy frame
@@ -120,8 +123,7 @@ private:
 
     runtime::WorkerSessionId m_sessionId{0};
     QTcpSocket* m_socket{nullptr};
-    const runtime::WorkerPathResolver& m_resolver;
-    runtime::JobScheduler& m_scheduler;
+    runtime::IRenderWorkerRuntime& m_runtime;
     ProtocolSessionConfiguration m_configuration;
     protocol::FrameParser m_parser;
     QTimer m_inactivityTimer;

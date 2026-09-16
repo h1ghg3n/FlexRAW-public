@@ -11,7 +11,11 @@ namespace flexraw::core::catalog
 // 출력: separator와 중복 segment를 정리한 path, 유효하지 않으면 빈 문자열
 QString normalizeSourceFolderPath(const QString& folderPath)
 {
-    const QString normalized = QDir::cleanPath(QDir::fromNativeSeparators(folderPath.trimmed()));
+    if (folderPath.isEmpty() || folderPath != folderPath.trimmed())
+    {
+        return {};
+    }
+    const QString normalized = QDir::cleanPath(QDir::fromNativeSeparators(folderPath));
     return normalized == QStringLiteral(".") ? QString{} : normalized;
 }
 
@@ -20,7 +24,11 @@ QString normalizeSourceFolderPath(const QString& folderPath)
 // 출력: 정규화된 parent path, parent를 파생할 수 없으면 빈 문자열
 QString sourceParentPath(const QString& sourcePath)
 {
-    const QString normalizedSource = QDir::cleanPath(QDir::fromNativeSeparators(sourcePath.trimmed()));
+    if (sourcePath.isEmpty() || sourcePath != sourcePath.trimmed())
+    {
+        return {};
+    }
+    const QString normalizedSource = QDir::cleanPath(QDir::fromNativeSeparators(sourcePath));
     if (normalizedSource.isEmpty() || normalizedSource == QStringLiteral("."))
     {
         return {};

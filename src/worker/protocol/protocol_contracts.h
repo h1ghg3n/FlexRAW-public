@@ -13,7 +13,7 @@ namespace flexraw::worker::protocol
 
 inline constexpr std::array<char, 4> ProtocolMagic{'F', 'R', 'W', 'K'};
 inline constexpr std::uint16_t ProtocolMajorVersion = 1;
-inline constexpr std::uint16_t ProtocolMinorVersion = 1;
+inline constexpr std::uint16_t ProtocolMinorVersion = 2;
 inline constexpr std::uint32_t MaximumPayloadBytes = 1024U * 1024U;
 inline constexpr qsizetype ProtocolHeaderBytes = 24;
 
@@ -26,6 +26,8 @@ enum class MessageType : std::uint16_t
     RenderFailed = 5,
     ServerBusy = 6,
     ResourceBusy = 7,
+    HealthRequest = 8,
+    HealthResponse = 9,
 };
 
 struct ProtocolFrameHeader

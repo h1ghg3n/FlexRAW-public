@@ -8,12 +8,41 @@
 #include <QMetaObject>
 #include <QThread>
 
-#include "catalog_editor_facade.h"
-#include "editor_client_projection.h"
-#include "folder_scan_controller.h"
+#include "log.h"
 
 namespace flexraw::ui::mainwindow
 {
+namespace
+{
+
+// 목적: Folder operation 종류를 status presentation용 Activity 종류로 변환
+// 입력: kind: scan 또는 Catalog import
+// 출력: 같은 의미의 Activity kind
+[[nodiscard]] core::client::ActivityKind toActivityKind(core::client::FolderOperationKind kind) noexcept
+{
+    return kind == core::client::FolderOperationKind::Import ? core::client::ActivityKind::FolderImport
+                                                             : core::client::ActivityKind::FolderScan;
+}
+
+// 목적: Folder operation terminal 상태를 공통 Activity terminal 상태로 변환
+// 입력: state: completed·failed·cancelled Folder terminal
+// 출력: 같은 의미의 Activity terminal state
+[[nodiscard]] core::client::ActivityTerminalState toActivityTerminalState(
+    core::client::FolderOperationTerminalState state) noexcept
+{
+    switch (state)
+    {
+    case core::client::FolderOperationTerminalState::Completed:
+        return core::client::ActivityTerminalState::Completed;
+    case core::client::FolderOperationTerminalState::Failed:
+        return core::client::ActivityTerminalState::Failed;
+    case core::client::FolderOperationTerminalState::Cancelled:
+        return core::client::ActivityTerminalState::Cancelled;
+    }
+    return core::client::ActivityTerminalState::Failed;
+}
+
+}  // namespace
 
 struct QtActivityAdapter::SubscriptionState
 {
@@ -78,129 +107,51 @@ private:
 };
 
 // 목적: 기존 Qt owner lifecycle을 하나의 Qt-free Activity client로 집계
-// 입력: catalogEditorFacade: Preview/Source owner adapter, folderScanController: Folder scan owner, parent: Qt owner
+// 입력: previewClient: Preview cancel command, preview/folder/source event source와 source client,
+//       parent: Qt owner
 // 출력: 현재 Qt thread에 bound된 Activity adapter
-QtActivityAdapter::QtActivityAdapter(facade::CatalogEditorFacade& catalogEditorFacade,
-                                     FolderScanController& folderScanController,
+QtActivityAdapter::QtActivityAdapter(core::client::IPreviewPresentationClient& previewClient,
+                                     core::client::IPreviewPresentationEventSource& previewEventSource,
+                                     core::client::IFolderImportEventSource& folderEventSource,
+                                     core::client::ISourceResolutionClient& sourceResolutionClient,
+                                     core::client::ISourceResolutionEventSource& sourceResolutionEventSource,
                                      QObject* parent)
-    : QObject(parent), m_catalogEditorFacade(&catalogEditorFacade), m_folderScanController(&folderScanController)
+    : QObject(parent), m_previewClient(&previewClient), m_sourceResolutionClient(&sourceResolutionClient)
 {
-    Q_ASSERT(m_catalogEditorFacade->thread() == thread());
-    Q_ASSERT(m_folderScanController->thread() == thread());
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::previewStarted,
-        this,
-        [this](core::types::RequestId requestId) {
-            const core::client::EditorSnapshot editor = m_catalogEditorFacade->editorSnapshot();
-            std::optional<core::client::ClientPhotoId> photoId;
-            if (editor.hasSelection)
-            {
-                photoId = editor.photoId;
-            }
-            recordStarted({{core::client::ActivityKind::Preview, requestId}, true, photoId});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::previewCompleted,
-        this,
-        [this](core::types::RequestId requestId) {
-            recordTerminal({{core::client::ActivityKind::Preview, requestId},
-                            core::client::ActivityTerminalState::Completed,
-                            std::nullopt});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::previewFailed,
-        this,
-        [this](const core::orchestration::PreviewIssue& issue) {
-            recordTerminal({{core::client::ActivityKind::Preview, issue.requestId},
-                            core::client::ActivityTerminalState::Failed,
-                            core::orchestration::toClientError(issue.error)});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::previewCancelled,
-        this,
-        [this](core::types::RequestId requestId) {
-            recordTerminal({{core::client::ActivityKind::Preview, requestId},
-                            core::client::ActivityTerminalState::Cancelled,
-                            std::nullopt});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::sourceBindingStarted,
-        this,
-        [this](core::types::RequestId requestId, core::types::PhotoId photoId) {
-            recordStarted({{core::client::ActivityKind::SourceVerification, requestId},
-                           true,
-                           core::client::ClientPhotoId{photoId.value}});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::sourceBindingUpdated,
-        this,
-        [this](const core::orchestration::CatalogSourceUpdate& update) {
-            recordTerminal({{core::client::ActivityKind::SourceVerification, update.requestId},
-                            core::client::ActivityTerminalState::Completed,
-                            std::nullopt});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::sourceBindingFailed,
-        this,
-        [this](const core::orchestration::CatalogIssue& issue) {
-            recordTerminal({{core::client::ActivityKind::SourceVerification, issue.requestId},
-                            core::client::ActivityTerminalState::Failed,
-                            core::orchestration::toClientError(issue.error)});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_catalogEditorFacade,
-        &facade::CatalogEditorFacade::sourceBindingCancelled,
-        this,
-        [this](core::types::RequestId requestId) {
-            recordTerminal({{core::client::ActivityKind::SourceVerification, requestId},
-                            core::client::ActivityTerminalState::Cancelled,
-                            std::nullopt});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_folderScanController,
-        &FolderScanController::scanStarted,
-        this,
-        [this](const QString&) {
-            m_folderActivityId = nextFolderActivityId();
-            recordStarted({*m_folderActivityId, false, std::nullopt});
-        },
-        Qt::DirectConnection);
-    connect(
-        m_folderScanController,
-        &FolderScanController::scanFinished,
-        this,
-        [this](const core::catalog::CatalogScanResult& result) {
-            if (!m_folderActivityId.has_value())
-            {
-                return;
-            }
-            const core::client::ActivityId activityId = *m_folderActivityId;
-            m_folderActivityId.reset();
-            if (result.hasError())
-            {
-                recordTerminal({activityId,
-                                core::client::ActivityTerminalState::Failed,
-                                core::orchestration::toClientError(result.error())});
-                return;
-            }
-            recordTerminal({activityId, core::client::ActivityTerminalState::Completed, std::nullopt});
-        },
-        Qt::DirectConnection);
+    const core::client::PreviewPresentationSubscriptionResult previewSubscribed =
+        previewEventSource.subscribeToPreviewPresentation(
+            [this](const core::client::PreviewPresentationEvent& event) { handlePreviewPresentationEvent(event); });
+    if (previewSubscribed.hasError())
+    {
+        LOG_ERROR(
+            "activity", "Unable to subscribe to Preview presentation: {}", previewSubscribed.error().technicalMessage);
+    }
+    else
+    {
+        m_previewPresentationSubscription = previewSubscribed.value();
+    }
+    const core::client::SourceResolutionSubscriptionResult sourceSubscribed =
+        sourceResolutionEventSource.subscribeToSourceResolution(
+            [this](const core::client::SourceResolutionEvent& event) { handleSourceResolutionEvent(event); });
+    if (sourceSubscribed.hasError())
+    {
+        LOG_ERROR(
+            "activity", "Unable to subscribe to Source Resolution: {}", sourceSubscribed.error().technicalMessage);
+    }
+    else
+    {
+        m_sourceResolutionSubscription = sourceSubscribed.value();
+    }
+    const core::client::FolderOperationSubscriptionResult subscribed = folderEventSource.subscribeToFolderOperations(
+        [this](const core::client::FolderOperationEvent& event) { handleFolderOperationEvent(event); });
+    if (subscribed.hasError())
+    {
+        LOG_ERROR("activity", "Unable to subscribe to Folder operations: {}", subscribed.error().technicalMessage);
+    }
+    else
+    {
+        m_folderOperationSubscription = subscribed.value();
+    }
 }
 
 // 목적: queued callback을 차단하고 outliving Activity subscription을 inactive로 전환
@@ -209,6 +160,21 @@ QtActivityAdapter::QtActivityAdapter(facade::CatalogEditorFacade& catalogEditorF
 QtActivityAdapter::~QtActivityAdapter()
 {
     m_shuttingDown = true;
+    if (m_previewPresentationSubscription != nullptr)
+    {
+        m_previewPresentationSubscription->unsubscribe();
+        m_previewPresentationSubscription.reset();
+    }
+    if (m_folderOperationSubscription != nullptr)
+    {
+        m_folderOperationSubscription->unsubscribe();
+        m_folderOperationSubscription.reset();
+    }
+    if (m_sourceResolutionSubscription != nullptr)
+    {
+        m_sourceResolutionSubscription->unsubscribe();
+        m_sourceResolutionSubscription.reset();
+    }
     for (const std::weak_ptr<SubscriptionState>& weakState : m_subscriptions)
     {
         if (const SubscriptionStatePtr state = weakState.lock(); state != nullptr)
@@ -217,6 +183,86 @@ QtActivityAdapter::~QtActivityAdapter()
         }
     }
     m_subscriptions.clear();
+}
+
+// 목적: Preview presentation lifecycle event를 공통 Activity lifecycle로 투영
+// 입력: event: initial active state, accepted transition 또는 exact terminal
+// 출력: Activity active/terminal event queue 등록 가능
+void QtActivityAdapter::handlePreviewPresentationEvent(const core::client::PreviewPresentationEvent& event)
+{
+    if (m_shuttingDown)
+    {
+        return;
+    }
+    if ((event.initial || event.requestStarted) && event.snapshot.activeRequestId.has_value())
+    {
+        recordStarted({{core::client::ActivityKind::Preview, event.snapshot.activeRequestId->value},
+                       true,
+                       event.snapshot.selectedPhotoId});
+    }
+    if (!event.terminal.has_value() || !event.terminal->requestId.has_value())
+    {
+        return;
+    }
+
+    core::client::ActivityTerminalState state = core::client::ActivityTerminalState::Completed;
+    switch (event.terminal->state)
+    {
+    case core::client::PreviewTerminalState::Completed:
+        break;
+    case core::client::PreviewTerminalState::Failed:
+        state = core::client::ActivityTerminalState::Failed;
+        break;
+    case core::client::PreviewTerminalState::Cancelled:
+        state = core::client::ActivityTerminalState::Cancelled;
+        break;
+    }
+    recordTerminal(
+        {{core::client::ActivityKind::Preview, event.terminal->requestId->value}, state, event.terminal->error});
+}
+
+// 목적: Source Resolution lifecycle event를 공통 Activity lifecycle로 투영
+// 입력: event: initial active requests, accepted transition 또는 exact terminal
+// 출력: Activity active/terminal event queue 등록 가능
+void QtActivityAdapter::handleSourceResolutionEvent(const core::client::SourceResolutionEvent& event)
+{
+    if (m_shuttingDown)
+    {
+        return;
+    }
+    if (event.initial)
+    {
+        for (const core::client::SourceRequestReceipt& request : event.snapshot.activeRequests)
+        {
+            recordStarted({{core::client::ActivityKind::SourceVerification, request.id.value}, true, request.photoId});
+        }
+    }
+    else if (event.accepted.has_value())
+    {
+        recordStarted({{core::client::ActivityKind::SourceVerification, event.accepted->id.value},
+                       true,
+                       event.accepted->photoId});
+    }
+    if (!event.terminal.has_value())
+    {
+        return;
+    }
+
+    core::client::ActivityTerminalState state = core::client::ActivityTerminalState::Completed;
+    switch (event.terminal->state)
+    {
+    case core::client::SourceResolutionTerminalState::Completed:
+        break;
+    case core::client::SourceResolutionTerminalState::Failed:
+        state = core::client::ActivityTerminalState::Failed;
+        break;
+    case core::client::SourceResolutionTerminalState::Cancelled:
+        state = core::client::ActivityTerminalState::Cancelled;
+        break;
+    }
+    recordTerminal({{core::client::ActivityKind::SourceVerification, event.terminal->receipt.id.value},
+                    state,
+                    event.terminal->error});
 }
 
 // 목적: initial active 목록과 이후 lifecycle event를 Qt delivery context에서 구독
@@ -294,12 +340,13 @@ core::client::ActivityCancelResult QtActivityAdapter::cancelActivity(core::clien
     switch (activityId.kind)
     {
     case core::client::ActivityKind::Preview:
-        cancelled = m_catalogEditorFacade->cancelPreviewActivity(activityId.value);
+        cancelled = m_previewClient->cancelPreviewRequest({activityId.value}).hasValue();
         break;
     case core::client::ActivityKind::SourceVerification:
-        cancelled = m_catalogEditorFacade->cancelSourceActivity(activityId.value);
+        cancelled = m_sourceResolutionClient->cancelSourceRequest({activityId.value}).hasValue();
         break;
     case core::client::ActivityKind::FolderScan:
+    case core::client::ActivityKind::FolderImport:
         break;
     }
     return cancelled ? core::client::ActivityCancelResult::success(activityId)
@@ -317,14 +364,24 @@ core::client::ActivityEventSequence QtActivityAdapter::nextEventSequence() noexc
     return {value};
 }
 
-// 목적: 단일 active Folder scan에 사용할 adapter-local identity 발급
-// 입력: 없음
-// 출력: 다음 Folder scan activity identity
-core::client::ActivityId QtActivityAdapter::nextFolderActivityId() noexcept
+// 목적: Folder operation lifecycle event를 공통 Activity lifecycle로 투영
+// 입력: event: initial active state 또는 exact terminal
+// 출력: Activity active/terminal event queue 등록 가능
+void QtActivityAdapter::handleFolderOperationEvent(const core::client::FolderOperationEvent& event)
 {
-    const std::uint64_t value = m_nextFolderActivityId;
-    m_nextFolderActivityId = value == std::numeric_limits<std::uint64_t>::max() ? 1 : value + 1;
-    return {core::client::ActivityKind::FolderScan, value};
+    if (event.activeOperation.has_value())
+    {
+        recordStarted(
+            {{toActivityKind(event.activeOperation->kind), event.activeOperation->id.value}, false, std::nullopt});
+    }
+    if (!event.terminal.has_value())
+    {
+        return;
+    }
+
+    recordTerminal({{toActivityKind(event.terminal->receipt.kind), event.terminal->receipt.id.value},
+                    toActivityTerminalState(event.terminal->state),
+                    event.terminal->error});
 }
 
 // 목적: accepted owner request를 active Activity 목록에 추가하고 snapshot publish

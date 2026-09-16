@@ -21,10 +21,10 @@ target_include_directories(flexraw_ui_cli PUBLIC
 
 target_link_libraries(flexraw_ui_cli PUBLIC
     flexraw_core_catalog
+    flexraw_core_client
     flexraw_core_export
     flexraw_core_orchestration
     flexraw_core_raw
-    flexraw_ui_settings
     Qt6::Core
     Qt6::Concurrent
     Qt6::Gui

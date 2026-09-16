@@ -1,24 +1,16 @@
 #pragma once
 
-#include <memory>
 #include <optional>
 
 #include <QObject>
-#include <QSettings>
 #include <QString>
 
 #include "catalog_command_service.h"
-#include "catalog_contracts.h"
+#include "export_client.h"
 #include "export_command_service.h"
-#include "export_contracts.h"
-#include "folder_scanner.h"
+#include "export_defaults_client.h"
+#include "folder_import_client.h"
 #include "raw_diagnostic_service.h"
-
-namespace flexraw::core::orchestration
-{
-class CatalogOrchestrator;
-class ExportOrchestrator;
-}  // namespace flexraw::core::orchestration
 
 namespace flexraw::ui::cli
 {
@@ -29,18 +21,13 @@ class ConsoleCommandController final : public QObject
 
 public:
     // 목적: console backend command의 비동기 실행과 결과 전달을 관리
-    // 입력: catalogOrchestrator: active catalog use case, exportOrchestrator: shared export use case, parent: Qt 부모
-    // 객체 출력: 초기화된 ConsoleCommandController 객체
-    explicit ConsoleCommandController(core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                                      core::orchestration::ExportOrchestrator& exportOrchestrator,
-                                      QObject* parent = nullptr);
-
-    // 목적: 외부 settings 저장소를 사용하는 console command controller 초기화
-    // 입력: catalogOrchestrator: active catalog use case, exportOrchestrator: export use case, settings: 외부 settings
+    // 입력: Folder/Export command/event와 application-wide Export default contract, parent: Qt 부모 객체
     // 출력: 초기화된 ConsoleCommandController 객체
-    explicit ConsoleCommandController(core::orchestration::CatalogOrchestrator& catalogOrchestrator,
-                                      core::orchestration::ExportOrchestrator& exportOrchestrator,
-                                      QSettings& settings,
+    explicit ConsoleCommandController(core::client::IFolderImportClient& folderImportClient,
+                                      core::client::IFolderImportEventSource& folderImportEventSource,
+                                      core::client::IExportClient& exportClient,
+                                      core::client::IExportEventSource& exportEventSource,
+                                      core::client::IExportDefaultsClient& exportDefaultsClient,
                                       QObject* parent = nullptr);
 
     // 목적: 인식된 console command를 검증 후 worker thread에서 실행
@@ -73,25 +60,35 @@ private:
 
     struct PendingExport
     {
-        core::types::RequestId requestId{0};
+        core::client::ExportRequestId requestId;
         PendingExportKind kind{PendingExportKind::File};
         core::export_::RasterExportOptions options;
     };
 
-    // 목적: shared ExportOrchestrator terminal event를 current console request handler에 연결
-    // 입력: 없음
-    // 출력: QObject signal 연결 생성
-    void connectExportOrchestrator();
+    // 목적: Qt-free Export event source를 current console request handler에 연결
+    // 입력: eventSource: application-scoped Export lifecycle source
+    // 출력: RAII subscription 저장 또는 diagnostic logging
+    void connectExportEvents(core::client::IExportEventSource& eventSource);
 
-    // 목적: worker scan 완료 후 active catalog를 재검증하고 owner thread에서 import
-    // 입력: expectedCatalogPath: scan 시작 session, scanResult: worker의 immutable scan 결과
-    // 출력: outputReady와 busyChanged signal 발생
-    void finishCatalogImport(const QString& expectedCatalogPath, const core::catalog::CatalogScanResult& scanResult);
+    // 목적: immutable Export event에서 current console request의 exact terminal만 처리
+    // 입력: event: initial snapshot 또는 accepted/progress/completed/failed/cancelled transition
+    // 출력: matching terminal이면 outputReady와 busyChanged(false) 발생
+    void handleExportEvent(const core::client::ExportEvent& event);
 
-    // 목적: CatalogOrchestrator import 결과를 사용자 표시 문자열로 변환
-    // 입력: result: active session에 적용한 import 결과
+    // 목적: Folder operation event source를 current console request handler에 연결
+    // 입력: eventSource: MainWindow와 공유하는 Qt delivery adapter
+    // 출력: RAII subscription 저장 또는 diagnostic logging
+    void connectFolderOperationEvents(core::client::IFolderImportEventSource& eventSource);
+
+    // 목적: current console Folder import와 일치하는 terminal을 사용자 출력으로 변환
+    // 입력: event: initial/active/terminal Folder operation event
+    // 출력: matching terminal이면 outputReady와 busyChanged(false) 발생
+    void handleFolderOperationEvent(const core::client::FolderOperationEvent& event);
+
+    // 목적: Folder import completion을 사용자 표시 문자열로 변환
+    // 입력: completion: discovered/applied count와 persisted Photo identity
     // 출력: console output 문자열
-    [[nodiscard]] QString formatImportResult(const core::orchestration::CatalogImportResult& result) const;
+    [[nodiscard]] QString formatImportResult(const core::client::FolderImportCompletion& completion) const;
 
     // 목적: raster export command를 검증하고 worker thread에서 실행
     // 입력: parsed: parse가 완료된 raster export command 결과
@@ -116,24 +113,31 @@ private:
     // 목적: Core export request를 submit하고 accepted request state를 console adapter에 연결
     // 입력: request: Core file/batch request, options: 성공 시 저장할 기본값, kind: 결과 formatting 종류
     // 출력: command 처리 완료를 나타내는 true
-    [[nodiscard]] bool submitExport(core::orchestration::ExportRequest request,
+    [[nodiscard]] bool submitExport(core::client::ExportRequest request,
                                     const core::export_::RasterExportOptions& options,
                                     PendingExportKind kind);
 
     // 목적: 현재 console export와 일치하는 완료 report를 표시하고 settings 갱신
     // 입력: result: request identity와 item별 상세 결과
     // 출력: outputReady와 busyChanged signal 발생 가능
-    void handleExportCompleted(const core::orchestration::ExportResult& result);
+    void handleExportCompleted(const core::client::ExportResult& result);
 
     // 목적: 현재 console export의 terminal pipeline 실패를 사용자 출력으로 변환
     // 입력: issue: request identity와 technical error
     // 출력: outputReady와 busyChanged signal 발생 가능
-    void handleExportFailed(const core::orchestration::ExportIssue& issue);
+    void handleExportFailed(const core::client::ExportIssue& issue);
 
     // 목적: 현재 console export cancellation을 표시하고 입력 상태 복원
     // 입력: requestId: 취소된 export request 식별자
     // 출력: outputReady와 busyChanged signal 발생 가능
-    void handleExportCancelled(core::types::RequestId requestId);
+    void handleExportCancelled(core::client::ExportRequestId requestId);
+
+    // 목적: common ClientError와 Export domain failure를 console user-facing text로 변환
+    // 입력: error: diagnostic-only detail, failureKind: optional Export domain 의미
+    // 출력: technicalMessage를 직접 노출하지 않는 localized 문자열
+    [[nodiscard]] QString exportErrorText(
+        const core::client::ClientError& error,
+        core::client::ExportFailureKind failureKind = core::client::ExportFailureKind::None) const;
 
     // 목적: current export adapter state를 정리하고 console 입력 재활성화
     // 입력: 없음
@@ -155,10 +159,12 @@ private:
     // 출력: console output 문자열
     [[nodiscard]] QString formatRawDiagnosticsResult(const RawDiagnosticsExecutionResult& result) const;
 
-    std::unique_ptr<QSettings> m_ownedSettings;
-    core::orchestration::CatalogOrchestrator* m_catalogOrchestrator{nullptr};
-    core::orchestration::ExportOrchestrator* m_exportOrchestrator{nullptr};
-    QSettings* m_settings{nullptr};
+    core::client::IFolderImportClient* m_folderImportClient{nullptr};
+    core::client::IExportClient* m_exportClient{nullptr};
+    core::client::IExportDefaultsClient* m_exportDefaultsClient{nullptr};
+    core::client::FolderOperationSubscriptionHandle m_folderOperationSubscription;
+    core::client::ExportSubscriptionHandle m_exportSubscription;
+    std::optional<core::client::FolderOperationId> m_pendingFolderOperation;
     std::optional<PendingExport> m_pendingExport;
     bool m_busy{false};
 };

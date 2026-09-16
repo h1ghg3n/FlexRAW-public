@@ -139,6 +139,14 @@ types::DevelopRevision DevelopHistory::revision(const QString& photoPath) const
     return state == m_photoHistories.cend() ? 0 : state->revision;
 }
 
+// 목적: 지정 사진의 session-local develop state와 undo/redo history 폐기
+// 입력: photoPath: 폐기할 사진별 history identity
+// 출력: 없음; 다른 사진 history는 유지
+void DevelopHistory::discardPhoto(const QString& photoPath)
+{
+    m_photoHistories.remove(photoPath);
+}
+
 // 목적: 사진 경로의 history state를 반환하고 없으면 생성
 // 입력: photoPath: history를 조회할 사진 경로
 // 출력: 해당 사진의 수정 가능한 history state

@@ -1,6 +1,8 @@
 add_subdirectory(render)
+add_subdirectory(catalog)
 
 set(FLEXRAW_BENCHMARK_VALIDATION_TARGETS
+    flexraw_catalog_pagination_benchmark
     flexraw_develop_baseline
     flexraw_resolved_render_smoke
 )

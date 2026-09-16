@@ -7,9 +7,7 @@
 #include <QSet>
 #include <QTcpServer>
 
-#include "job_scheduler.h"
 #include "protocol_session.h"
-#include "worker_path_resolver.h"
 
 namespace flexraw::worker::network
 {
@@ -26,10 +24,9 @@ class WorkerServer final : public QObject
 
 public:
     // 목적: shared Worker runtime 위에 TCP acceptor 구성
-    // 입력: resolver/scheduler: 모든 session이 공유할 runtime, configuration: connection/session 한도
+    // 입력: runtime: 모든 session이 공유할 Runtime port, configuration: connection/session 한도
     // 출력: 아직 listen하지 않는 server
-    WorkerServer(const runtime::WorkerPathResolver& resolver,
-                 runtime::JobScheduler& scheduler,
+    WorkerServer(runtime::IRenderWorkerRuntime& runtime,
                  WorkerServerConfiguration configuration = {},
                  QObject* parent = nullptr);
 
@@ -80,8 +77,7 @@ private:
     // 출력: wrap 시 0을 건너뛴 WorkerSessionId
     [[nodiscard]] runtime::WorkerSessionId nextSessionId() noexcept;
 
-    const runtime::WorkerPathResolver& m_resolver;
-    runtime::JobScheduler& m_scheduler;
+    runtime::IRenderWorkerRuntime& m_runtime;
     WorkerServerConfiguration m_configuration;
     QTcpServer m_server;
     QSet<ProtocolSession*> m_sessions;

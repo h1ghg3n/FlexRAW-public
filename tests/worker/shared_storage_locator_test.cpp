@@ -90,6 +90,20 @@ TEST(SharedStorageLocatorTest, RejectsPathWithoutMarker)
     EXPECT_EQ(SharedStorageLocatorErrorCode::NoStorageMarker, located.error().code);
 }
 
+TEST(SharedStorageLocatorTest, RejectsOuterWhitespaceWithoutRemappingTheSource)
+{
+    QTemporaryDir storageRoot;
+    ASSERT_TRUE(storageRoot.isValid());
+    ASSERT_TRUE(writeMarker(storageRoot.path(), QUuid::createUuid()));
+    const QString sourcePath = QDir(storageRoot.path()).filePath(QStringLiteral("input.ARW"));
+    ASSERT_TRUE(createFile(sourcePath));
+
+    const LocateSharedStorageResult located = SharedStorageLocator::locateSource(sourcePath + QLatin1Char(' '));
+
+    ASSERT_TRUE(located.hasError());
+    EXPECT_EQ(SharedStorageLocatorErrorCode::InvalidPath, located.error().code);
+}
+
 TEST(SharedStorageLocatorTest, RejectsMalformedAndUnsupportedMarkers)
 {
     QTemporaryDir malformedRoot;

@@ -563,7 +563,11 @@ RasterExportCommandExecutionResult ExportCommandService::exportRaster(const Rast
     }
 
     const QFileInfo inputInfo(QDir::cleanPath(command.inputPath));
-    if (command.inputPath.trimmed().isEmpty() || !inputInfo.exists())
+    if (command.inputPath.isEmpty() || command.inputPath != command.inputPath.trimmed())
+    {
+        return {false, {}, tr("Raster export input path contains outer whitespace.")};
+    }
+    if (!inputInfo.exists())
     {
         return {false, {}, tr("Raster export input file does not exist.")};
     }

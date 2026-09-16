@@ -8,25 +8,25 @@
 #include <QObject>
 
 #include "activity_client.h"
-
-namespace flexraw::ui::facade
-{
-class CatalogEditorFacade;
-}
+#include "folder_import_client.h"
+#include "preview_presentation_client.h"
+#include "source_resolution_client.h"
 
 namespace flexraw::ui::mainwindow
 {
-
-class FolderScanController;
 
 class QtActivityAdapter final : public QObject, public core::client::IActivityClient
 {
 public:
     // 목적: 기존 Qt owner lifecycle을 하나의 Qt-free Activity client로 집계
-    // 입력: catalogEditorFacade: Preview/Source adapter, folderScanController: Folder scan owner, parent: Qt parent
+    // 입력: previewClient: Preview cancel command, preview/folder/source event source와 source client,
+    //       parent: Qt parent
     // 출력: 현재 Qt thread에 bound된 Activity adapter
-    QtActivityAdapter(facade::CatalogEditorFacade& catalogEditorFacade,
-                      FolderScanController& folderScanController,
+    QtActivityAdapter(core::client::IPreviewPresentationClient& previewClient,
+                      core::client::IPreviewPresentationEventSource& previewEventSource,
+                      core::client::IFolderImportEventSource& folderEventSource,
+                      core::client::ISourceResolutionClient& sourceResolutionClient,
+                      core::client::ISourceResolutionEventSource& sourceResolutionEventSource,
                       QObject* parent = nullptr);
 
     // 목적: queued callback을 차단하고 outliving Activity subscription을 inactive로 전환
@@ -55,10 +55,20 @@ private:
     // 출력: 다음 Activity event sequence
     [[nodiscard]] core::client::ActivityEventSequence nextEventSequence() noexcept;
 
-    // 목적: 단일 active Folder scan에 사용할 adapter-local identity 발급
-    // 입력: 없음
-    // 출력: 다음 Folder scan activity identity
-    [[nodiscard]] core::client::ActivityId nextFolderActivityId() noexcept;
+    // 목적: Preview presentation lifecycle event를 공통 Activity lifecycle로 투영
+    // 입력: event: initial active state, accepted transition 또는 exact terminal
+    // 출력: Activity active/terminal event queue 등록 가능
+    void handlePreviewPresentationEvent(const core::client::PreviewPresentationEvent& event);
+
+    // 목적: Source Resolution lifecycle event를 공통 Activity lifecycle로 투영
+    // 입력: event: initial active requests, accepted transition 또는 exact terminal
+    // 출력: Activity active/terminal event queue 등록 가능
+    void handleSourceResolutionEvent(const core::client::SourceResolutionEvent& event);
+
+    // 목적: Folder operation lifecycle event를 공통 Activity lifecycle로 투영
+    // 입력: event: initial active state 또는 exact terminal
+    // 출력: Activity active/terminal event queue 등록 가능
+    void handleFolderOperationEvent(const core::client::FolderOperationEvent& event);
 
     // 목적: accepted owner request를 active Activity 목록에 추가하고 snapshot publish
     // 입력: activity: kind, owner identity, cancellation capability와 optional Photo identity
@@ -85,13 +95,14 @@ private:
     // 출력: 없음
     static void deliverEvent(const SubscriptionStatePtr& state, const core::client::ActivityEvent& event) noexcept;
 
-    facade::CatalogEditorFacade* m_catalogEditorFacade{nullptr};
-    FolderScanController* m_folderScanController{nullptr};
+    core::client::IPreviewPresentationClient* m_previewClient{nullptr};
+    core::client::ISourceResolutionClient* m_sourceResolutionClient{nullptr};
+    core::client::PreviewPresentationSubscriptionHandle m_previewPresentationSubscription;
+    core::client::FolderOperationSubscriptionHandle m_folderOperationSubscription;
+    core::client::SourceResolutionSubscriptionHandle m_sourceResolutionSubscription;
     std::vector<core::client::ActiveActivity> m_activeActivities;
     std::vector<std::weak_ptr<SubscriptionState>> m_subscriptions;
-    std::optional<core::client::ActivityId> m_folderActivityId;
     std::uint64_t m_nextEventSequence{1};
-    std::uint64_t m_nextFolderActivityId{1};
     bool m_shuttingDown{false};
 };
 

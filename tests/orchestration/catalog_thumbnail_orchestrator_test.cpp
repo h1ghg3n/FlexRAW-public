@@ -1,8 +1,14 @@
 #include <atomic>
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <vector>
 
+#include <QByteArray>
+#include <QDir>
 #include <QEventLoop>
 #include <QSemaphore>
+#include <QThread>
 #include <QTimer>
 
 #include <gtest/gtest.h>
@@ -16,17 +22,20 @@ namespace flexraw::core::orchestration
 namespace
 {
 
-// 목적: thumbnail orchestration test용 raster source descriptor 생성
-// 입력: name: source path와 display name을 구분할 값
-// 출력: filesystem access가 필요 없는 유효 raster descriptor
-[[nodiscard]] types::FileDescriptor makeSource(const QString& name)
+// 목적: thumbnail orchestration test용 transient Qt-free item 생성
+// 입력: name: source locator와 display name을 구분할 값
+// 출력: filesystem access가 필요 없는 normalized raster item
+[[nodiscard]] client::CatalogThumbnailItem makeItem(const QString& name)
 {
-    return {
-        QStringLiteral("C:/thumbnail-test/") + name,
-        QStringLiteral("jpg"),
-        name,
-        types::SupportedFileKind::RasterImage,
-    };
+    const QString path = QDir::cleanPath(QDir(QDir::tempPath()).filePath(QStringLiteral("thumbnail-test/") + name));
+    const QByteArray pathUtf8 = path.toUtf8();
+    const QByteArray nameUtf8 = name.toUtf8();
+    const std::string locator(pathUtf8.constData(), static_cast<std::size_t>(pathUtf8.size()));
+    return {{client::CatalogThumbnailIdentityKind::TransientSource, {}, locator},
+            locator,
+            "jpg",
+            {nameUtf8.constData(), static_cast<std::size_t>(nameUtf8.size())},
+            client::CatalogFileKind::RasterImage};
 }
 
 struct BlockingThumbnailProbe
@@ -71,25 +80,76 @@ private:
     std::shared_ptr<BlockingThumbnailProbe> m_probe;
 };
 
+struct ThumbnailDestructionProbe
+{
+    QSemaphore started;
+    QSemaphore cancellationObserved;
+    std::atomic_bool loadReturned{false};
+};
+
+class CancellationBlockingThumbnailPipeline final : public ICatalogThumbnailPipeline
+{
+public:
+    // 목적: Orchestrator destruction test와 cancellation 관찰 state 공유
+    // 입력: probe: 시작·취소·반환 상태를 보유한 shared probe
+    // 출력: cancellation 전까지 bounded 대기하는 pipeline
+    explicit CancellationBlockingThumbnailPipeline(std::shared_ptr<ThumbnailDestructionProbe> probe)
+        : m_probe(std::move(probe))
+    {}
+
+    // 목적: active load가 owner cancellation을 관찰한 뒤에만 정상적으로 반환하는지 검증
+    // 입력: source/targetSize: 미사용, cancellationToken: Orchestrator-owned cancellation state
+    // 출력: cancellation이면 Cancelled, 제한 시간 초과면 Unknown test failure
+    [[nodiscard]] CatalogThumbnailPipelineResult load(const types::FileDescriptor&,
+                                                      const QSize&,
+                                                      const types::CancellationToken& cancellationToken) override
+    {
+        m_probe->started.release();
+        for (int attempt = 0; attempt < 600; ++attempt)
+        {
+            if (cancellationToken.isCancellationRequested())
+            {
+                m_probe->cancellationObserved.release();
+                m_probe->loadReturned.store(true, std::memory_order_relaxed);
+                return CatalogThumbnailPipelineResult::failure(
+                    {types::ErrorCode::Cancelled, QStringLiteral("Thumbnail owner was destroyed.")});
+            }
+            QThread::msleep(5);
+        }
+        m_probe->loadReturned.store(true, std::memory_order_relaxed);
+        return CatalogThumbnailPipelineResult::failure(
+            {types::ErrorCode::Unknown, QStringLiteral("Thumbnail destruction cancellation timed out.")});
+    }
+
+private:
+    std::shared_ptr<ThumbnailDestructionProbe> m_probe;
+};
+
 TEST(CatalogThumbnailOrchestratorTest, ReplacesPendingWindowAndFiltersStaleActiveResult)
 {
     (void)test::application();
     auto probe = std::make_shared<BlockingThumbnailProbe>();
     CatalogThumbnailOrchestrator orchestrator(std::make_unique<BlockingThumbnailPipeline>(probe));
-    QVector<QString> readyPaths;
+    std::vector<CatalogThumbnailFrame> frames;
+    std::vector<CatalogThumbnailWindowTerminal> terminals;
     QEventLoop eventLoop;
     QObject::connect(&orchestrator,
                      &CatalogThumbnailOrchestrator::thumbnailReady,
                      &eventLoop,
-                     [&readyPaths, &eventLoop](const CatalogThumbnailFrame& frame) {
-                         readyPaths.push_back(frame.sourcePath);
-                         eventLoop.quit();
+                     [&frames](const CatalogThumbnailFrame& frame) { frames.push_back(frame); });
+    QObject::connect(&orchestrator,
+                     &CatalogThumbnailOrchestrator::thumbnailWindowTerminal,
+                     &eventLoop,
+                     [&terminals, &eventLoop](const CatalogThumbnailWindowTerminal& terminal) {
+                         terminals.push_back(terminal);
+                         if (terminal.state == client::CatalogThumbnailTerminalState::Completed)
+                         {
+                             eventLoop.quit();
+                         }
                      });
-    ASSERT_TRUE(orchestrator
-                    .updateWindow({{makeSource(QStringLiteral("stale-first.jpg")),
-                                    makeSource(QStringLiteral("stale-pending.jpg"))},
-                                   QSize{96, 72}})
-                    .hasValue());
+    const client::CatalogThumbnailWindowResult stale = orchestrator.replaceThumbnailWindow(
+        {{makeItem(QStringLiteral("stale-first.jpg")), makeItem(QStringLiteral("stale-pending.jpg"))}, {96, 72}});
+    ASSERT_TRUE(stale.hasValue());
     const bool firstStarted = probe->firstStarted.tryAcquire(1, 1000);
     if (!firstStarted)
     {
@@ -97,13 +157,21 @@ TEST(CatalogThumbnailOrchestratorTest, ReplacesPendingWindowAndFiltersStaleActiv
     }
     ASSERT_TRUE(firstStarted);
 
-    ASSERT_TRUE(orchestrator.updateWindow({{makeSource(QStringLiteral("current.jpg"))}, QSize{96, 72}}).hasValue());
+    const client::CatalogThumbnailWindowResult current =
+        orchestrator.replaceThumbnailWindow({{makeItem(QStringLiteral("current.jpg"))}, {96, 72}});
+    ASSERT_TRUE(current.hasValue());
     probe->finishFirst.release();
     QTimer::singleShot(3000, &eventLoop, &QEventLoop::quit);
     eventLoop.exec();
 
-    ASSERT_EQ(1, readyPaths.size());
-    EXPECT_EQ(QStringLiteral("C:/thumbnail-test/current.jpg"), readyPaths.front());
+    ASSERT_EQ(1U, frames.size());
+    EXPECT_EQ(current.value().generation, frames.front().generation);
+    EXPECT_EQ(makeItem(QStringLiteral("current.jpg")).identity, frames.front().identity);
+    ASSERT_EQ(2U, terminals.size());
+    EXPECT_EQ(stale.value().generation, terminals.front().generation);
+    EXPECT_EQ(client::CatalogThumbnailTerminalState::Cancelled, terminals.front().state);
+    EXPECT_EQ(current.value().generation, terminals.back().generation);
+    EXPECT_EQ(client::CatalogThumbnailTerminalState::Completed, terminals.back().state);
     EXPECT_EQ(2, probe->loadCount.load(std::memory_order_relaxed));
 }
 
@@ -112,19 +180,89 @@ TEST(CatalogThumbnailOrchestratorTest, RejectsWindowAboveBoundWithoutStartingPip
     (void)test::application();
     auto probe = std::make_shared<BlockingThumbnailProbe>();
     CatalogThumbnailOrchestrator orchestrator(std::make_unique<BlockingThumbnailPipeline>(probe));
-    CatalogThumbnailWindowRequest request;
-    request.targetSize = QSize{96, 72};
-    request.sources.reserve(MaximumCatalogThumbnailWindowSize + 1);
-    for (int index = 0; index <= MaximumCatalogThumbnailWindowSize; ++index)
+    client::ReplaceCatalogThumbnailWindowCommand command;
+    command.targetExtent = {96, 72};
+    command.items.reserve(client::MaximumCatalogThumbnailWindowSize + 1);
+    for (std::size_t index = 0; index <= client::MaximumCatalogThumbnailWindowSize; ++index)
     {
-        request.sources.push_back(makeSource(QStringLiteral("photo-%1.jpg").arg(index)));
+        command.items.push_back(makeItem(QStringLiteral("photo-%1.jpg").arg(index)));
     }
 
-    const CatalogThumbnailWindowResult result = orchestrator.updateWindow(std::move(request));
+    const client::CatalogThumbnailWindowResult result = orchestrator.replaceThumbnailWindow(command);
 
     ASSERT_TRUE(result.hasError());
-    EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, result.error().code);
     EXPECT_EQ(0, probe->loadCount.load(std::memory_order_relaxed));
+}
+
+TEST(CatalogThumbnailOrchestratorTest, RejectsNonNormalizedLocatorAndMismatchedTransientIdentity)
+{
+    (void)test::application();
+    auto probe = std::make_shared<BlockingThumbnailProbe>();
+    CatalogThumbnailOrchestrator orchestrator(std::make_unique<BlockingThumbnailPipeline>(probe));
+    client::CatalogThumbnailItem nonNormalized = makeItem(QStringLiteral("photo.jpg"));
+    nonNormalized.sourceLocator += "/../photo.jpg";
+    client::CatalogThumbnailItem mismatchedIdentity = makeItem(QStringLiteral("other.jpg"));
+    mismatchedIdentity.identity.transientSourceLocator += ".different";
+
+    const client::CatalogThumbnailWindowResult nonNormalizedResult =
+        orchestrator.replaceThumbnailWindow({{nonNormalized}, {96, 72}});
+    const client::CatalogThumbnailWindowResult mismatchedResult =
+        orchestrator.replaceThumbnailWindow({{mismatchedIdentity}, {96, 72}});
+
+    ASSERT_TRUE(nonNormalizedResult.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, nonNormalizedResult.error().code);
+    ASSERT_TRUE(mismatchedResult.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, mismatchedResult.error().code);
+    EXPECT_EQ(0, probe->loadCount.load(std::memory_order_relaxed));
+}
+
+TEST(CatalogThumbnailOrchestratorTest, ClearsCurrentWindowOnceWithCancelledTerminal)
+{
+    (void)test::application();
+    auto probe = std::make_shared<BlockingThumbnailProbe>();
+    CatalogThumbnailOrchestrator orchestrator(std::make_unique<BlockingThumbnailPipeline>(probe));
+    std::vector<CatalogThumbnailWindowTerminal> terminals;
+    QObject::connect(&orchestrator,
+                     &CatalogThumbnailOrchestrator::thumbnailWindowTerminal,
+                     &orchestrator,
+                     [&terminals](const CatalogThumbnailWindowTerminal& terminal) { terminals.push_back(terminal); });
+    const client::CatalogThumbnailWindowResult receipt =
+        orchestrator.replaceThumbnailWindow({{makeItem(QStringLiteral("active.jpg"))}, {96, 72}});
+    ASSERT_TRUE(receipt.hasValue());
+    const bool started = probe->firstStarted.tryAcquire(1, 1000);
+    if (!started)
+    {
+        probe->finishFirst.release();
+    }
+    ASSERT_TRUE(started);
+
+    EXPECT_TRUE(orchestrator.clearThumbnailWindow().hasValue());
+    EXPECT_TRUE(orchestrator.clearThumbnailWindow().hasValue());
+
+    ASSERT_EQ(1U, terminals.size());
+    EXPECT_EQ(receipt.value().generation, terminals.front().generation);
+    EXPECT_EQ(client::CatalogThumbnailTerminalState::Cancelled, terminals.front().state);
+    EXPECT_FALSE(orchestrator.thumbnailWindowSnapshot().activeGeneration.has_value());
+    probe->finishFirst.release();
+}
+
+TEST(CatalogThumbnailOrchestratorTest, DestructionCancelsAndWaitsForInFlightPipeline)
+{
+    (void)test::application();
+    auto probe = std::make_shared<ThumbnailDestructionProbe>();
+    auto orchestrator =
+        std::make_unique<CatalogThumbnailOrchestrator>(std::make_unique<CancellationBlockingThumbnailPipeline>(probe));
+    const client::CatalogThumbnailWindowResult receipt =
+        orchestrator->replaceThumbnailWindow({{makeItem(QStringLiteral("active-destruction.jpg"))}, {96, 72}});
+    ASSERT_TRUE(receipt.hasValue());
+    ASSERT_TRUE(probe->started.tryAcquire(1, 1000));
+
+    orchestrator.reset();
+
+    EXPECT_TRUE(probe->cancellationObserved.tryAcquire(1, 1000));
+    EXPECT_TRUE(probe->loadReturned.load(std::memory_order_relaxed));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
 }
 
 }  // namespace

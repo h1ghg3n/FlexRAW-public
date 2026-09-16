@@ -74,15 +74,13 @@ struct SourceParentBackfillRecord
 // 출력: 정규화된 절대 경로 또는 구조화된 오류
 [[nodiscard]] types::Result<QString, types::CoreError> validateCatalogPath(const QString& catalogPath)
 {
-    const QString normalizedPath = catalogPath.trimmed();
-
-    if (normalizedPath.isEmpty())
+    if (catalogPath.isEmpty() || catalogPath != catalogPath.trimmed())
     {
         return types::Result<QString, types::CoreError>::failure(
-            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog path is empty.")});
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog path is empty or contains outer whitespace.")});
     }
 
-    const QFileInfo catalogInfo(normalizedPath);
+    const QFileInfo catalogInfo(catalogPath);
 
     if (catalogInfo.exists() && catalogInfo.isDir())
     {

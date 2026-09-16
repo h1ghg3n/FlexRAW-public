@@ -1,7 +1,12 @@
 #pragma once
 
-#include "catalog_thumbnail_contracts.h"
+#include <QImage>
+#include <QSize>
+
+#include "error.h"
+#include "file_types.h"
 #include "operation_types.h"
+#include "result.h"
 
 namespace flexraw::core::orchestration
 {

@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <system_error>
 #include <vector>
 
 #include <QCoreApplication>
@@ -28,6 +30,17 @@ namespace
            file.flush();
 }
 
+// 목적: Folder import baseline test용 기존 Catalog hard-link alias 생성
+// 입력: existingPath/linkPath: 원본 Catalog와 생성할 alias 경로
+// 출력: hard link 생성 성공 여부
+[[nodiscard]] bool createHardLink(const QString& existingPath, const QString& linkPath)
+{
+    std::error_code error;
+    std::filesystem::create_hard_link(
+        QFileInfo(existingPath).filesystemAbsoluteFilePath(), QFileInfo(linkPath).filesystemAbsoluteFilePath(), error);
+    return !error;
+}
+
 // 목적: Qt event를 처리하면서 source binding update 수가 목표에 도달할 때까지 대기
 // 입력: updates: signal 기록 container, expectedCount: 목표 event 수, timeoutMs: 제한 시간
 // 출력: 제한 시간 안에 목표 수에 도달하면 true
@@ -47,6 +60,186 @@ namespace
         QThread::msleep(1);
     }
     return updates.size() >= expectedCount;
+}
+
+// 목적: Qt event를 처리하면서 Folder operation terminal 수가 목표에 도달할 때까지 대기
+// 입력: terminals: signal 기록 container, expectedCount: 목표 event 수, timeoutMs: 제한 시간
+// 출력: 제한 시간 안에 목표 수에 도달하면 true
+[[nodiscard]] bool waitForFolderTerminalCount(const std::vector<client::FolderOperationTerminal>& terminals,
+                                              std::size_t expectedCount,
+                                              int timeoutMs = 3000)
+{
+    QElapsedTimer timeout;
+    timeout.start();
+    while (timeout.elapsed() < timeoutMs)
+    {
+        if (terminals.size() >= expectedCount)
+        {
+            return true;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    return terminals.size() >= expectedCount;
+}
+
+TEST(CatalogOrchestratorTest, RunsQtFreeFolderScanWithoutCatalogAndRejectsConcurrentRequest)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstPath = QDir(directory.path()).filePath(QStringLiteral("a-한글.jpg"));
+    const QString secondPath = QDir(directory.path()).filePath(QStringLiteral("b.arw"));
+    const QString ignoredPath = QDir(directory.path()).filePath(QStringLiteral("ignored.txt"));
+    ASSERT_TRUE(writeSourceFile(firstPath, QByteArray("first-scan-source")));
+    ASSERT_TRUE(writeSourceFile(secondPath, QByteArray("second-scan-source")));
+    ASSERT_TRUE(writeSourceFile(ignoredPath, QByteArray("ignored")));
+    CatalogOrchestrator orchestrator;
+    client::IFolderImportClient& folderClient = orchestrator;
+    std::vector<client::FolderOperationReceipt> starts;
+    std::vector<client::FolderOperationTerminal> terminals;
+    QObject::connect(&orchestrator,
+                     &CatalogOrchestrator::folderOperationStarted,
+                     [&](const client::FolderOperationReceipt& receipt) { starts.push_back(receipt); });
+    QObject::connect(&orchestrator,
+                     &CatalogOrchestrator::folderOperationTerminal,
+                     [&](const client::FolderOperationTerminal& terminal) { terminals.push_back(terminal); });
+
+    const client::FolderOperationResult accepted =
+        folderClient.submitFolderScan({directory.path().toUtf8().toStdString()});
+    const client::FolderOperationResult busy = folderClient.submitFolderScan({directory.path().toUtf8().toStdString()});
+
+    ASSERT_TRUE(accepted.hasValue());
+    EXPECT_GT(accepted.value().id.value, 0U);
+    EXPECT_EQ(client::FolderOperationKind::Scan, accepted.value().kind);
+    EXPECT_EQ(QFileInfo(directory.path()).absoluteFilePath().toUtf8().toStdString(), accepted.value().folderPath);
+    ASSERT_TRUE(busy.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, busy.error().code);
+    ASSERT_EQ(1U, starts.size());
+    ASSERT_TRUE(waitForFolderTerminalCount(terminals, 1));
+    ASSERT_EQ(1U, terminals.size());
+    EXPECT_EQ(accepted.value(), terminals.front().receipt);
+    EXPECT_EQ(client::FolderOperationTerminalState::Completed, terminals.front().state);
+    ASSERT_TRUE(terminals.front().completion.has_value());
+    ASSERT_TRUE(std::holds_alternative<client::FolderScanCompletion>(*terminals.front().completion));
+    const client::FolderScanCompletion& completion =
+        std::get<client::FolderScanCompletion>(*terminals.front().completion);
+    ASSERT_EQ(2U, completion.items.size());
+    EXPECT_EQ("a-한글.jpg", completion.items[0].displayName);
+    EXPECT_EQ(client::CatalogFileKind::RasterImage, completion.items[0].kind);
+    EXPECT_EQ("b.arw", completion.items[1].displayName);
+    EXPECT_EQ(client::CatalogFileKind::Raw, completion.items[1].kind);
+    EXPECT_FALSE(terminals.front().error.has_value());
+}
+
+TEST(CatalogOrchestratorTest, ImportsFolderThroughQtFreeLifecycleAndReturnsPersistedIdentities)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("imported.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("lifecycle.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("folder-import-source")));
+    CatalogOrchestrator orchestrator;
+    client::IFolderImportClient& folderClient = orchestrator;
+    std::vector<client::FolderOperationTerminal> terminals;
+    QObject::connect(&orchestrator,
+                     &CatalogOrchestrator::folderOperationTerminal,
+                     [&](const client::FolderOperationTerminal& terminal) { terminals.push_back(terminal); });
+
+    const client::FolderOperationResult closedImport = folderClient.submitFolderImport(
+        {directory.path().toUtf8().toStdString(), QFileInfo(catalogPath).absoluteFilePath().toUtf8().toStdString()});
+    ASSERT_TRUE(closedImport.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closedImport.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const std::string expectedCatalogPath = orchestrator.state().catalogPath.toUtf8().toStdString();
+
+    const client::FolderOperationResult accepted =
+        folderClient.submitFolderImport({directory.path().toUtf8().toStdString(), expectedCatalogPath});
+
+    ASSERT_TRUE(accepted.hasValue());
+    ASSERT_TRUE(waitForFolderTerminalCount(terminals, 1));
+    ASSERT_EQ(1U, terminals.size());
+    EXPECT_EQ(accepted.value(), terminals.front().receipt);
+    EXPECT_EQ(client::FolderOperationTerminalState::Completed, terminals.front().state);
+    ASSERT_TRUE(terminals.front().completion.has_value());
+    ASSERT_TRUE(std::holds_alternative<client::FolderImportCompletion>(*terminals.front().completion));
+    const client::FolderImportCompletion& completion =
+        std::get<client::FolderImportCompletion>(*terminals.front().completion);
+    EXPECT_EQ(1, completion.discoveredCount);
+    EXPECT_EQ(1, completion.appliedCount);
+    ASSERT_EQ(1U, completion.photoIds.size());
+    EXPECT_GT(completion.photoIds.front().value, 0);
+    const client::CatalogPhotoPageResult photos = orchestrator.queryPhotoPage({});
+    ASSERT_TRUE(photos.hasValue());
+    ASSERT_EQ(1U, photos.value().photos.size());
+    EXPECT_EQ(completion.photoIds.front(), photos.value().photos.front().id);
+}
+
+TEST(CatalogOrchestratorTest, RejectsPersistenceWhenCatalogChangesAfterFolderImportAcceptance)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("session-change.jpg"));
+    const QString firstCatalogPath = QDir(directory.path()).filePath(QStringLiteral("first.flexraw-catalog"));
+    const QString secondCatalogPath = QDir(directory.path()).filePath(QStringLiteral("second.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("session-change-source")));
+    CatalogOrchestrator orchestrator;
+    std::vector<client::FolderOperationTerminal> terminals;
+    QObject::connect(&orchestrator,
+                     &CatalogOrchestrator::folderOperationTerminal,
+                     [&](const client::FolderOperationTerminal& terminal) { terminals.push_back(terminal); });
+    ASSERT_TRUE(orchestrator.openCatalog(firstCatalogPath).hasValue());
+    const std::string expectedCatalogPath = orchestrator.state().catalogPath.toUtf8().toStdString();
+
+    const client::FolderOperationResult accepted =
+        orchestrator.submitFolderImport({directory.path().toUtf8().toStdString(), expectedCatalogPath});
+    ASSERT_TRUE(accepted.hasValue());
+    EXPECT_FALSE(orchestrator.closeCatalog().isOpen);
+    ASSERT_TRUE(orchestrator.openCatalog(secondCatalogPath).hasValue());
+    ASSERT_TRUE(waitForFolderTerminalCount(terminals, 1));
+
+    ASSERT_EQ(1U, terminals.size());
+    EXPECT_EQ(client::FolderOperationTerminalState::Failed, terminals.front().state);
+    ASSERT_TRUE(terminals.front().error.has_value());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, terminals.front().error->code);
+    EXPECT_FALSE(terminals.front().completion.has_value());
+    const client::CatalogPhotoPageResult secondCatalogPhotos = orchestrator.queryPhotoPage({});
+    ASSERT_TRUE(secondCatalogPhotos.hasValue());
+    EXPECT_TRUE(secondCatalogPhotos.value().photos.empty());
+}
+
+TEST(CatalogOrchestratorTest, AcceptsExistingCatalogAliasAsFolderImportBaseline)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("alias-import.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("alias.flexraw-catalog"));
+    const QString catalogAliasPath = QDir(directory.path()).filePath(QStringLiteral("alias-link.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("alias-import-source")));
+    CatalogOrchestrator orchestrator;
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    EXPECT_FALSE(orchestrator.closeCatalog().isOpen);
+    if (!createHardLink(catalogPath, catalogAliasPath))
+    {
+        GTEST_SKIP() << "The test filesystem does not support hard links.";
+    }
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    std::vector<client::FolderOperationTerminal> terminals;
+    QObject::connect(&orchestrator,
+                     &CatalogOrchestrator::folderOperationTerminal,
+                     [&](const client::FolderOperationTerminal& terminal) { terminals.push_back(terminal); });
+
+    const client::FolderOperationResult accepted = orchestrator.submitFolderImport(
+        {directory.path().toUtf8().toStdString(), catalogAliasPath.toUtf8().toStdString()});
+
+    ASSERT_TRUE(accepted.hasValue());
+    ASSERT_TRUE(waitForFolderTerminalCount(terminals, 1));
+    ASSERT_EQ(1U, terminals.size());
+    EXPECT_EQ(client::FolderOperationTerminalState::Completed, terminals.front().state);
+    EXPECT_FALSE(terminals.front().error.has_value());
 }
 
 TEST(CatalogOrchestratorTest, OpensImportsAndPersistsBackgroundFingerprint)
@@ -115,6 +308,52 @@ TEST(CatalogOrchestratorTest, ImportsPreScannedEntriesWithoutScanningOnOwnerThre
     ASSERT_EQ(1, imported.value().fingerprintRequestIds.size());
     ASSERT_TRUE(waitForUpdateCount(updates, 1));
     EXPECT_EQ(catalog::SourceBindingState::Available, updates.front().photo.sourceState);
+}
+
+TEST(CatalogOrchestratorTest, ProjectsQtFreeFolderSnapshotsWithCountsAndUtf8Paths)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstFolder = QDir(directory.path()).filePath(QStringLiteral("a-first"));
+    const QString secondFolder = QDir(directory.path()).filePath(QStringLiteral("b-한글"));
+    ASSERT_TRUE(QDir().mkpath(firstFolder));
+    ASSERT_TRUE(QDir().mkpath(secondFolder));
+    const QString firstPath = QDir(firstFolder).filePath(QStringLiteral("first.jpg"));
+    const QString secondPath = QDir(firstFolder).filePath(QStringLiteral("second.jpg"));
+    const QString thirdPath = QDir(secondFolder).filePath(QStringLiteral("third.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("folders.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(firstPath, QByteArray("first-folder-source")));
+    ASSERT_TRUE(writeSourceFile(secondPath, QByteArray("second-folder-source")));
+    ASSERT_TRUE(writeSourceFile(thirdPath, QByteArray("third-folder-source")));
+    CatalogOrchestrator orchestrator;
+    client::ICatalogFolderClient& folderClient = orchestrator;
+
+    const client::CatalogFolderListResult closedFolders = folderClient.listFolders();
+    ASSERT_TRUE(closedFolders.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closedFolders.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const client::CatalogFolderListResult emptyFolders = folderClient.listFolders();
+    ASSERT_TRUE(emptyFolders.hasValue());
+    EXPECT_TRUE(emptyFolders.value().empty());
+    const QVector<catalog::CatalogEntry> entries{
+        {types::makeFileDescriptor(QFileInfo(firstPath), types::SupportedFileKind::RasterImage),
+         types::FileScanStatus::Ready},
+        {types::makeFileDescriptor(QFileInfo(secondPath), types::SupportedFileKind::RasterImage),
+         types::FileScanStatus::Ready},
+        {types::makeFileDescriptor(QFileInfo(thirdPath), types::SupportedFileKind::RasterImage),
+         types::FileScanStatus::Ready},
+    };
+    ASSERT_TRUE(orchestrator.importScannedEntries(entries).hasValue());
+
+    const client::CatalogFolderListResult folders = folderClient.listFolders();
+
+    ASSERT_TRUE(folders.hasValue());
+    ASSERT_EQ(2, folders.value().size());
+    EXPECT_EQ(firstFolder.toUtf8().toStdString(), folders.value()[0].path);
+    EXPECT_EQ(2, folders.value()[0].photoCount);
+    EXPECT_EQ(secondFolder.toUtf8().toStdString(), folders.value()[1].path);
+    EXPECT_EQ(1, folders.value()[1].photoCount);
 }
 
 TEST(CatalogOrchestratorTest, RegistersEditorActivationOnceAndReturnsStableIdentity)

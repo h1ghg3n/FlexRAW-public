@@ -21,7 +21,12 @@
 
 #include "frame_codec.h"
 #include "frame_parser.h"
+#include "health_payload_codec.h"
+#include "job_scheduler.h"
+#include "render_job_runner.h"
 #include "render_payload_codec.h"
+#include "render_worker_runtime_facade.h"
+#include "worker_path_resolver.h"
 #include "worker_server.h"
 
 namespace flexraw::worker::network
@@ -161,6 +166,87 @@ private:
     mutable QSemaphore m_release;
 };
 
+class CompletionWinningRuntime final : public runtime::IRenderWorkerRuntime
+{
+public:
+    // 목적: submit 반환 전에 Runtime terminal을 발생시켜 session delivery race를 결정적으로 구성
+    // 입력: command: Runtime identity와 output intent, completion: ProtocolSession callback
+    // 출력: completion을 먼저 호출한 뒤 Accepted
+    [[nodiscard]] runtime::RenderWorkerSubmitResult submit(runtime::RenderWorkerCommand command,
+                                                           runtime::RenderJobCompletion completion) override
+    {
+        ++m_submitCount;
+        const runtime::RenderJobExecutionResult result = runtime::RenderJobExecutionResult::success(
+            core::render::ResolvedRenderPipelineResult::success({{command.request.outputRelativePath, 42}, {}}));
+        completion({command.key, command.request.outputRelativePath, result});
+        return runtime::RenderWorkerSubmitResult::success(runtime::SubmitStatus::Accepted);
+    }
+
+    // 목적: completion이 이미 Runtime authority를 제거한 late cancel 모사
+    // 입력: key: session-scoped job identity
+    // 출력: active job이 없으므로 false
+    [[nodiscard]] bool cancel(const runtime::RenderJobKey key) override
+    {
+        static_cast<void>(key);
+        ++m_cancelCount;
+        return false;
+    }
+
+    // 목적: protocol health contract를 만족하는 최소 ready snapshot 제공
+    // 입력: 없음
+    // 출력: accepting 상태의 빈 Runtime snapshot
+    [[nodiscard]] runtime::WorkerRuntimeSnapshot snapshot() const override
+    {
+        return {0, 0, 1, 1, {}, true};
+    }
+
+    // 목적: submit 호출 횟수 조회
+    // 입력: 없음
+    // 출력: accepted request 수
+    [[nodiscard]] int submitCount() const noexcept
+    {
+        return m_submitCount;
+    }
+
+    // 목적: completion-won 구간에 도착한 cancel 호출 횟수 조회
+    // 입력: 없음
+    // 출력: Runtime cancel 호출 수
+    [[nodiscard]] int cancelCount() const noexcept
+    {
+        return m_cancelCount;
+    }
+
+private:
+    int m_submitCount{0};
+    int m_cancelCount{0};
+};
+
+class RuntimeServerHarness final
+{
+public:
+    // 목적: injected Runtime port를 ephemeral localhost WorkerServer에 연결
+    // 입력: runtime: protocol race를 제어할 fake Runtime
+    // 출력: 즉시 listen하는 server harness
+    explicit RuntimeServerHarness(runtime::IRenderWorkerRuntime& runtime) : m_server(runtime)
+    {
+        if (!m_server.listen(QHostAddress::LocalHost, 0))
+        {
+            throw std::runtime_error("Unable to create Runtime WorkerServer test harness.");
+        }
+    }
+
+    // 목적: client 연결용 ephemeral port 조회
+    // 입력: 없음
+    // 출력: bound server port
+    [[nodiscard]] quint16 port() const noexcept
+    {
+        return m_server.serverPort();
+    }
+
+private:
+    WorkerServer m_server;
+};
+
 class WorkerServerHarness final
 {
 public:
@@ -173,7 +259,8 @@ public:
                         WorkerServerConfiguration serverConfiguration = {})
         : m_resolver(createResolver(m_sourceRoot, m_outputRoot)),
           m_scheduler(runner, concurrency, queueCapacity),
-          m_server(m_resolver, m_scheduler, std::move(serverConfiguration))
+          m_runtimePort(m_resolver, m_scheduler),
+          m_server(m_runtimePort, std::move(serverConfiguration))
     {
         if (!m_sourceRoot.isValid() || !m_outputRoot.isValid() ||
             !createSourceFile(QDir(m_sourceRoot.path()).filePath(QStringLiteral("input.CR3"))) ||
@@ -212,6 +299,7 @@ private:
     QTemporaryDir m_outputRoot;
     runtime::WorkerPathResolver m_resolver;
     runtime::JobScheduler m_scheduler;
+    runtime::RenderWorkerRuntimeFacade m_runtimePort;
     WorkerServer m_server;
 };
 
@@ -307,6 +395,36 @@ private:
     return {protocol::MessageType::RenderRequest, jobId, encoded.hasValue() ? encoded.value() : QByteArray{}};
 }
 
+TEST(ProtocolSessionTest, ReturnsHealthSnapshotWithoutClaimingRenderJobIdentity)
+{
+    ImmediateRenderJobRunner runner;
+    WorkerServerHarness harness(runner, 3, 5);
+    ProtocolTestClient client;
+    ASSERT_TRUE(client.connectToServer(harness.port()));
+    ASSERT_TRUE(client.sendFrame({protocol::MessageType::HealthRequest, 7, {}}));
+
+    ASSERT_TRUE(client.waitForFrames(1));
+    const std::vector<protocol::ProtocolFrame> healthFrames = client.takeFrames();
+    ASSERT_EQ(1U, healthFrames.size());
+    EXPECT_EQ(protocol::MessageType::HealthResponse, healthFrames.front().messageType);
+    EXPECT_EQ(7U, healthFrames.front().jobId);
+    const protocol::DecodeHealthPayloadResult health =
+        protocol::decodeHealthResponsePayload(healthFrames.front().payload);
+    ASSERT_TRUE(health.hasValue());
+    EXPECT_EQ(protocol::HealthServiceState::Ready, health.value().serviceState);
+    EXPECT_EQ(0U, health.value().runningJobs);
+    EXPECT_EQ(0U, health.value().queuedJobs);
+    EXPECT_EQ(3U, health.value().maximumConcurrentJobs);
+    EXPECT_EQ(5U, health.value().queueCapacity);
+
+    ASSERT_TRUE(client.sendFrame(makeRenderRequestFrame(7)));
+    ASSERT_TRUE(client.waitForFrames(2));
+    const std::vector<protocol::ProtocolFrame> renderFrames = client.takeFrames();
+    ASSERT_EQ(2U, renderFrames.size());
+    EXPECT_EQ(protocol::MessageType::JobAccepted, renderFrames.front().messageType);
+    EXPECT_EQ(protocol::MessageType::RenderSucceeded, renderFrames.back().messageType);
+}
+
 TEST(ProtocolSessionTest, ReturnsAcceptedThenSucceededForValidRenderRequest)
 {
     ImmediateRenderJobRunner runner;
@@ -327,6 +445,34 @@ TEST(ProtocolSessionTest, ReturnsAcceptedThenSucceededForValidRenderRequest)
     EXPECT_EQ(QStringLiteral("output.jpg"), result.value().outputRelativePath);
     EXPECT_EQ(42U, result.value().byteSize);
     EXPECT_EQ(5U, result.value().stats.totalNanoseconds);
+}
+
+TEST(ProtocolSessionTest, PreservesQueuedTerminalWhenCompletionWinsLateCancel)
+{
+    CompletionWinningRuntime runtime;
+    RuntimeServerHarness harness(runtime);
+    ProtocolTestClient client;
+    ASSERT_TRUE(client.connectToServer(harness.port()));
+    const protocol::EncodeFrameResult request = protocol::encodeFrame(makeRenderRequestFrame(7));
+    const protocol::EncodeFrameResult cancel = protocol::encodeFrame({protocol::MessageType::CancelRequest, 7, {}});
+    ASSERT_TRUE(request.hasValue());
+    ASSERT_TRUE(cancel.hasValue());
+
+    ASSERT_TRUE(client.sendBytes(request.value() + cancel.value()));
+    ASSERT_TRUE(client.waitForFrames(2));
+    const std::vector<protocol::ProtocolFrame> firstFrames = client.takeFrames();
+    ASSERT_EQ(2U, firstFrames.size());
+    EXPECT_EQ(protocol::MessageType::JobAccepted, firstFrames[0].messageType);
+    EXPECT_EQ(protocol::MessageType::RenderSucceeded, firstFrames[1].messageType);
+    EXPECT_EQ(1, runtime.cancelCount());
+
+    ASSERT_TRUE(client.sendFrame(makeRenderRequestFrame(8)));
+    ASSERT_TRUE(client.waitForFrames(2));
+    const std::vector<protocol::ProtocolFrame> secondFrames = client.takeFrames();
+    ASSERT_EQ(2U, secondFrames.size());
+    EXPECT_EQ(protocol::MessageType::JobAccepted, secondFrames[0].messageType);
+    EXPECT_EQ(protocol::MessageType::RenderSucceeded, secondFrames[1].messageType);
+    EXPECT_EQ(2, runtime.submitCount());
 }
 
 TEST(ProtocolSessionTest, ReturnsAcceptedThenResourceBusyWithRetryAdvice)

@@ -17,11 +17,13 @@
 
 #include "catalog_editor_facade.h"
 #include "catalog_orchestrator.h"
+#include "catalog_session_orchestrator.h"
 #include "catalog_thumbnail_orchestrator.h"
 #include "catalog_thumbnail_pipeline.h"
 #include "editor_orchestrator.h"
 #include "preview_orchestrator.h"
 #include "preview_pipeline.h"
+#include "qt_source_resolution_event_source.h"
 #include "source_path.h"
 
 namespace flexraw::ui::facade
@@ -71,6 +73,32 @@ public:
            file.flush();
 }
 
+// 목적: facade test Catalog entry를 Qt-free Editor source activation command로 변환
+// 입력: entry: normalized source와 지원 file metadata
+// 출력: 같은 source 의미를 가진 client command
+[[nodiscard]] core::client::ActivateEditorSourceCommand toActivateSourceCommand(
+    const core::catalog::CatalogEntry& entry)
+{
+    const core::client::CatalogFileKind kind = entry.file.kind == core::types::SupportedFileKind::Raw
+                                                   ? core::client::CatalogFileKind::Raw
+                                                   : core::client::CatalogFileKind::RasterImage;
+    return {entry.file.path.toUtf8().toStdString(),
+            entry.file.extension.toUtf8().toStdString(),
+            entry.file.displayName.toUtf8().toStdString(),
+            kind};
+}
+
+// 목적: facade의 Qt-free Catalog Session contract로 새 test Catalog 생성
+// 입력: facade: 실제 Qt adapter, catalogPath: 존재하지 않는 temporary path
+// 출력: explicit CreateNew command 결과
+[[nodiscard]] core::client::CatalogSessionResult createTestCatalog(core::client::ICatalogSessionClient& sessionClient,
+                                                                   const QString& catalogPath)
+{
+    return sessionClient.openCatalog({catalogPath.toUtf8().toStdString(),
+                                      core::client::CatalogOpenMode::CreateNew,
+                                      core::client::CatalogReplacementPolicy::Reject});
+}
+
 // 목적: Qt event를 처리하며 facade source update 수가 목표에 도달할 때까지 대기
 // 입력: updateCount: signal handler count, expectedCount: 목표 수, timeoutMs: 제한 시간
 // 출력: 제한 시간 안에 목표 update를 받으면 true
@@ -118,7 +146,13 @@ TEST(CatalogEditorFacadeTest, DeliversInitialEditorSnapshotAsynchronouslyOnQtCon
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     std::vector<core::client::EditorStateEvent> events;
     bool subscribeReturned = false;
     bool reenteredSubscribe = false;
@@ -157,7 +191,13 @@ TEST(CatalogEditorFacadeTest, CoalescesAdjustmentEventsAndPreservesFinalSnapshot
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     std::vector<core::client::EditorStateEvent> events;
     const core::client::EditorStateSubscriptionResult subscription = facade.subscribeToEditorState(
         [&events](const core::client::EditorStateEvent& event) { events.push_back(event); });
@@ -177,8 +217,8 @@ TEST(CatalogEditorFacadeTest, CoalescesAdjustmentEventsAndPreservesFinalSnapshot
                      &catalogOrchestrator,
                      [&sourceUpdateCount](const core::orchestration::CatalogSourceUpdate&) { ++sourceUpdateCount; });
 
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    const core::orchestration::CatalogImportResult imported = facade.importScannedEntries({entry});
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    const core::orchestration::CatalogImportResult imported = catalogOrchestrator.importScannedEntries({entry});
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().photoIds.size());
     ASSERT_TRUE(waitForSourceUpdates(sourceUpdateCount, 1));
@@ -217,7 +257,13 @@ TEST(CatalogEditorFacadeTest, UnsubscribeSuppressesQueuedAndFutureEditorEvents)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     std::vector<core::client::EditorStateEvent> events;
     const core::client::EditorStateSubscriptionResult subscription = facade.subscribeToEditorState(
         [&events](const core::client::EditorStateEvent& event) { events.push_back(event); });
@@ -238,11 +284,16 @@ TEST(CatalogEditorFacadeTest, AdapterDestructionDeactivatesOutlivingEditorSubscr
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
     std::vector<core::client::EditorStateEvent> events;
     core::client::EditorStateSubscriptionHandle handle;
     {
-        auto facade = std::make_unique<CatalogEditorFacade>(
-            catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+        auto facade = std::make_unique<CatalogEditorFacade>(catalogOrchestrator,
+                                                            catalogSessionOrchestrator,
+                                                            catalogThumbnailOrchestrator,
+                                                            editorOrchestrator,
+                                                            sourceResolutionEventSource);
         const core::client::EditorStateSubscriptionResult subscription = facade->subscribeToEditorState(
             [&events](const core::client::EditorStateEvent& event) { events.push_back(event); });
         ASSERT_TRUE(subscription.hasValue());
@@ -268,35 +319,43 @@ TEST(CatalogEditorFacadeTest, ActivatesFolderPhotoWithStableIdentityAndForwardsE
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
-    int stateChangeCount = 0;
-    QObject::connect(&facade,
-                     &CatalogEditorFacade::editorStateChanged,
-                     &facade,
-                     [&stateChangeCount](const core::orchestration::EditorState&) { ++stateChangeCount; });
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
+    std::vector<core::client::EditorStateEvent> events;
+    const core::client::EditorStateSubscriptionResult subscription = facade.subscribeToEditorState(
+        [&events](const core::client::EditorStateEvent& event) { events.push_back(event); });
+    ASSERT_TRUE(subscription.hasValue());
+    ASSERT_TRUE(waitForEditorEvents(events, 1));
+    events.clear();
     const core::catalog::CatalogEntry entry{
         {sourcePath, QStringLiteral("jpg"), QStringLiteral("facade.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
 
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    const core::orchestration::EditorStateResult selected = facade.activatePhoto(entry, QSize{640, 480});
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    ASSERT_TRUE(facade.setPreviewViewport({{640, 480}}).hasValue());
+    const core::client::EditorResult selected = facade.activateSource(toActivateSourceCommand(entry));
     ASSERT_TRUE(selected.hasValue());
-    core::types::DevelopParams params;
+    core::client::EditorDevelopParams params;
     params.exposureEv = 0.8F;
-    ASSERT_TRUE(facade.updateDevelopParams(params, QSize{640, 480}));
+    ASSERT_TRUE(facade.updateDevelopParams({params}).hasValue());
+    ASSERT_TRUE(waitForEditorEvents(events, 2));
 
     EXPECT_TRUE(selected.value().hasSelection);
-    EXPECT_TRUE(core::types::isValidPhotoId(selected.value().photo.photoId));
-    EXPECT_TRUE(selected.value().photo.transientKey.isEmpty());
-    ASSERT_TRUE(facade.queryPhotos(core::catalog::CatalogPhotoPageRequest{}).hasValue());
-    EXPECT_EQ(1, facade.queryPhotos(core::catalog::CatalogPhotoPageRequest{}).value().photos.size());
-    EXPECT_EQ(params, facade.editorState().params);
-    EXPECT_TRUE(facade.editorState().dirty);
-    EXPECT_EQ(2, stateChangeCount);
+    EXPECT_GT(selected.value().photoId.value, 0);
+    const core::client::CatalogPhotoPageResult photos = facade.queryPhotoPage({});
+    ASSERT_TRUE(photos.hasValue());
+    EXPECT_EQ(1U, photos.value().photos.size());
+    EXPECT_EQ(params, facade.editorSnapshot().params);
+    EXPECT_TRUE(facade.editorSnapshot().dirty);
 }
 
-TEST(CatalogEditorFacadeTest, ForwardsQtFreeEditorContractAndProjectsLegacyState)
+TEST(CatalogEditorFacadeTest, ForwardsQtFreeEditorContract)
 {
     QTemporaryDir directory;
     ASSERT_TRUE(directory.isValid());
@@ -308,7 +367,13 @@ TEST(CatalogEditorFacadeTest, ForwardsQtFreeEditorContractAndProjectsLegacyState
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     const core::catalog::CatalogEntry entry{
         {sourcePath,
          QStringLiteral("jpg"),
@@ -317,8 +382,8 @@ TEST(CatalogEditorFacadeTest, ForwardsQtFreeEditorContractAndProjectsLegacyState
         core::types::FileScanStatus::Ready,
     };
 
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    const core::orchestration::CatalogImportResult imported = facade.importScannedEntries({entry});
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    const core::orchestration::CatalogImportResult imported = catalogOrchestrator.importScannedEntries({entry});
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().photoIds.size());
     core::client::IEditorClient& editorClient = facade;
@@ -333,13 +398,12 @@ TEST(CatalogEditorFacadeTest, ForwardsQtFreeEditorContractAndProjectsLegacyState
     const core::client::EditorResult saved = editorClient.saveDevelopState();
 
     ASSERT_TRUE(saved.hasValue());
-    EXPECT_EQ(photoId.value, facade.editorState().photo.photoId.value);
+    EXPECT_EQ(photoId, facade.editorSnapshot().photoId);
     EXPECT_EQ(params, facade.editorSnapshot().params);
-    EXPECT_EQ(params.exposureEv, facade.editorState().params.exposureEv);
-    EXPECT_FALSE(facade.editorState().dirty);
+    EXPECT_FALSE(facade.editorSnapshot().dirty);
 }
 
-TEST(CatalogEditorFacadeTest, ProjectsAsyncPreviewIntoQtFreeDisplayFrame)
+TEST(CatalogEditorFacadeTest, PublishesFrameAndAnalysisThroughQtFreePreviewContract)
 {
     QTemporaryDir directory;
     ASSERT_TRUE(directory.isValid());
@@ -351,23 +415,35 @@ TEST(CatalogEditorFacadeTest, ProjectsAsyncPreviewIntoQtFreeDisplayFrame)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     std::optional<core::client::DisplayFrame> receivedFrame;
+    std::optional<core::client::PreviewAnalysisSnapshot> receivedAnalysis;
     QEventLoop eventLoop;
-    QObject::connect(&facade,
-                     &CatalogEditorFacade::displayFrameUpdated,
-                     &eventLoop,
-                     [&receivedFrame, &eventLoop](const core::client::DisplayFrame& frame) {
-                         receivedFrame = frame;
-                         eventLoop.quit();
-                     });
+    const core::client::PreviewPresentationSubscriptionResult subscription = facade.subscribeToPreviewPresentation(
+        [&receivedFrame, &receivedAnalysis, &eventLoop](const core::client::PreviewPresentationEvent& event) {
+            if (!event.frameUpdated || !event.snapshot.currentFrame.has_value())
+            {
+                return;
+            }
+            receivedFrame = event.snapshot.currentFrame->frame;
+            receivedAnalysis = event.snapshot.currentFrame->analysis;
+            eventLoop.quit();
+        });
+    ASSERT_TRUE(subscription.hasValue());
     const core::catalog::CatalogEntry entry{
         {sourcePath, QStringLiteral("jpg"), QStringLiteral("frame.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
 
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    ASSERT_TRUE(facade.activatePhoto(entry, QSize{640, 480}).hasValue());
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    ASSERT_TRUE(facade.setPreviewViewport({{640, 480}}).hasValue());
+    ASSERT_TRUE(facade.activateSource(toActivateSourceCommand(entry)).hasValue());
     QTimer::singleShot(3000, &eventLoop, &QEventLoop::quit);
     eventLoop.exec();
 
@@ -379,6 +455,9 @@ TEST(CatalogEditorFacadeTest, ProjectsAsyncPreviewIntoQtFreeDisplayFrame)
     EXPECT_EQ(20U, receivedFrame->bytes()[1]);
     EXPECT_EQ(10U, receivedFrame->bytes()[2]);
     EXPECT_EQ(255U, receivedFrame->bytes()[3]);
+    ASSERT_TRUE(receivedAnalysis.has_value());
+    EXPECT_EQ(0U, receivedAnalysis->histogram.pixelCount);
+    EXPECT_EQ(0U, receivedAnalysis->clipping.pixelCount);
 }
 
 TEST(CatalogEditorFacadeTest, ForwardsCatalogCommands)
@@ -394,18 +473,23 @@ TEST(CatalogEditorFacadeTest, ForwardsCatalogCommands)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     const core::catalog::CatalogEntry entry{
         {sourcePath, QStringLiteral("jpg"), QStringLiteral("facade.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
 
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    const core::orchestration::CatalogImportResult imported = facade.importScannedEntries({entry});
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    const core::orchestration::CatalogImportResult imported = catalogOrchestrator.importScannedEntries({entry});
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().photoIds.size());
-    const core::orchestration::CatalogPhotoPageResult photos =
-        facade.queryPhotos(core::catalog::CatalogPhotoPageRequest{});
+    const core::client::CatalogPhotoPageResult photos = facade.queryPhotoPage({});
 
     ASSERT_TRUE(photos.hasValue());
     ASSERT_EQ(1, photos.value().photos.size());
@@ -420,14 +504,16 @@ TEST(CatalogEditorFacadeTest, ForwardsCatalogCommands)
     ASSERT_TRUE(projects.hasValue());
     ASSERT_EQ(1, projects.value().size());
     EXPECT_EQ("Selected", projects.value().front().name);
-    core::catalog::CatalogPhotoPageRequest projectRequest;
-    projectRequest.projectId = core::catalog::ProjectId{project.value().id.value};
-    ASSERT_TRUE(facade.queryPhotos(projectRequest).hasValue());
-    EXPECT_EQ(1, facade.queryPhotos(projectRequest).value().photos.size());
+    core::client::CatalogPhotoPageRequest projectRequest;
+    projectRequest.projectId = project.value().id;
+    ASSERT_TRUE(facade.queryPhotoPage(projectRequest).hasValue());
+    EXPECT_EQ(1U, facade.queryPhotoPage(projectRequest).value().photos.size());
     ASSERT_TRUE(projectClient.removePhotoFromProject({project.value().id, photoId}).hasValue());
     ASSERT_TRUE(projectClient.deleteProject({project.value().id}).hasValue());
-    EXPECT_FALSE(facade.closeCatalog().isOpen);
-    EXPECT_FALSE(facade.catalogState().isOpen);
+    const core::client::CatalogSessionResult closed = facade.closeCatalog();
+    ASSERT_TRUE(closed.hasValue());
+    EXPECT_FALSE(closed.value().isOpen);
+    EXPECT_FALSE(facade.catalogSnapshot().isOpen);
 }
 
 TEST(CatalogEditorFacadeTest, ForwardsExactFolderPhotoPageScope)
@@ -449,7 +535,14 @@ TEST(CatalogEditorFacadeTest, ForwardsExactFolderPhotoPageScope)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
+    core::client::ICatalogFolderClient& folderClient = facade;
     const core::catalog::CatalogEntry firstEntry{
         {firstPath, QStringLiteral("jpg"), QStringLiteral("first.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
@@ -458,20 +551,20 @@ TEST(CatalogEditorFacadeTest, ForwardsExactFolderPhotoPageScope)
         {secondPath, QStringLiteral("jpg"), QStringLiteral("second.jpg"), core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    ASSERT_TRUE(facade.importScannedEntries({firstEntry, secondEntry}).hasValue());
-    core::catalog::CatalogPhotoPageRequest request;
-    request.exactFolderPath = firstFolder;
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    ASSERT_TRUE(catalogOrchestrator.importScannedEntries({firstEntry, secondEntry}).hasValue());
+    core::client::CatalogPhotoPageRequest request;
+    request.exactFolderPath = firstFolder.toUtf8().toStdString();
 
-    const core::orchestration::CatalogPhotoPageResult photos = facade.queryPhotos(request);
-    const core::orchestration::CatalogFolderListResult folders = facade.queryFolders();
+    const core::client::CatalogPhotoPageResult photos = facade.queryPhotoPage(request);
+    const core::client::CatalogFolderListResult folders = folderClient.listFolders();
 
     ASSERT_TRUE(photos.hasValue());
     ASSERT_EQ(1, photos.value().photos.size());
-    EXPECT_EQ(QStringLiteral("first.jpg"), photos.value().photos.front().displayName);
+    EXPECT_EQ("first.jpg", photos.value().photos.front().displayName);
     ASSERT_TRUE(folders.hasValue());
     ASSERT_EQ(2, folders.value().size());
-    EXPECT_EQ(core::catalog::normalizeSourceFolderPath(firstFolder), folders.value()[0].path);
+    EXPECT_EQ(core::catalog::normalizeSourceFolderPath(firstFolder).toUtf8().toStdString(), folders.value()[0].path);
     EXPECT_EQ(1, folders.value()[0].photoCount);
 }
 
@@ -488,16 +581,24 @@ TEST(CatalogEditorFacadeTest, ForwardsSourceResolutionCommandsAndTerminalEvents)
     core::orchestration::CatalogThumbnailOrchestrator catalogThumbnailOrchestrator(
         std::make_unique<core::orchestration::FileCatalogThumbnailPipeline>());
     core::orchestration::EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
-    CatalogEditorFacade facade(catalogOrchestrator, catalogThumbnailOrchestrator, editorOrchestrator);
+    core::orchestration::CatalogSessionOrchestrator catalogSessionOrchestrator(catalogOrchestrator, editorOrchestrator);
+    core::orchestration::QtSourceResolutionEventSource sourceResolutionEventSource(catalogOrchestrator);
+    CatalogEditorFacade facade(catalogOrchestrator,
+                               catalogSessionOrchestrator,
+                               catalogThumbnailOrchestrator,
+                               editorOrchestrator,
+                               sourceResolutionEventSource);
     int updateCount = 0;
-    core::orchestration::CatalogSourceUpdate latestUpdate;
-    QObject::connect(&facade,
-                     &CatalogEditorFacade::sourceBindingUpdated,
-                     &facade,
-                     [&updateCount, &latestUpdate](const core::orchestration::CatalogSourceUpdate& update) {
-                         ++updateCount;
-                         latestUpdate = update;
-                     });
+    core::client::SourceResolutionUpdate latestUpdate;
+    const core::client::SourceResolutionSubscriptionResult subscribed = facade.subscribeToSourceResolution(
+        [&updateCount, &latestUpdate](const core::client::SourceResolutionEvent& event) {
+            if (event.update.has_value())
+            {
+                ++updateCount;
+                latestUpdate = *event.update;
+            }
+        });
+    ASSERT_TRUE(subscribed.hasValue());
     const core::catalog::CatalogEntry entry{
         {sourcePath,
          QStringLiteral("jpg"),
@@ -505,22 +606,36 @@ TEST(CatalogEditorFacadeTest, ForwardsSourceResolutionCommandsAndTerminalEvents)
          core::types::SupportedFileKind::RasterImage},
         core::types::FileScanStatus::Ready,
     };
-    ASSERT_TRUE(facade.openCatalog(catalogPath).hasValue());
-    const core::orchestration::EditorStateResult activated = facade.activatePhoto(entry, QSize{640, 480});
+    ASSERT_TRUE(createTestCatalog(facade, catalogPath).hasValue());
+    ASSERT_TRUE(facade.setPreviewViewport({{640, 480}}).hasValue());
+    const core::client::EditorResult activated = facade.activateSource(toActivateSourceCommand(entry));
     ASSERT_TRUE(activated.hasValue());
     ASSERT_TRUE(waitForSourceUpdates(updateCount, 1));
-    const core::types::PhotoId photoId = activated.value().photo.photoId;
+    const core::client::ClientPhotoId photoId = activated.value().photoId;
     ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("replacement-source-with-different-size")));
-    ASSERT_TRUE(facade.selectCatalogPhoto(photoId, QSize{640, 480}).hasValue());
+    ASSERT_TRUE(facade.selectPhoto({photoId}).hasValue());
     ASSERT_TRUE(waitForSourceUpdates(updateCount, 2));
-    ASSERT_EQ(core::catalog::SourceBindingState::ReplacementDetected, latestUpdate.photo.sourceState);
+    ASSERT_EQ(core::client::CatalogSourceState::ReplacementDetected, latestUpdate.photo.sourceState);
 
-    const core::orchestration::CatalogSourceSubmissionResult accepted = facade.acceptReplacement(photoId);
+    const core::client::SourceRequestResult accepted = facade.acceptReplacement({photoId});
 
     ASSERT_TRUE(accepted.hasValue());
     ASSERT_TRUE(waitForSourceUpdates(updateCount, 3));
-    EXPECT_EQ(core::catalog::SourceBindingState::Available, latestUpdate.photo.sourceState);
+    EXPECT_EQ(core::client::CatalogSourceState::Available, latestUpdate.photo.sourceState);
     EXPECT_EQ(photoId.value, latestUpdate.photo.id.value);
+
+    ASSERT_TRUE(writeSourceFile(sourcePath, QByteArray("third-source-for-register-as-new-with-different-size")));
+    ASSERT_TRUE(facade.selectPhoto({photoId}).hasValue());
+    ASSERT_TRUE(waitForSourceUpdates(updateCount, 4));
+    ASSERT_EQ(core::client::CatalogSourceState::ReplacementDetected, latestUpdate.photo.sourceState);
+    const core::client::SourceRequestResult registered = facade.registerReplacementAsNew({photoId});
+    ASSERT_TRUE(registered.hasValue());
+    ASSERT_TRUE(waitForSourceUpdates(updateCount, 5));
+    EXPECT_EQ(core::client::SourceRequestKind::RegisterReplacementAsNew, latestUpdate.receipt.kind);
+    EXPECT_EQ(core::client::CatalogSourceState::Unlinked, latestUpdate.photo.sourceState);
+    ASSERT_TRUE(latestUpdate.createdPhoto.has_value());
+    EXPECT_NE(photoId.value, latestUpdate.createdPhoto->id.value);
+    EXPECT_EQ(core::client::CatalogSourceState::Available, latestUpdate.createdPhoto->sourceState);
 }
 
 }  // namespace

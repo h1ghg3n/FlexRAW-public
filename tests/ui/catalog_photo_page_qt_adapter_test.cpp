@@ -1,4 +1,6 @@
+#include <array>
 #include <cstdint>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -54,6 +56,32 @@ TEST(CatalogPhotoPageQtAdapterTest, PreservesStableOrderAndAbsentSource)
     EXPECT_EQ(QStringLiteral("first.jpg"), photos[0].displayName);
     EXPECT_FALSE(photos[0].source.has_value());
     EXPECT_EQ(17, photos[1].id.value);
+}
+
+TEST(CatalogPhotoPageQtAdapterTest, ProjectsEveryClientSourceStateToGuiRecord)
+{
+    constexpr std::array mappings{
+        std::pair{core::client::CatalogSourceState::FingerprintPending,
+                  core::catalog::SourceBindingState::FingerprintPending},
+        std::pair{core::client::CatalogSourceState::Available, core::catalog::SourceBindingState::Available},
+        std::pair{core::client::CatalogSourceState::Missing, core::catalog::SourceBindingState::Missing},
+        std::pair{core::client::CatalogSourceState::VerificationRequired,
+                  core::catalog::SourceBindingState::VerificationRequired},
+        std::pair{core::client::CatalogSourceState::IdentityUnverified,
+                  core::catalog::SourceBindingState::IdentityUnverified},
+        std::pair{core::client::CatalogSourceState::ReplacementDetected,
+                  core::catalog::SourceBindingState::ReplacementDetected},
+        std::pair{core::client::CatalogSourceState::Unreadable, core::catalog::SourceBindingState::Unreadable},
+        std::pair{core::client::CatalogSourceState::Unlinked, core::catalog::SourceBindingState::Unlinked},
+    };
+
+    for (const auto& [clientState, guiState] : mappings)
+    {
+        core::client::CatalogPhotoSnapshot snapshot;
+        snapshot.sourceState = clientState;
+
+        EXPECT_EQ(guiState, toCatalogPhotoRecord(snapshot).sourceState);
+    }
 }
 
 }  // namespace

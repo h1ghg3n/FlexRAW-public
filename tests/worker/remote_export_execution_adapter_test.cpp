@@ -1,5 +1,3 @@
-#include <gtest/gtest.h>
-
 #include <memory>
 #include <utility>
 
@@ -9,7 +7,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QUuid>
+
+#include <gtest/gtest.h>
 
 #include "remote_export_execution_adapter.h"
 
@@ -73,11 +74,8 @@ public:
 // 목적: absolute RAW item과 marker profile을 adapter test fixture로 조립
 // 입력: sourcePath/outputPath: local path, sourceId/outputId: expected storage identity
 // 출력: target과 prepared item pair
-[[nodiscard]] std::pair<core::orchestration::ExportRemoteTarget, core::orchestration::PreparedExportItem>
-makeOperation(const QString& sourcePath,
-              const QString& outputPath,
-              const QUuid& sourceId,
-              const QUuid& outputId)
+[[nodiscard]] std::pair<core::orchestration::ExportRemoteTarget, core::orchestration::PreparedExportItem> makeOperation(
+    const QString& sourcePath, const QString& outputPath, const QUuid& sourceId, const QUuid& outputId)
 {
     core::orchestration::ExportRemoteTarget target;
     target.host = QStringLiteral("192.0.2.10");
@@ -116,12 +114,23 @@ TEST(RemoteExportExecutionAdapterTest, MapsSharedStorageAndRestoresDesktopOutput
     const RemoteExportExecutionAdapter adapter(std::move(executor));
     const core::types::CancellationSource cancellation;
     int acceptedCount = 0;
+    bool executeReturned = false;
+    bool acceptedBeforeReturn = false;
+    QThread* acceptedThread = nullptr;
+    QThread* const executeThread = QThread::currentThread();
 
     const core::orchestration::RemoteExportExecutionResult result =
-        adapter.execute(target, item, cancellation.token(), [&acceptedCount] { ++acceptedCount; });
+        adapter.execute(target, item, cancellation.token(), [&] {
+            ++acceptedCount;
+            acceptedBeforeReturn = !executeReturned;
+            acceptedThread = QThread::currentThread();
+        });
+    executeReturned = true;
 
     ASSERT_TRUE(result.hasValue());
     EXPECT_EQ(1, acceptedCount);
+    EXPECT_TRUE(acceptedBeforeReturn);
+    EXPECT_EQ(executeThread, acceptedThread);
     EXPECT_EQ(1, recorded->executeCount);
     EXPECT_EQ(QStringLiteral("nested/사진.ARW"), recorded->lastRequest.sourceRelativePath);
     EXPECT_EQ(QStringLiteral("결과.jpg"), recorded->lastRequest.outputRelativePath);
@@ -142,8 +151,8 @@ TEST(RemoteExportExecutionAdapterTest, RejectsStorageMismatchBeforeExecutorStart
     ASSERT_TRUE(source.open(QIODevice::WriteOnly));
     source.write("raw");
     source.close();
-    auto [target, item] =
-        makeOperation(source.fileName(), outputRoot.filePath(QStringLiteral("output.jpg")), QUuid::createUuid(), outputId);
+    auto [target, item] = makeOperation(
+        source.fileName(), outputRoot.filePath(QStringLiteral("output.jpg")), QUuid::createUuid(), outputId);
     auto executor = std::make_unique<RecordingRemoteExecutor>();
     RecordingRemoteExecutor* const recorded = executor.get();
     const RemoteExportExecutionAdapter adapter(std::move(executor));

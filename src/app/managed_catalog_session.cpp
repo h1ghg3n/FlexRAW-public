@@ -6,9 +6,10 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QSettings>
-#include <QStandardPaths>
 
 #include "catalog_orchestrator.h"
+#include "catalog_path.h"
+#include "client_error_projection.h"
 
 namespace flexraw::app
 {
@@ -20,7 +21,6 @@ constexpr auto LastActiveCatalogKey = "lastActivePath";
 constexpr auto RecoveryPathKey = "recovery/unavailablePath";
 constexpr auto RecoveryErrorCodeKey = "recovery/errorCode";
 constexpr auto RecoveryErrorMessageKey = "recovery/errorMessage";
-constexpr auto ManagedCatalogFileName = "Flexraw.flexraw-catalog";
 
 // 목적: settings dependency가 null이 아닌 소유 객체인지 검증
 // 입력: settings: caller가 전달한 optional ownership
@@ -34,23 +34,6 @@ constexpr auto ManagedCatalogFileName = "Flexraw.flexraw-catalog";
     return settings;
 }
 
-// 목적: 비어 있지 않은 catalog path를 비교 가능한 절대 경로로 정규화
-// 입력: catalogPath: settings 또는 caller가 전달한 catalog 경로
-// 출력: 정규화된 절대 경로, 입력이 비어 있으면 빈 문자열
-[[nodiscard]] QString normalizedCatalogPath(const QString& catalogPath)
-{
-    const QString trimmedPath = catalogPath.trimmed();
-    return trimmedPath.isEmpty() ? QString{} : QFileInfo(trimmedPath).absoluteFilePath();
-}
-
-// 목적: 두 catalog locator가 같은 정규화 경로인지 확인
-// 입력: left/right: 비교할 catalog 경로
-// 출력: 정규화된 경로 문자열이 같으면 true
-[[nodiscard]] bool isSameCatalogPath(const QString& left, const QString& right)
-{
-    return normalizedCatalogPath(left) == normalizedCatalogPath(right);
-}
-
 // 목적: Managed Catalog startup path 오류를 구조화된 CoreError로 생성
 // 입력: code: 오류 분류, message: technical 설명
 // 출력: Catalog startup state에 저장할 CoreError
@@ -59,31 +42,42 @@ constexpr auto ManagedCatalogFileName = "Flexraw.flexraw-catalog";
     return {code, std::move(message)};
 }
 
-// 목적: OS별 per-user local application data 아래 기본 Managed Catalog 경로 resolve
-// 입력: 없음
-// 출력: 기본 catalog 절대 경로, 표준 위치를 얻지 못하면 빈 문자열
-[[nodiscard]] QString defaultManagedCatalogPath()
-{
-    const QString applicationDataPath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    return applicationDataPath.isEmpty() ? QString{} : QDir(applicationDataPath).filePath(ManagedCatalogFileName);
-}
-
 }  // namespace
 
-// 목적: OS 표준 application data와 기본 QSettings를 사용하는 Managed Catalog session 시작
-// 입력: 없음
+// 목적: 주입된 Catalog owner와 application startup settings를 사용하는 Managed Catalog session 시작
+// 입력: orchestrator: 이 session보다 오래 살아야 하는 Catalog resource owner,
+//       startupSettingsClient: startup 시점 snapshot을 제공하는 settings contract
 // 출력: startup recovery가 완료된 production catalog session
-ManagedCatalogSession::ManagedCatalogSession()
-    : ManagedCatalogSession(std::make_unique<QSettings>(), defaultManagedCatalogPath())
-{}
+ManagedCatalogSession::ManagedCatalogSession(core::orchestration::CatalogOrchestrator& orchestrator,
+                                             core::client::ICatalogStartupSettingsClient& startupSettingsClient)
+    : m_orchestrator(orchestrator), m_settings(std::make_unique<QSettings>())
+{
+    const core::client::CatalogStartupSettingsResult settings = startupSettingsClient.catalogStartupSettings();
+    if (settings.hasError())
+    {
+        m_startupConfigurationError = core::orchestration::fromClientError(settings.error());
+    }
+    else
+    {
+        m_defaultCatalogPath =
+            core::catalog::normalizeCatalogPath(QString::fromUtf8(settings.value().managedCatalogPath.c_str()));
+        m_startupBehavior = settings.value().behavior;
+    }
+    m_startupState = startCatalog();
+}
 
-// 목적: 주입된 settings와 기본 catalog 경로로 test 가능한 Managed Catalog session 시작
-// 입력: settings: session이 소유할 설정 저장소, defaultCatalogPath: fallback catalog 파일 경로
+// 목적: 주입된 Catalog owner, settings와 resolved startup 값으로 test 가능한 Managed Catalog session 시작
+// 입력: orchestrator: session보다 오래 살아야 하는 owner, settings: 소유할 설정,
+//       defaultCatalogPath: fallback 경로, startupBehavior: startup Catalog 선택 정책
 // 출력: startup recovery가 완료된 catalog session
-ManagedCatalogSession::ManagedCatalogSession(std::unique_ptr<QSettings> settings, QString defaultCatalogPath)
-    : m_settings(requireSettings(std::move(settings))),
-      m_defaultCatalogPath(normalizedCatalogPath(defaultCatalogPath)),
-      m_orchestrator(std::make_unique<core::orchestration::CatalogOrchestrator>())
+ManagedCatalogSession::ManagedCatalogSession(core::orchestration::CatalogOrchestrator& orchestrator,
+                                             std::unique_ptr<QSettings> settings,
+                                             QString defaultCatalogPath,
+                                             const core::client::CatalogStartupBehavior startupBehavior)
+    : m_orchestrator(orchestrator),
+      m_settings(requireSettings(std::move(settings))),
+      m_defaultCatalogPath(core::catalog::normalizeCatalogPath(defaultCatalogPath)),
+      m_startupBehavior(startupBehavior)
 {
     m_startupState = startCatalog();
 }
@@ -94,14 +88,6 @@ ManagedCatalogSession::ManagedCatalogSession(std::unique_ptr<QSettings> settings
 ManagedCatalogSession::~ManagedCatalogSession()
 {
     rememberActiveCatalog();
-}
-
-// 목적: session이 소유한 CatalogOrchestrator를 downstream consumer에 주입
-// 입력: 없음
-// 출력: ManagedCatalogSession lifetime 동안 유효한 Orchestrator 참조
-core::orchestration::CatalogOrchestrator& ManagedCatalogSession::orchestrator() noexcept
-{
-    return *m_orchestrator;
 }
 
 // 목적: startup open, fallback과 fatal 상태를 immutable 값으로 조회
@@ -120,10 +106,28 @@ ManagedCatalogStartupState ManagedCatalogSession::startCatalog()
     ManagedCatalogStartupState startupState;
     startupState.defaultCatalogPath = m_defaultCatalogPath;
 
-    m_settings->beginGroup(QString::fromLatin1(CatalogSettingsGroup));
-    const QString configuredCatalogPath =
-        normalizedCatalogPath(m_settings->value(QString::fromLatin1(LastActiveCatalogKey)).toString());
-    m_settings->endGroup();
+    if (m_startupConfigurationError.has_value())
+    {
+        startupState.fatalError = m_startupConfigurationError;
+        return startupState;
+    }
+
+    QString configuredCatalogPath;
+    switch (m_startupBehavior)
+    {
+    case core::client::CatalogStartupBehavior::ReopenLastActive:
+        m_settings->beginGroup(QString::fromLatin1(CatalogSettingsGroup));
+        configuredCatalogPath = core::catalog::normalizeCatalogPath(
+            m_settings->value(QString::fromLatin1(LastActiveCatalogKey)).toString());
+        m_settings->endGroup();
+        break;
+    case core::client::CatalogStartupBehavior::OpenManagedCatalog:
+        break;
+    default:
+        startupState.fatalError = makeStartupError(core::types::ErrorCode::InvalidArgument,
+                                                   QStringLiteral("Catalog startup behavior is invalid."));
+        return startupState;
+    }
 
     startupState.requestedCatalogPath = configuredCatalogPath.isEmpty() ? m_defaultCatalogPath : configuredCatalogPath;
 
@@ -149,7 +153,7 @@ ManagedCatalogStartupState ManagedCatalogSession::startCatalog()
     }
     else
     {
-        const core::orchestration::CatalogSessionResult opened = m_orchestrator->openCatalog(configuredCatalogPath);
+        const core::orchestration::CatalogSessionResult opened = m_orchestrator.openCatalog(configuredCatalogPath);
         if (!opened.hasError())
         {
             startupState.session = opened.value();
@@ -163,8 +167,10 @@ ManagedCatalogStartupState ManagedCatalogSession::startCatalog()
     recordRecoveryIssue(*startupState.recoveryIssue);
 
     const bool missingDefaultCatalog =
-        isSameCatalogPath(configuredCatalogPath, m_defaultCatalogPath) && !QFileInfo::exists(configuredCatalogPath);
-    if (isSameCatalogPath(configuredCatalogPath, m_defaultCatalogPath) && !missingDefaultCatalog)
+        core::catalog::catalogPathsReferToSameFile(configuredCatalogPath, m_defaultCatalogPath) &&
+        !QFileInfo::exists(configuredCatalogPath);
+    if (core::catalog::catalogPathsReferToSameFile(configuredCatalogPath, m_defaultCatalogPath) &&
+        !missingDefaultCatalog)
     {
         startupState.fatalError = *requestedError;
         return startupState;
@@ -202,7 +208,7 @@ core::orchestration::CatalogSessionResult ManagedCatalogSession::openDefaultCata
             core::types::ErrorCode::PermissionDenied, QStringLiteral("Unable to create managed catalog directory.")));
     }
 
-    return m_orchestrator->openCatalog(m_defaultCatalogPath);
+    return m_orchestrator.openCatalog(m_defaultCatalogPath);
 }
 
 // 목적: unavailable recent Catalog 정보를 settings에 보존
@@ -225,7 +231,7 @@ void ManagedCatalogSession::clearResolvedRecoveryIssue(const QString& catalogPat
 {
     m_settings->beginGroup(QString::fromLatin1(CatalogSettingsGroup));
     const QString unavailablePath = m_settings->value(QString::fromLatin1(RecoveryPathKey)).toString();
-    if (isSameCatalogPath(unavailablePath, catalogPath))
+    if (core::catalog::catalogPathsReferToSameFile(unavailablePath, catalogPath))
     {
         m_settings->remove(QStringLiteral("recovery"));
     }
@@ -238,7 +244,7 @@ void ManagedCatalogSession::clearResolvedRecoveryIssue(const QString& catalogPat
 // 출력: 열린 session이 있으면 last-active path가 settings에 저장됨
 void ManagedCatalogSession::rememberActiveCatalog()
 {
-    const core::orchestration::CatalogSessionState session = m_orchestrator->state();
+    const core::orchestration::CatalogSessionState session = m_orchestrator.state();
     if (!session.isOpen || session.catalogPath.isEmpty())
     {
         return;

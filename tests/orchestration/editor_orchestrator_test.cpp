@@ -304,6 +304,48 @@ TEST(EditorOrchestratorTest, SavesAndRestoresCatalogDevelopStateAcrossSessions)
     }
 }
 
+TEST(EditorOrchestratorTest, DiscardReloadsSavedBaselineAfterCatalogReopen)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("discard.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(writeCatalogSource(sourcePath, QByteArray("discard-source")));
+    CatalogOrchestrator catalogOrchestrator;
+    ASSERT_TRUE(catalogOrchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogImportResult imported = catalogOrchestrator.importFolder(directory.path());
+    ASSERT_TRUE(imported.hasValue());
+    ASSERT_EQ(1, imported.value().photoIds.size());
+    const types::PhotoId photoId = imported.value().photoIds.front();
+    auto pipeline = std::make_unique<RecordingPreviewPipeline>();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editorOrchestrator(previewOrchestrator, catalogOrchestrator);
+    ASSERT_TRUE(editorOrchestrator.selectCatalogPhoto(photoId, QSize{640, 480}).hasValue());
+    types::DevelopParams savedParams;
+    savedParams.exposureEv = 0.4F;
+    ASSERT_TRUE(editorOrchestrator.updateDevelopParams(savedParams, QSize{640, 480}));
+    ASSERT_TRUE(editorOrchestrator.saveCurrentPhoto().hasValue());
+    types::DevelopParams discardedParams = savedParams;
+    discardedParams.exposureEv = 1.2F;
+    ASSERT_TRUE(editorOrchestrator.updateDevelopParams(discardedParams, QSize{640, 480}));
+    ASSERT_TRUE(editorOrchestrator.state().dirty);
+
+    const client::EditorResult cleared = editorOrchestrator.clearEditorSelection();
+    ASSERT_TRUE(cleared.hasValue());
+    EXPECT_FALSE(cleared.value().hasSelection);
+    EXPECT_FALSE(catalogOrchestrator.closeCatalog().isOpen);
+    ASSERT_TRUE(catalogOrchestrator.openCatalog(catalogPath).hasValue());
+    const EditorStateResult restored = editorOrchestrator.selectCatalogPhoto(photoId, QSize{640, 480});
+
+    ASSERT_TRUE(restored.hasValue());
+    EXPECT_EQ(savedParams, restored.value().params);
+    EXPECT_EQ(1U, restored.value().persistedRevision);
+    EXPECT_FALSE(restored.value().dirty);
+    EXPECT_FALSE(restored.value().canUndo);
+    EXPECT_FALSE(restored.value().canRedo);
+}
+
 TEST(EditorOrchestratorTest, PreservesDirtyStateWhenPersistedRevisionConflicts)
 {
     (void)test::application();
@@ -336,6 +378,14 @@ TEST(EditorOrchestratorTest, PreservesDirtyStateWhenPersistedRevisionConflicts)
     EXPECT_EQ(localParams, editorOrchestrator.state().params);
     EXPECT_EQ(0U, editorOrchestrator.state().persistedRevision);
     EXPECT_TRUE(editorOrchestrator.state().dirty);
+
+    ASSERT_TRUE(editorOrchestrator.clearEditorSelection().hasValue());
+    const EditorStateResult reselected = editorOrchestrator.selectCatalogPhoto(photoId, QSize{640, 480});
+    ASSERT_TRUE(reselected.hasValue());
+    EXPECT_EQ(externalParams, reselected.value().params);
+    EXPECT_EQ(1U, reselected.value().persistedRevision);
+    EXPECT_FALSE(reselected.value().dirty);
+    EXPECT_FALSE(reselected.value().canUndo);
 }
 
 TEST(EditorOrchestratorTest, BlocksSourceDependentEditingWhenCatalogSourceIsMissing)
@@ -567,6 +617,39 @@ TEST(EditorOrchestratorTest, OwnsSelectionDirtyAndUndoRedoState)
     EXPECT_FALSE(editorOrchestrator.state().hasSelection);
 }
 
+TEST(EditorOrchestratorTest, DiscardKeepsOtherPhotoSessionHistory)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    const std::optional<catalog::CatalogEntry> firstEntry =
+        catalog.createEntry(QStringLiteral("first.bmp"), types::SupportedFileKind::RasterImage);
+    const std::optional<catalog::CatalogEntry> secondEntry =
+        catalog.createEntry(QStringLiteral("second.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(firstEntry.has_value());
+    ASSERT_TRUE(secondEntry.has_value());
+    auto pipeline = std::make_unique<RecordingPreviewPipeline>();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editorOrchestrator(previewOrchestrator, catalog.orchestrator());
+    ASSERT_TRUE(editorOrchestrator.activatePhoto(*firstEntry, QSize{640, 480}).hasValue());
+    types::DevelopParams firstParams;
+    firstParams.exposureEv = 0.5F;
+    ASSERT_TRUE(editorOrchestrator.updateDevelopParams(firstParams, QSize{640, 480}));
+    ASSERT_TRUE(editorOrchestrator.activatePhoto(*secondEntry, QSize{640, 480}).hasValue());
+    types::DevelopParams secondParams;
+    secondParams.exposureEv = -0.25F;
+    ASSERT_TRUE(editorOrchestrator.updateDevelopParams(secondParams, QSize{640, 480}));
+
+    ASSERT_TRUE(editorOrchestrator.clearEditorSelection().hasValue());
+    const EditorStateResult restored = editorOrchestrator.activatePhoto(*firstEntry, QSize{640, 480});
+
+    ASSERT_TRUE(restored.hasValue());
+    EXPECT_EQ(firstParams, restored.value().params);
+    EXPECT_TRUE(restored.value().dirty);
+    EXPECT_TRUE(restored.value().canUndo);
+    EXPECT_FALSE(restored.value().canRedo);
+}
+
 TEST(EditorOrchestratorTest, ExecutesQtFreeEditorCommandsWithoutPreviewTarget)
 {
     (void)test::application();
@@ -583,6 +666,9 @@ TEST(EditorOrchestratorTest, ExecutesQtFreeEditorCommandsWithoutPreviewTarget)
     const client::EditorResult invalidSelection = editorClient.selectPhoto({client::ClientPhotoId{0}});
     ASSERT_TRUE(invalidSelection.hasError());
     EXPECT_EQ(client::ClientErrorCode::InvalidArgument, invalidSelection.error().code);
+    const client::EditorResult invalidSource = editorClient.activateSource({});
+    ASSERT_TRUE(invalidSource.hasError());
+    EXPECT_EQ(client::ClientErrorCode::InvalidArgument, invalidSource.error().code);
     const std::optional<catalog::CatalogEntry> entry =
         catalog.createEntry(QStringLiteral("headless.bmp"), types::SupportedFileKind::RasterImage);
     ASSERT_TRUE(entry.has_value());
@@ -591,13 +677,13 @@ TEST(EditorOrchestratorTest, ExecutesQtFreeEditorCommandsWithoutPreviewTarget)
                      &CatalogOrchestrator::sourceBindingUpdated,
                      &catalog.orchestrator(),
                      [&sourceUpdateCount](const CatalogSourceUpdate&) { ++sourceUpdateCount; });
-    const CatalogPhotoRegistrationResult registered = catalog.orchestrator().registerPhoto(*entry);
-    ASSERT_TRUE(registered.hasValue());
-
-    const client::EditorResult selected = editorClient.selectPhoto({client::ClientPhotoId{registered.value().value}});
+    const client::EditorResult selected = editorClient.activateSource({entry->file.path.toUtf8().toStdString(),
+                                                                       entry->file.extension.toUtf8().toStdString(),
+                                                                       entry->file.displayName.toUtf8().toStdString(),
+                                                                       client::CatalogFileKind::RasterImage});
     ASSERT_TRUE(selected.hasValue());
     EXPECT_TRUE(selected.value().hasSelection);
-    EXPECT_EQ(registered.value().value, selected.value().photoId.value);
+    EXPECT_GT(selected.value().photoId.value, 0);
     EXPECT_FALSE(selected.value().adjustmentActive);
     client::EditorDevelopParams invalidParams = selected.value().params;
     invalidParams.exposureEv = std::numeric_limits<float>::infinity();
@@ -634,6 +720,45 @@ TEST(EditorOrchestratorTest, ExecutesQtFreeEditorCommandsWithoutPreviewTarget)
 
     ASSERT_TRUE(waitForCatalogUpdate(sourceUpdateCount, 1));
     EXPECT_TRUE(pipelineObserver->requests().empty());
+}
+
+TEST(EditorOrchestratorTest, CancelsAcceptedPreviewThroughQtFreePresentationContract)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    auto pipeline = std::make_unique<BlockingEditorPreviewPipeline>();
+    BlockingEditorPreviewPipeline* const pipelineObserver = pipeline.get();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editorOrchestrator(previewOrchestrator, catalog.orchestrator());
+    QEventLoop requestLoop;
+    QObject::connect(&editorOrchestrator, &EditorOrchestrator::previewStarted, &requestLoop, &QEventLoop::quit);
+    client::IPreviewPresentationClient& previewClient = editorOrchestrator;
+    EXPECT_TRUE(previewClient.cancelPreviewRequest({}).hasError());
+    ASSERT_TRUE(previewClient.setPreviewViewport({{640, 480}}).hasValue());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("cancel-preview.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    ASSERT_TRUE(editorOrchestrator
+                    .activateSource({entry->file.path.toUtf8().toStdString(),
+                                     entry->file.extension.toUtf8().toStdString(),
+                                     entry->file.displayName.toUtf8().toStdString(),
+                                     client::CatalogFileKind::RasterImage})
+                    .hasValue());
+    QTimer::singleShot(2000, &requestLoop, &QEventLoop::quit);
+    requestLoop.exec();
+
+    const client::PreviewRequestId requestId{editorOrchestrator.activePreviewRequestId()};
+    const client::PreviewRequestCancelResult cancelled = previewClient.cancelPreviewRequest(requestId);
+    pipelineObserver->allowFirstRenderToFinish.release();
+
+    ASSERT_GT(requestId.value, 0U);
+    ASSERT_TRUE(cancelled.hasValue());
+    EXPECT_EQ(requestId, cancelled.value());
+    EXPECT_EQ(0U, editorOrchestrator.activePreviewRequestId());
+    const client::PreviewRequestCancelResult stale = previewClient.cancelPreviewRequest(requestId);
+    ASSERT_TRUE(stale.hasError());
+    EXPECT_EQ(client::ClientErrorCode::NotFound, stale.error().code);
 }
 
 TEST(EditorOrchestratorTest, RejectsInvalidParamsBeforeMutatingHistory)

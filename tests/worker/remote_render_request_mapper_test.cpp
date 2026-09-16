@@ -88,6 +88,26 @@ TEST(RemoteRenderRequestMapperTest, RejectsRelativeAndMissingRoots)
     EXPECT_EQ(RemoteRenderPathErrorCode::InvalidRoot, missing.error().code);
 }
 
+TEST(RemoteRenderRequestMapperTest, RejectsOuterWhitespaceInRootsAndMappedPaths)
+{
+    QTemporaryDir sourceRoot;
+    QTemporaryDir outputRoot;
+    ASSERT_TRUE(sourceRoot.isValid());
+    ASSERT_TRUE(outputRoot.isValid());
+    const RemoteRenderRequestMapper::CreateResult invalidRoot =
+        RemoteRenderRequestMapper::create({sourceRoot.path() + QLatin1Char(' '), outputRoot.path()});
+    ASSERT_TRUE(invalidRoot.hasError());
+    EXPECT_EQ(RemoteRenderPathErrorCode::InvalidRoot, invalidRoot.error().code);
+
+    const QString sourcePath = QDir(sourceRoot.path()).filePath(QStringLiteral("input.ARW"));
+    ASSERT_TRUE(createFile(sourcePath));
+    const RemoteRenderRequestMapper mapper = makeMapper(sourceRoot, outputRoot);
+    const RemoteRenderRequestMapper::MapResult invalidSource = mapper.map(
+        makeRequest(sourcePath + QLatin1Char(' '), QDir(outputRoot.path()).filePath(QStringLiteral("output.jpg"))));
+    ASSERT_TRUE(invalidSource.hasError());
+    EXPECT_EQ(RemoteRenderPathErrorCode::InvalidPath, invalidSource.error().code);
+}
+
 TEST(RemoteRenderRequestMapperTest, RejectsSourceOutsideRootAndMissingSource)
 {
     QTemporaryDir sourceRoot;

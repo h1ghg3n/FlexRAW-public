@@ -109,6 +109,14 @@ struct SelectEditorPhotoCommand
     ClientPhotoId photoId;
 };
 
+struct ActivateEditorSourceCommand
+{
+    std::string sourceLocator;
+    std::string extension;
+    std::string displayName;
+    CatalogFileKind kind{CatalogFileKind::Unknown};
+};
+
 struct UpdateDevelopParamsCommand
 {
     EditorDevelopParams params;
@@ -129,14 +137,19 @@ public:
     // 출력: selection, Develop state, source capability와 history snapshot
     [[nodiscard]] virtual EditorSnapshot editorSnapshot() const = 0;
 
+    // 목적: Folder scan source를 active Catalog에 등록·resolve하고 Editor session으로 선택
+    // 입력: command: normalized absolute UTF-8 source와 표시 metadata
+    // 출력: stable Photo identity가 발급된 snapshot 또는 validation·Catalog 오류
+    [[nodiscard]] virtual EditorResult activateSource(const ActivateEditorSourceCommand& command) = 0;
+
     // 목적: active Catalog의 stable PhotoId를 현재 Editor session으로 선택
     // 입력: command: 선택할 fixed-width Photo identity
     // 출력: 선택 후 snapshot 또는 validation·Catalog·Develop load 오류
     [[nodiscard]] virtual EditorResult selectPhoto(const SelectEditorPhotoCommand& command) = 0;
 
-    // 목적: 현재 Editor selection과 진행 중 Adjustment를 정리
+    // 목적: 현재 Editor selection과 해당 Photo의 session-local Develop state를 폐기
     // 입력: 없음
-    // 출력: 선택되지 않은 snapshot
+    // 출력: 다른 Photo history와 persisted data를 유지한 선택되지 않은 snapshot
     [[nodiscard]] virtual EditorResult clearEditorSelection() = 0;
 
     // 목적: 현재 Photo의 Develop parameter를 검증하고 session state에 반영

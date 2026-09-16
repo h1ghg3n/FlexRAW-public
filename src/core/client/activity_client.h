@@ -17,6 +17,7 @@ enum class ActivityKind : std::uint8_t
 {
     Preview,
     FolderScan,
+    FolderImport,
     SourceVerification,
 };
 
