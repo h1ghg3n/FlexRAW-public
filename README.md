@@ -48,9 +48,9 @@ Linux ARM64는 운영체제와 architecture를 나타내는 명칭이며 Ubuntu�
 ## Architecture 요약
 
 ```text
-Qt Desktop                         Local STDIO MCP
-MainWindow + Qt Adapter            MCP Adapter
-        |                              |
+Qt Desktop                              Local STDIO MCP
+MainWindow + Qt Adapter                   MCP Adapter
+        |                                      |
         +------ Qt-free Product Contract ------+
                          ^
                          |
