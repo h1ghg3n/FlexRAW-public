@@ -108,6 +108,15 @@ build/release/Release/flexraw.exe
 첫 configure에서는 vcpkg dependency build 때문에 시간이 오래 걸릴 수 있습니다. Worker, MCP-only, portable contract와
 benchmark용 preset은 [CMakePresets.json](CMakePresets.json)에서 확인할 수 있습니다.
 
+## 사진과 개인정보
+
+FlexRAW에는 사진, metadata 또는 Catalog 정보를 개발자 운영 서버로 전송하는 telemetry나 upload 기능이 없습니다.
+Local Desktop과 MCP에서 사용하는 사진 정보는 사용자의 장치에 머무르며 개발자에게 전송되지 않습니다.
+
+Remote Export를 명시적으로 설정한 경우에는 사용자가 직접 지정한 Worker와만 통신합니다. 이 경로 역시 FlexRAW 개발자에게
+사진 정보를 전송하지 않으며, 현재 Worker는 loopback 또는 사용자가 관리하는 신뢰할 수 있는 내부 network에서만 사용해야
+합니다.
+
 ## Worker 사용 범위
 
 Remote Export는 RAW byte를 TCP로 업로드하거나 결과물을 다운로드하지 않습니다. Desktop과 Worker가 같은 logical storage를
