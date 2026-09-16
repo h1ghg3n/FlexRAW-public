@@ -7,9 +7,8 @@ vcpkg_installed/
 out/
 CMakeSettings.json
 
-# Personal / environment-specific notes (not part of project docs)
-documents/jetson_restore_r36.5.md
-documents/jetson_board_conflict.md
+# Internal / environment-specific docs are not part of the public snapshot
+documents/
 
 # Local Codex agent notes
 codex.md

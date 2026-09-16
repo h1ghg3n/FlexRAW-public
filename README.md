@@ -37,10 +37,13 @@ NASA Earth Observatory를 출처로 표시합니다. NASA의
 |---|---|---|
 | `flexraw.exe` | Qt Widgets Desktop | Windows가 primary 검증 대상입니다. |
 | `flexraw-mcp.exe` | local STDIO MCP consumer | bounded Catalog/Project read와 opt-in write tool을 제공합니다. |
-| `flexraw-worker` | TCP Render Worker | Windows, WSL x64와 Jetson ARM64에서 build 및 RAW E2E를 확인했습니다. |
+| `flexraw-worker` | TCP Render Worker | Windows, WSL x64와 Linux ARM64에서 build 및 RAW E2E를 확인했습니다. |
 
 Desktop과 MCP는 같은 Qt-free Product Contract와 `ProductRuntime` owner type을 사용하지만 현재는 별도 process로 실행됩니다.
 Worker는 Product Contract가 아니라 server-facing Runtime port와 versioned wire protocol을 사용합니다.
+
+Linux ARM64는 운영체제와 architecture를 나타내는 명칭이며 Ubuntu나 특정 제조사 장비 전용 target이 아닙니다.
+검증한 환경의 build/E2E 결과를 의미하며, 모든 Linux 배포판과 ARM64 장비의 호환성을 보장하지는 않습니다.
 
 ## Architecture 요약
 
@@ -110,18 +113,24 @@ benchmark용 preset은 [CMakePresets.json](CMakePresets.json)에서 확인할 �
 
 ## 사진과 개인정보
 
-FlexRAW에는 사진, metadata 또는 Catalog 정보를 개발자 운영 서버로 전송하는 telemetry나 upload 기능이 없습니다.
-Local Desktop과 MCP에서 사용하는 사진 정보는 사용자의 장치에 머무르며 개발자에게 전송되지 않습니다.
+FlexRAW 자체에는 사진, metadata 또는 Catalog 정보를 FlexRAW 개발자 운영 서버로 전송하는 telemetry나 upload 기능이
+없습니다. 기본 Local Desktop 경로에서는 사진을 사용자의 장치에서 처리하며 개발자에게 전송하지 않습니다.
 
-Remote Export를 명시적으로 설정한 경우에는 사용자가 직접 지정한 Worker와만 통신합니다. 이 경로 역시 FlexRAW 개발자에게
-사진 정보를 전송하지 않으며, 현재 Worker는 loopback 또는 사용자가 관리하는 신뢰할 수 있는 내부 network에서만 사용해야
-합니다.
+Remote Export를 명시적으로 설정하면 사용자가 지정한 Worker에 보정·출력 option과 shared storage 기준 파일 경로를
+전달합니다. Worker가 읽는 원본과 쓰는 결과물은 사용자가 구성한 storage에 있습니다. 선택적으로 Resource Router를
+설정한 Worker는 지정된 endpoint에 resource claim/lease 정보를 전달합니다. 이는 개발자 서버로의 사진 upload가 아니며,
+현재 Worker는 loopback 또는 사용자가 관리하는 신뢰할 수 있는 내부 network에서만 사용해야 합니다.
+
+MCP는 요청에 따라 Catalog에 등록된 사진의 경로와 Editor 상태 등을 연결된 MCP Host에 전달합니다. Host 또는 Host가
+연결한 외부 서비스의 처리·전송·보관 범위는 해당 서비스의 설정과 정책에 따릅니다. 따라서 MCP를 연결한 경우까지
+사진 관련 정보가 항상 사용자의 장치 안에만 머문다고 보장하지는 않습니다. 이 경로는 FlexRAW 자체의 개발자 서버 전송과
+구분해서 확인해 주세요.
 
 ## Worker 사용 범위
 
 Remote Export는 RAW byte를 TCP로 업로드하거나 결과물을 다운로드하지 않습니다. Desktop과 Worker가 같은 logical storage를
-각자의 local path로 mount한 trusted environment를 전제로 합니다. Wire에는 storage root 기준의 portable relative path만
-전달합니다.
+각자의 local path로 mount한 trusted environment를 전제로 합니다. Wire의 파일 경로는 storage root 기준의 portable relative
+path로 전달하며, 보정·출력 option과 함께 render job을 요청합니다.
 
 현재 protocol에는 authentication과 TLS가 없으므로 loopback 또는 신뢰할 수 있는 내부 network에서만 사용해 주세요.
 Internet에 직접 노출해서는 안 됩니다.

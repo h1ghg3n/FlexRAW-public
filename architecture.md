@@ -235,7 +235,10 @@ fairness, CPU reservation과 intra-image parallelism은 measurement와 별도 �
 - Windows Worker-only Release
 - Windows Qt-free Product Contract
 - WSL x64 Qt-free Product Contract
-- Jetson ARM64 Qt-free Product Contract
+- Linux ARM64 Qt-free Product Contract
+
+Linux ARM64 preset은 `arm64-linux` triplet을 사용하는 native build용입니다. 특정 장비 이름을 build target으로 사용하지
+않으며, 장비별 측정 결과와 모든 Linux ARM64 환경의 지원 보장은 구분합니다.
 
 Test는 ownership 경계에 따라 `tests/core`, `tests/orchestration`, `tests/worker`, `tests/ui`, `tests/app`, `tests/mcp`,
 `tests/platform`과 `tests/portable`로 나뉩니다. 실제 RAW 또는 OS capability가 필요한 test는 fixture가 없을 때 이유를 명시하고

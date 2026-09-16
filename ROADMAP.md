@@ -30,7 +30,7 @@ Catalog, Project, Editor, Preview presentation, thumbnail, source resolution, Wo
 
 ### Portable contract build
 
-Desktop과 Worker를 끈 상태에서 Product Contract와 deterministic contract test를 Windows, WSL x64와 Jetson ARM64에서
+Desktop과 Worker를 끈 상태에서 Product Contract와 deterministic contract test를 Windows, WSL x64와 Linux ARM64에서
 build할 수 있습니다. 여기서 portable은 무설치 package가 아니라 frontend package 없이 contract를 검증할 수 있다는
 뜻입니다.
 
