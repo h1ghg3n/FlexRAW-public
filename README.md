@@ -4,7 +4,7 @@ FlexRAW는 로컬 환경에서 RAW 사진을 관리하고 비파괴 보정과 �
 Windows Desktop을 우선 지원하며, 동일한 processing path를 사용하는 별도 Render Worker와 local STDIO MCP consumer도
 함께 제공합니다.
 
-> 현재 버전: **0.1.0-alpha.5**
+> 현재 버전: **0.2.0-alpha.1**
 > 현재 checkpoint: **M1.7 Local Product Acceptance & Freeze 완료**
 
 현재 공개본은 기본 workflow와 architecture boundary를 검토할 수 있는 source snapshot입니다. 완성된 상용 사진 보정
