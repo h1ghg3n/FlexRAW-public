@@ -85,7 +85,7 @@ TEST(SettingsDialogTest, CreatesWorkerProfileThroughQtFreeClient)
     ASSERT_NE(nullptr, portSpinBox);
 
     newButton->click();
-    nameEdit->setText(QStringLiteral("Jetson"));
+    nameEdit->setText(QStringLiteral("Remote Worker"));
     hostEdit->setText(QStringLiteral("192.168.1.90"));
     portSpinBox->setValue(48000);
     saveButton->click();
@@ -93,7 +93,7 @@ TEST(SettingsDialogTest, CreatesWorkerProfileThroughQtFreeClient)
     const core::client::WorkerProfileListResult profiles = workerProfiles.listWorkerProfiles();
     ASSERT_TRUE(profiles.hasValue());
     ASSERT_EQ(2U, profiles.value().size());
-    EXPECT_EQ("Jetson", profiles.value().back().displayName);
+    EXPECT_EQ("Remote Worker", profiles.value().back().displayName);
     EXPECT_EQ("192.168.1.90", profiles.value().back().host);
     EXPECT_EQ(48000, profiles.value().back().port);
 }

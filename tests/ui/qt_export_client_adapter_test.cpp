@@ -294,7 +294,8 @@ TEST(QtExportClientAdapterTest, ResolvesWorkerProfileOnlyInsideAdapter)
     core::orchestration::ExportOrchestrator orchestrator(
         std::make_unique<BlockingExportPipeline>(), std::move(remotePort), nullptr, configuration);
     WorkerProfileClientStub profiles;
-    profiles.profiles.push_back({{"worker-a"}, "Jetson", "192.168.0.42", 49200, true, "source-a", "output-a"});
+    profiles.profiles.push_back(
+        {{"worker-a"}, "Remote Worker", "192.168.0.42", 49200, true, "source-a", "output-a"});
     QtExportClientAdapter adapter(orchestrator, profiles);
     bool completed = false;
     const core::client::ExportSubscriptionResult subscribed = adapter.subscribeToExports(

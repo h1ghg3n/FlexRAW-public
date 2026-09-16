@@ -83,7 +83,7 @@ TEST(WorkerProfileSettingsAdapterTest, CrudPreservesStableIdentityAndOrder)
     initializeEmptySchema(settings);
     QtWorkerProfileSettingsAdapter adapter(settings);
     const CreateWorkerProfileCommand firstCommand{"Desk", "127.0.0.1", 47331, true, {}, {}};
-    const CreateWorkerProfileCommand secondCommand{"Jetson", "192.168.1.90", 48000, true, {}, {}};
+    const CreateWorkerProfileCommand secondCommand{"Remote Worker", "192.168.1.90", 48000, true, {}, {}};
 
     const core::client::WorkerProfileResult first = adapter.createWorkerProfile(firstCommand);
     const core::client::WorkerProfileResult second = adapter.createWorkerProfile(secondCommand);
@@ -117,7 +117,7 @@ TEST(WorkerProfileSettingsAdapterTest, RejectsInvalidAndDuplicateProfiles)
     const core::client::WorkerProfileResult duplicate =
         adapter.createWorkerProfile(CreateWorkerProfileCommand{" desk ", "other-host", 48000, true, {}, {}});
     const core::client::WorkerProfileResult invalidStorage = adapter.createWorkerProfile(
-        CreateWorkerProfileCommand{"Jetson", "192.168.1.90", 48000, true, "not-a-uuid", {}});
+        CreateWorkerProfileCommand{"Remote Worker", "192.168.1.90", 48000, true, "not-a-uuid", {}});
     const core::client::WorkerProfileResult invalidHost =
         adapter.createWorkerProfile(CreateWorkerProfileCommand{"Remote", "   ", 48000, true, {}, {}});
 

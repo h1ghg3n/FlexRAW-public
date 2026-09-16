@@ -155,10 +155,10 @@
       }
     },
     {
-      "name": "linux-jetson-worker-release",
+      "name": "linux-arm64-worker-release",
       "inherits": "linux-wsl-worker-release",
-      "displayName": "Jetson ARM64 Worker Release",
-      "binaryDir": "${sourceDir}/build/worker/jetson-release",
+      "displayName": "Linux ARM64 Worker Release",
+      "binaryDir": "${sourceDir}/build/worker/linux-arm64-release",
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "arm64-linux"
       }
@@ -183,10 +183,10 @@
       }
     },
     {
-      "name": "linux-jetson-portable-contract-release",
+      "name": "linux-arm64-portable-contract-release",
       "inherits": "linux-wsl-portable-contract-release",
-      "displayName": "Jetson ARM64 Portable Contract Release",
-      "binaryDir": "${sourceDir}/build/portable/jetson-release",
+      "displayName": "Linux ARM64 Portable Contract Release",
+      "binaryDir": "${sourceDir}/build/portable/linux-arm64-release",
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "arm64-linux"
       }
@@ -245,8 +245,8 @@
       "configurePreset": "linux-wsl-worker-release"
     },
     {
-      "name": "worker-jetson-release",
-      "configurePreset": "linux-jetson-worker-release"
+      "name": "worker-linux-arm64-release",
+      "configurePreset": "linux-arm64-worker-release"
     },
     {
       "name": "portable-contract-windows-release",
@@ -257,8 +257,8 @@
       "configurePreset": "linux-wsl-portable-contract-release"
     },
     {
-      "name": "portable-contract-jetson-release",
-      "configurePreset": "linux-jetson-portable-contract-release"
+      "name": "portable-contract-linux-arm64-release",
+      "configurePreset": "linux-arm64-portable-contract-release"
     }
   ],
   "testPresets": [
@@ -369,8 +369,8 @@
       }
     },
     {
-      "name": "worker-jetson-release",
-      "configurePreset": "linux-jetson-worker-release",
+      "name": "worker-linux-arm64-release",
+      "configurePreset": "linux-arm64-worker-release",
       "output": {
         "outputOnFailure": true
       }
@@ -391,8 +391,8 @@
       }
     },
     {
-      "name": "portable-contract-jetson-release",
-      "configurePreset": "linux-jetson-portable-contract-release",
+      "name": "portable-contract-linux-arm64-release",
+      "configurePreset": "linux-arm64-portable-contract-release",
       "output": {
         "outputOnFailure": true
       }

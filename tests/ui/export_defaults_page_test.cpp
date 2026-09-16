@@ -27,7 +27,7 @@ TEST(ExportDefaultsPageTest, LoadsAndSavesDefaultsThroughProductClients)
     QtWorkerProfileSettingsAdapter workerProfiles(storage);
     QtExportSettingsAdapter exportDefaults(storage);
     const core::client::WorkerProfileResult profile =
-        workerProfiles.createWorkerProfile({"Jetson", "192.168.1.90", 47331, true, {}, {}});
+        workerProfiles.createWorkerProfile({"Remote Worker", "192.168.1.90", 47331, true, {}, {}});
     ASSERT_TRUE(profile.hasValue());
     core::client::ExportDefaultsSnapshot initial;
     initial.rasterOptions.format = core::client::ExportRasterFormat::Tiff;
@@ -111,7 +111,7 @@ TEST(ExportDefaultsPageTest, RefreshesPreferredWorkerAfterProfileMutation)
     QtExportSettingsAdapter exportDefaults(storage);
     SettingsDialog dialog(storage, workerProfiles, exportDefaults);
     const core::client::WorkerProfileResult profile =
-        workerProfiles.createWorkerProfile({"Jetson", "192.168.1.90", 47331, true, {}, {}});
+        workerProfiles.createWorkerProfile({"Remote Worker", "192.168.1.90", 47331, true, {}, {}});
     ASSERT_TRUE(profile.hasValue());
 
     auto* tabs = dialog.findChild<QTabWidget*>(QStringLiteral("settingsTabs"));
@@ -131,7 +131,7 @@ TEST(ExportDefaultsPageTest, KeepsExplicitNoPreferenceAcrossProfileRefresh)
     QtWorkerProfileSettingsAdapter workerProfiles(storage);
     QtExportSettingsAdapter exportDefaults(storage);
     const core::client::WorkerProfileResult profile =
-        workerProfiles.createWorkerProfile({"Jetson", "192.168.1.90", 47331, true, {}, {}});
+        workerProfiles.createWorkerProfile({"Remote Worker", "192.168.1.90", 47331, true, {}, {}});
     ASSERT_TRUE(profile.hasValue());
     ASSERT_TRUE(
         exportDefaults.saveExportExecutionDefaults({core::client::ExportPlacementPolicy::Auto, profile.value().id})

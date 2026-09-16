@@ -1,4 +1,4 @@
-# platform_linux - Linux and Jetson OS capability adapters
+# platform_linux - Linux OS capability adapters
 
 add_library(flexraw_platform_linux STATIC)
 
