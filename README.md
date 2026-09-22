@@ -143,7 +143,7 @@ MCP는 explicit Catalog 하나를 열어 bounded Catalog/Project read, Editor st
 
 Preview frame, Export, Worker 제어와 generic filesystem access는 현재 MCP tool surface에 포함되지 않습니다.
 
-## 공개 source 경계
+## Public source Boundary
 
 - 검토된 하나의 source commit을 기준으로 공개합니다.
 - credential, 개인 local path, private RAW와 재배포 권리가 없는 asset은 포함하지 않습니다.
