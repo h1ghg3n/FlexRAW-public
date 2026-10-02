@@ -7,8 +7,7 @@ Windows Desktop을 우선 지원하며, 동일한 processing path를 사용하�
 > 현재 버전: **0.2.0-alpha.1**
 > 현재 checkpoint: **M1.7 Local Product Acceptance & Freeze 완료**
 
-현재 공개본은 기본 workflow와 architecture boundary를 검토할 수 있는 source snapshot입니다. 완성된 상용 사진 보정
-제품이나 모든 camera·운영체제를 지원하는 배포판을 의미하지는 않습니다.
+현재 공개본은 기본 workflow와 architecture boundary를 검토할 수 있는 source snapshot입니다.
 
 ![FlexRAW Windows Release Editor](images/flexraw-editor.png)
 
