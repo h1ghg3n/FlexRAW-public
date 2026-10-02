@@ -1,13 +1,13 @@
 # FlexRAW
 
 FlexRAW는 로컬 환경에서 RAW 사진을 관리하고 비파괴 보정과 내보내기를 수행하는 C++20 기반 사진 편집기입니다.
-Windows Desktop을 우선 지원하며, 동일한 processing path를 사용하는 별도 Render Worker와 local STDIO MCP consumer도
+Windows Desktop을 우선 지원하며, 동일한 처리 경로를 사용하는 별도 Render Worker와 로컬 MCP 서버 기능도
 함께 제공합니다.
 
 > 현재 버전: **0.2.0-alpha.1**
 > 현재 checkpoint: **M1.7 Local Product Acceptance & Freeze 완료**
 
-현재 공개본은 기본 workflow와 architecture boundary를 검토할 수 있는 source snapshot입니다.
+현재 공개본은 기본 workflow와 구조를 검토할 수 있는 source snapshot입니다.
 
 ![FlexRAW Windows Release Editor](images/flexraw-editor.png)
 
@@ -18,9 +18,9 @@ NASA Earth Observatory를 출처로 표시합니다. NASA의
 
 ## 현재 제공하는 기능
 
-- folder에서 RAW와 JPEG/PNG/TIFF 사진을 찾아 Catalog에 등록하고 bounded page로 탐색할 수 있습니다.
-- embedded thumbnail을 먼저 표시한 뒤 standard preview로 교체하며, visible/adjacent 범위만 thumbnail로 유지합니다.
-- exposure, contrast, highlights, shadows, whites, blacks, white balance, vibrance, saturation을 조정할 수 있습니다.
+- folder에서 RAW와 JPEG/PNG/TIFF 사진을 찾아 카탈로그에 등록하고 페이지 별로 탐색할 수 있습니다.
+- 화면에는 우선 썸네일을 표시한 뒤 처리된 프리뷰로 교체하며, 현재 보여지는 사진들의 범위만 thumbnail로 유지합니다.
+- 노출, 대비, 밝은 영역, 어두운 영역, 흰색 영역, 검은색 영역, 화이트밸런스, 생동감, 채도를 조정할 수 있습니다.
 - clarity, dehaze, sharpening, luminance/color noise reduction과 parametric/point tone curve를 지원합니다.
 - 사진별 undo/redo, 연속 조작 coalescing, persisted revision과 explicit save를 지원합니다.
 - Project 생성·이름 변경·삭제와 multi-selection membership 추가·제거를 지원합니다.
