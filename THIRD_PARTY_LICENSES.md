@@ -1,6 +1,6 @@
 # Third-Party License Inventory
 
-Last audited: 2026-09-13
+Last audited: 2026-10-19
 
 This file records the dependency and license inventory for the current Flexraw source tree. It is not
 the complete notice bundle for a binary release. The exact release bundle must be generated from the
@@ -10,23 +10,24 @@ does not by itself certify a binary notice bundle.
 Rows marked as inactive future candidates are retained as implementation and license checkpoints; they are not current build or
 distribution dependencies.
 
-Third-party components retain their own copyright and license terms. Neither Flexraw's public
-AGPL license nor a separate private/commercial license can relicense those components.
+Third-party components retain their own copyright and license terms. FlexRAW's license does not
+alter or replace those terms.
 
 ## Current Dependencies
 
 | Component | Current use | License | Distribution note |
 |---|---|---|---|
-| Qt 6 | Core, Gui, Network, Widgets, Sql, Concurrent and image format plugins by build profile | Module-specific open-source terms, primarily `LGPL-3.0-only` with GPL alternatives; commercial terms are separate | Audit every deployed Qt module, plugin, and bundled third-party notice. Public and commercial profiles must each use one valid Qt licensing path. |
-| Exiv2 | Export metadata copy/include/exclude; directly linked by Desktop and Worker | `GPL-2.0-or-later` | The public AGPL profile selects a GPLv3-compatible route. The current Exiv2 project does not offer a new commercial license; a proprietary distributed profile must replace/exclude Exiv2 unless separately documented legacy rights are legally verified to cover the exact shipped code. Internal use does not grant redistribution rights. |
+| Qt 6 | Core, Gui, Network, Widgets, Sql, Concurrent and image format plugins by build profile | Module-specific open-source terms, primarily `LGPL-3.0-only` with GPL alternatives | Audit every deployed Qt module, plugin, and bundled third-party notice and comply with the applicable open-source terms. |
+| Exiv2 | Export metadata copy/include/exclude; directly linked by Desktop and Worker | `GPL-2.0-or-later` | FlexRAW's `AGPL-3.0-or-later` distribution uses a GPLv3-compatible route. Include the corresponding source and license notices in each binary release. |
 | LibRaw | RAW decode; directly linked | `LGPL-2.1-only OR CDDL-1.0` | The public AGPL build selects `LGPL-2.1-only`. Include the applicable source and notice material in each release. |
 | Little CMS | ICC/color transforms; directly linked | `MIT` | Preserve the MIT copyright and permission notice. |
+| libpng | Portable PNG8/sRGB encoding; directly linked by portable processing and Terminal CLI profiles | `libpng-2.0` | Preserve the libpng copyright and license notice. |
 | spdlog | Logging; directly linked | `MIT` | Preserve the MIT notice. |
 | fmt | Transitive formatting dependency of spdlog | `MIT` | Preserve the fmt MIT notice when its code or binary is included. |
 | GNU libiconv/libcharset | Windows runtime dependency used by the Exiv2 build | `LGPL-2.1-or-later` for libraries and headers | The separate `iconv` program is GPL-covered and is not intended to be distributed by Flexraw. |
 | OpenCV | Inactive future candidate; not declared, linked, or bundled by the current build profiles | `Apache-2.0` | Reintroduce only with the first real OpenCV vertical slice. If shipped later, include the Apache license, copyright, and any upstream NOTICE material for deployed modules. |
 | Lensfun | Inactive future candidate; no Lensfun API or database is built or bundled | `LGPL-3.0-only` for libraries; `CC-BY-SA-3.0` for the lens database | Reintroduce only when lens correction is implemented. If the database is shipped later, include its attribution and ShareAlike terms separately. Lensfun applications are GPL-3.0 and are not intended to be bundled. |
-| Qt Image Formats | Broad Desktop image-format post-build deployment; the exact plugin/codec subset is not yet a clean release package | Qt module terms plus codec-specific terms | Treat deployed plugins and codec libraries as release artifacts, remove unused plugins only after runtime smoke, and collect notices for the final staged subset. |
+| Qt Image Formats | Windows Desktop staging retains the `windeployqt` image-format plugin set while the product exposes JPEG/PNG/TIFF | Qt module terms plus codec-specific terms | The release finalizer maps staged DLLs to their vcpkg owners and collects the matching package notice/SPDX material. |
 | GoogleTest | Build and test only | `BSD-3-Clause` | Do not include it in runtime notices unless a release artifact actually contains it. |
 | ONNX Runtime | Inactive future candidate; no imported target, inference implementation, or binary is configured or bundled | `MIT` | Reintroduce only with the first real inference slice. When enabled in a release, include both `LICENSE` and the matching `ThirdPartyNotices.txt`. Provider-specific packages can add further notices. |
 
@@ -57,9 +58,9 @@ For every public binary release:
 - Qt licensing: <https://doc.qt.io/qt-6/licensing.html>
 - Qt SBOM: <https://doc.qt.io/qt-6/sbom.html>
 - Exiv2: <https://github.com/Exiv2/exiv2>
-- Exiv2 commercial-license status: <https://github.com/Exiv2/exiv2/wiki/Commercial-License>
 - LibRaw: <https://www.libraw.org/about>
 - Little CMS: <https://github.com/mm2/Little-CMS>
+- libpng: <https://github.com/pnggroup/libpng>
 - spdlog: <https://github.com/gabime/spdlog/blob/v1.x/LICENSE>
 - GNU libiconv: <https://www.gnu.org/software/libiconv/>
 - OpenCV: <https://github.com/opencv/opencv>

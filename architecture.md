@@ -38,6 +38,7 @@ Runtime과 concrete dependency를 생성하고 명시적으로 주입합니다.
 | 경로 | 책임 |
 |---|---|
 | `src/app` | Desktop와 MCP Composition Root를 구성합니다. |
+| `src/cli` | Qt 없이 portable RAW processing을 호출하는 terminal consumer를 제공합니다. |
 | `src/runtime` | Catalog/Editor authority를 공유하는 Product Runtime owner를 제공합니다. |
 | `src/core/client` | Frontend-neutral command/state/event contract를 제공합니다. |
 | `src/core/orchestration` | Use case 순서, async lifecycle, cancellation, revision과 result assembly를 담당합니다. |
@@ -69,10 +70,9 @@ Platform service / persistence / pipeline
 소멸 시에는 역순으로 callback 입구와 Adapter를 먼저 닫고, background operation을 취소·대기한 뒤 dependency를 파괴합니다.
 MCP process도 EOF에서 subscription을 먼저 닫고 Runtime을 종료합니다.
 
-현재 Product Runtime은 Catalog session, Catalog/Project, Editor와 Source Resolution authority 및 주입된 capability를 사용하는
-Preview Orchestrator를 소유합니다. Desktop은 실제 Preview pipeline과 presentation Adapter를 조립하며 MCP는 unavailable Preview
-capability를 주입합니다. Thumbnail과 Export의 ownership은 Desktop use case에 남아 있고 실제 두 번째 consumer가 필요로 하는
-vertical slice에서만 Runtime으로 점진적으로 이동합니다.
+현재 Product Runtime은 Catalog session, Catalog/Project, Editor, Source Resolution과 Export authority를 소유합니다. Desktop은
+실제 Preview/Thumbnail pipeline과 presentation Adapter를 조립하고, MCP는 같은 Runtime에서 현재 선택한 사진의 bounded Local
+JPEG Export surface를 사용합니다.
 
 ## 4. Product Contract
 
@@ -123,7 +123,7 @@ User input
    -> Qt Adapter
    -> EditorOrchestrator
       - state/history 갱신
-      - interactive throttle와 final debounce
+      - 조작 중 요청 빈도 제한과 조작 종료 후 최종 요청 발행
       - superseded request 취소
       - immutable PreviewRequest 생성
    -> PreviewOrchestrator
@@ -140,7 +140,8 @@ Histogram과 clipping은 현재 standard preview 결과와 함께 계산합니�
 
 ## 7. Shared processing path
 
-Preview와 Export는 lifecycle과 output precision이 다르지만 RAW decode, Develop parameter, color와 encode 의미를 공유합니다.
+Preview와 Export는 lifecycle과 output precision이 다르지만 RAW decode, Develop parameter와 color 의미를 공유합니다. RAW,
+Develop, Color와 PNG encode에는 Qt를 link하지 않는 processing target이 있으며, terminal CLI는 이 경로를 직접 사용합니다.
 Worker가 사용하는 가장 좁은 synchronous seam은 `ResolvedRenderPipeline`입니다.
 
 ```text
@@ -204,11 +205,12 @@ shared-storage 방식과 trusted LAN을 전제로 하며 authentication, authori
 MCP executable은 하나의 `ProductRuntime`을 소유하고 Product Contract를 JSON-RPC/MCP tool로 projection합니다. Tool layer가
 별도의 Catalog 또는 Editor business state를 만들지 않습니다.
 
-기본 surface는 bounded Catalog/Project read, Editor state와 Source Resolution event poll입니다. Mutation tool은
-`--allow-write`가 있을 때만 등록합니다. Request 처리, Runtime callback과 stdout write를 하나의 owner context로 직렬화해
+기본 surface는 bounded Catalog/Project read, Editor state, Source Resolution과 Export event poll입니다. Mutation과 artifact
+write tool은 `--allow-write`가 있을 때만 등록합니다. 현재 Export tool은 선택한 사진의 in-memory Develop state를 사용하는
+Local JPEG submit/cancel로 제한됩니다. Request 처리, Runtime callback과 stdout write를 하나의 owner context로 직렬화해
 response byte가 섞이지 않도록 합니다.
 
-MCP에는 Preview frame, Export, Worker control과 generic filesystem access가 아직 포함되지 않습니다.
+MCP에는 Preview frame, Remote/Auto Export, Worker control과 generic filesystem access가 포함되지 않습니다.
 
 ## 11. Thread와 async boundary
 
@@ -225,8 +227,7 @@ MCP에는 Preview frame, Export, Worker control과 generic filesystem access가 
 Cross-thread callback은 immutable value를 전달하고 owner context로 serialize합니다. Async owner가 borrowed dependency보다 오래
 살지 않도록 Composition Root의 member order와 destructor wait를 검증합니다.
 
-현재 Preview, Export와 Worker의 compute pool을 하나의 global scheduler로 통합하지 않습니다. Shared executor, priority,
-fairness, CPU reservation과 intra-image parallelism은 measurement와 별도 설계 승인이 필요한 후속 범위입니다.
+현재 Preview, Export와 Worker는 각각의 operation lifecycle과 실행 queue를 사용합니다.
 
 ## 12. Build와 test boundary
 
@@ -235,9 +236,10 @@ fairness, CPU reservation과 intra-image parallelism은 measurement와 별도 �
 - Windows Desktop Release
 - Windows MCP-only Release
 - Windows Worker-only Release
-- Windows Qt-free Product Contract
-- WSL x64 Qt-free Product Contract
-- Linux ARM64 Qt-free Product Contract
+- Windows terminal CLI와 portable processing
+- Windows frontend-neutral Product Contract
+- WSL x64 frontend-neutral Product Contract와 portable processing
+- Linux ARM64 frontend-neutral Product Contract와 portable processing
 
 Linux ARM64 preset은 `arm64-linux` triplet을 사용하는 native build용입니다. 특정 장비 이름을 build target으로 사용하지
 않으며, 장비별 측정 결과와 모든 Linux ARM64 환경의 지원 보장은 구분합니다.
@@ -257,6 +259,3 @@ skip하며, 일반 unit test가 fixture 부재를 성공으로 가장하지 않�
 - Worker discovery, durable retry/resume와 public network security
 - 완전한 display ICC, high-bit-depth preview와 advanced Export feature
 - ML/HDR/Panorama directory가 암시하는 모든 미래 기능
-
-새 abstraction은 실제 consumer 또는 concrete build blocker가 있을 때만 추가합니다. 코드 모양이 비슷하다는 이유만으로
-ownership, lifetime, cancellation과 failure semantics가 다른 책임을 하나로 합치지 않습니다.
