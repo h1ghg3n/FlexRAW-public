@@ -8,6 +8,7 @@
 #include "client_error.h"
 #include "client_identity.h"
 #include "client_result.h"
+#include "hsl_params.h"
 
 namespace flexraw::core::client
 {
@@ -28,6 +29,7 @@ struct EditorDevelopParams
     float blacks{0.0F};
     float saturation{0.0F};
     float vibrance{0.0F};
+    types::HslParams hsl;
     EditorWhiteBalanceMode whiteBalanceMode{EditorWhiteBalanceMode::AsShot};
     float whiteBalanceTemperatureKelvin{6500.0F};
     float whiteBalanceTint{0.0F};

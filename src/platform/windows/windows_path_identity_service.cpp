@@ -1,6 +1,7 @@
 #include "windows_path_identity_service.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
@@ -15,6 +16,12 @@ namespace
 {
 
 constexpr ULONG CaseSensitiveDirectoryFlag = 0x00000001;
+
+enum class ParentIdentityKind : std::uint8_t
+{
+    FileId128 = 1,
+    LegacyFileIndex = 2,
+};
 
 struct HandleCloser
 {
@@ -39,6 +46,35 @@ template<typename Value> void appendValue(std::string& destination, const Value&
 {
     const auto* const begin = reinterpret_cast<const char*>(std::addressof(value));
     destination.append(begin, sizeof(Value));
+}
+
+// 목적: Windows directory handle에서 SMB 호환 fallback을 포함한 parent identity 생성
+// 입력: handle: 열린 parent directory handle
+// 출력: 128-bit 또는 legacy volume/file index identity, 둘 다 조회할 수 없으면 nullopt
+[[nodiscard]] std::optional<std::string> parentIdentityBytes(const HANDLE handle)
+{
+    FILE_ID_INFO identity{};
+    if (GetFileInformationByHandleEx(handle, FileIdInfo, &identity, sizeof(identity)) != 0)
+    {
+        std::string bytes;
+        appendValue(bytes, ParentIdentityKind::FileId128);
+        appendValue(bytes, identity.VolumeSerialNumber);
+        bytes.append(reinterpret_cast<const char*>(identity.FileId.Identifier), sizeof(identity.FileId.Identifier));
+        return bytes;
+    }
+
+    BY_HANDLE_FILE_INFORMATION legacyIdentity{};
+    if (GetFileInformationByHandle(handle, &legacyIdentity) == 0)
+    {
+        return std::nullopt;
+    }
+
+    std::string bytes;
+    appendValue(bytes, ParentIdentityKind::LegacyFileIndex);
+    appendValue(bytes, legacyIdentity.dwVolumeSerialNumber);
+    appendValue(bytes, legacyIdentity.nFileIndexHigh);
+    appendValue(bytes, legacyIdentity.nFileIndexLow);
+    return bytes;
 }
 
 // 목적: Windows case-insensitive filename 비교용 invariant uppercase 문자열 생성
@@ -76,7 +112,7 @@ template<typename Value> void appendValue(std::string& destination, const Value&
 
 // 목적: Windows parent identity와 directory case policy를 반영한 임시 path key 생성
 // 입력: absolutePath: 기존 parent directory와 prospective leaf를 가진 절대 경로
-// 출력: 같은 parent와 Windows filename 의미를 비교할 key, native 조회 실패 시 nullopt
+// 출력: 같은 parent와 Windows filename 의미를 비교할 key, parent identity 조회 실패 시 nullopt
 std::optional<TransientPathKey> WindowsPathIdentityService::comparisonKey(
     const std::filesystem::path& absolutePath) const
 {
@@ -100,15 +136,17 @@ std::optional<TransientPathKey> WindowsPathIdentityService::comparisonKey(
         return std::nullopt;
     }
 
-    FILE_ID_INFO identity{};
-    FILE_CASE_SENSITIVE_INFO casePolicy{};
-    if (GetFileInformationByHandleEx(parentHandle.get(), FileIdInfo, &identity, sizeof(identity)) == 0 ||
-        GetFileInformationByHandleEx(parentHandle.get(), FileCaseSensitiveInfo, &casePolicy, sizeof(casePolicy)) == 0)
+    std::optional<std::string> parentIdentity = parentIdentityBytes(static_cast<HANDLE>(parentHandle.get()));
+    if (!parentIdentity.has_value())
     {
         return std::nullopt;
     }
 
-    const bool caseSensitive = (casePolicy.Flags & CaseSensitiveDirectoryFlag) != 0;
+    FILE_CASE_SENSITIVE_INFO casePolicy{};
+    const bool casePolicyAvailable =
+        GetFileInformationByHandleEx(parentHandle.get(), FileCaseSensitiveInfo, &casePolicy, sizeof(casePolicy)) != 0;
+    // SMB server가 case policy query를 지원하지 않으면 false positive만 허용하는 case-insensitive 비교로 제한한다.
+    const bool caseSensitive = casePolicyAvailable && (casePolicy.Flags & CaseSensitiveDirectoryFlag) != 0;
     const std::optional<std::wstring> comparableLeaf =
         caseSensitive ? std::optional<std::wstring>{leaf} : uppercaseLeaf(leaf);
     if (!comparableLeaf.has_value())
@@ -117,10 +155,8 @@ std::optional<TransientPathKey> WindowsPathIdentityService::comparisonKey(
     }
 
     TransientPathKey key;
-    key.bytes.reserve(sizeof(identity.VolumeSerialNumber) + sizeof(identity.FileId.Identifier) + sizeof(caseSensitive) +
-                      comparableLeaf->size() * sizeof(wchar_t));
-    appendValue(key.bytes, identity.VolumeSerialNumber);
-    key.bytes.append(reinterpret_cast<const char*>(identity.FileId.Identifier), sizeof(identity.FileId.Identifier));
+    key.bytes = std::move(*parentIdentity);
+    key.bytes.reserve(key.bytes.size() + sizeof(caseSensitive) + comparableLeaf->size() * sizeof(wchar_t));
     appendValue(key.bytes, caseSensitive);
     key.bytes.append(reinterpret_cast<const char*>(comparableLeaf->data()), comparableLeaf->size() * sizeof(wchar_t));
     return key;

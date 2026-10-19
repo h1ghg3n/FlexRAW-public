@@ -52,6 +52,16 @@ endif()
 
 include(GoogleTest)
 
+# Allocation failure injection must not affect the general Worker test process.
+add_executable(flexraw_memory_exception_tests
+    local_memory_admission_exception_test.cpp
+    ../../src/worker/admission/local_memory_admission.cpp
+)
+target_include_directories(flexraw_memory_exception_tests PRIVATE ../../src/worker/admission)
+target_link_libraries(flexraw_memory_exception_tests PRIVATE flexraw_platform_api GTest::gtest_main)
+set_target_properties(flexraw_memory_exception_tests PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+gtest_discover_tests(flexraw_memory_exception_tests DISCOVERY_MODE PRE_TEST)
+
 gtest_discover_tests(flexraw_worker_tests
     DISCOVERY_MODE PRE_TEST
     PROPERTIES

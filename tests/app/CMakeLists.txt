@@ -5,6 +5,7 @@ set_target_properties(flexraw_app_tests PROPERTIES
 )
 
 target_sources(flexraw_app_tests PRIVATE
+    ../support/qt_core_test_main.cpp
     managed_catalog_session_test.cpp
     product_runtime_test.cpp
 )
@@ -13,7 +14,7 @@ target_link_libraries(flexraw_app_tests PRIVATE
     flexraw_app
     flexraw_core_orchestration
     flexraw_product_runtime
-    GTest::gtest_main
+    GTest::gtest
 )
 
 include(GoogleTest)

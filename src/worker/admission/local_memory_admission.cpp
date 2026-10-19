@@ -49,7 +49,7 @@ LocalMemoryAdmission::LocalMemoryAdmission(const platform::ISystemMemoryProbe& m
 
 // 목적: local physical memory headroom과 active ledger를 함께 확인해 claim admission
 // 입력: request: process-local lease identity와 예상 peak resource claim
-// 출력: reserve를 유지할 수 있으면 local active lease, 아니면 Busy/Unavailable decision
+// 출력: snapshot과 active claim의 보수적 headroom에 맞으면 lease, 아니면 Busy/Unavailable
 ResourceAdmissionDecision LocalMemoryAdmission::acquire(const ResourceLeaseRequest& request)
 {
     if (request.requestId.empty())
@@ -92,7 +92,10 @@ ResourceAdmissionDecision LocalMemoryAdmission::acquire(const ResourceLeaseReque
     const std::uint64_t ledgerRemainingMiB =
         m_committedMemoryMiB >= allocatableMiB ? 0 : allocatableMiB - m_committedMemoryMiB;
     const std::uint64_t observedHeadroomMiB = availableMiB - m_reserveMiB;
-    const std::uint64_t effectiveAvailableMiB = std::min(ledgerRemainingMiB, observedHeadroomMiB);
+    // Snapshot은 claim이 실제 할당됐는지 구분하지 못하므로 active claim을 보수적으로 차감합니다.
+    const std::uint64_t uncommittedHeadroomMiB =
+        m_committedMemoryMiB >= observedHeadroomMiB ? 0 : observedHeadroomMiB - m_committedMemoryMiB;
+    const std::uint64_t effectiveAvailableMiB = std::min(ledgerRemainingMiB, uncommittedHeadroomMiB);
     if (request.claim.memoryMiB > effectiveAvailableMiB)
     {
         return makeBusyDecision("Local render memory claim would breach the configured available memory reserve.");
@@ -102,12 +105,15 @@ ResourceAdmissionDecision LocalMemoryAdmission::acquire(const ResourceLeaseReque
         return makeInvalidRequestDecision("Local render memory claim overflows the active admission ledger.");
     }
 
+    // Grant commit 뒤에는 반환 lease의 string allocation이 실패해 commitment만 남지 않아야 합니다.
+    ResourceAdmissionDecision decision{
+        ResourceAdmissionStatus::Granted,
+        RenderResourceLease{request.requestId, std::chrono::system_clock::time_point::max()},
+        std::nullopt,
+        {}};
     m_activeLeases.emplace(request.requestId, ActiveLeaseRecord{request.clientId, request.claim, request.ttl});
     m_committedMemoryMiB += request.claim.memoryMiB;
-    return {ResourceAdmissionStatus::Granted,
-            RenderResourceLease{request.requestId, std::chrono::system_clock::time_point::max()},
-            std::nullopt,
-            {}};
+    return decision;
 }
 
 // 목적: local lease가 아직 active인지 확인하고 non-expiring lease 반환

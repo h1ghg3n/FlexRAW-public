@@ -70,6 +70,66 @@ namespace
            value <= static_cast<int>(types::FileScanStatus::Failed);
 }
 
+// 목적: database 또는 command의 Catalog 선별 상태가 지원 범위인지 확인
+// 입력: value: CatalogCullingState 정수 표현
+// 출력: Neutral·Pick·Reject 중 하나면 true
+[[nodiscard]] bool isCatalogCullingState(int value)
+{
+    return value >= static_cast<int>(CatalogCullingState::Neutral) &&
+           value <= static_cast<int>(CatalogCullingState::Reject);
+}
+
+// 목적: database 또는 command의 Catalog 등록 포함 상태가 지원 범위인지 확인
+// 입력: value: CatalogInclusionState 정수 표현
+// 출력: Included·Excluded 중 하나면 true
+[[nodiscard]] bool isCatalogInclusionState(int value)
+{
+    return value >= static_cast<int>(CatalogInclusionState::Included) &&
+           value <= static_cast<int>(CatalogInclusionState::Excluded);
+}
+
+// 목적: page filter enum이 지원 범위인지 확인
+// 입력: filter: caller가 전달한 Catalog 선별 filter
+// 출력: All·Pick·Reject 중 하나면 true
+[[nodiscard]] bool isCatalogCullingFilter(CatalogCullingFilter filter)
+{
+    return filter == CatalogCullingFilter::All || filter == CatalogCullingFilter::Pick ||
+           filter == CatalogCullingFilter::Reject;
+}
+
+// 목적: page filter enum이 지원하는 Catalog 등록 포함 범위인지 확인
+// 입력: filter: caller가 전달한 Catalog 등록 포함 filter
+// 출력: IncludedOnly·ExcludedOnly 중 하나면 true
+[[nodiscard]] bool isCatalogInclusionFilter(CatalogInclusionFilter filter)
+{
+    return filter == CatalogInclusionFilter::IncludedOnly || filter == CatalogInclusionFilter::ExcludedOnly;
+}
+
+// 목적: Catalog 등록 포함 filter를 photos.inclusion_state 저장값으로 변환
+// 입력: filter: 검증된 Catalog 등록 포함 filter
+// 출력: 대응하는 persisted state 값
+[[nodiscard]] int inclusionStateForFilter(CatalogInclusionFilter filter)
+{
+    return filter == CatalogInclusionFilter::ExcludedOnly ? static_cast<int>(CatalogInclusionState::Excluded)
+                                                          : static_cast<int>(CatalogInclusionState::Included);
+}
+
+// 목적: Pick·Reject filter를 photos.culling_state 저장값으로 변환
+// 입력: filter: 검증된 Catalog 선별 filter
+// 출력: All이면 빈 값, 나머지는 대응하는 persisted state 값
+[[nodiscard]] std::optional<int> cullingStateForFilter(CatalogCullingFilter filter)
+{
+    if (filter == CatalogCullingFilter::Pick)
+    {
+        return static_cast<int>(CatalogCullingState::Pick);
+    }
+    if (filter == CatalogCullingFilter::Reject)
+    {
+        return static_cast<int>(CatalogCullingState::Reject);
+    }
+    return std::nullopt;
+}
+
 // 목적: 사진 파일의 현재 수정 시각을 millisecond epoch 값으로 조회
 // 입력: path: 수정 시각을 읽을 사진 파일 경로
 // 출력: 파일이 없거나 시각이 없으면 0, 그 외 마지막 수정 시각
@@ -96,6 +156,8 @@ namespace
     const int kindValue = query.value(5).toInt();
     const int scanStatusValue = query.value(6).toInt();
     const int sourceStateValue = query.value(10).toInt();
+    const int cullingStateValue = query.value(11).toInt();
+    const int inclusionStateValue = query.value(12).toInt();
     const types::PhotoId photoId{query.value(0).toLongLong()};
     const types::SourceFingerprint fingerprint{
         query.value(7).toLongLong(), query.value(8).toLongLong(), query.value(9).toByteArray()};
@@ -103,7 +165,8 @@ namespace
     const QString lastKnownPath = query.value(2).toString();
     if (!types::isValidPhotoId(photoId) || lastKnownPath.isEmpty() || lastKnownPath != lastKnownPath.trimmed() ||
         !isSupportedFileKind(kindValue) || !isFileScanStatus(scanStatusValue) ||
-        !isSourceBindingState(sourceStateValue) || !types::isValidSourceFingerprint(fingerprint))
+        !isSourceBindingState(sourceStateValue) || !isCatalogCullingState(cullingStateValue) ||
+        !isCatalogInclusionState(inclusionStateValue) || !types::isValidSourceFingerprint(fingerprint))
     {
         return types::Result<CatalogPhotoRecord, types::CoreError>::failure(
             makeDatabaseError(QStringLiteral("The catalog contains an invalid photo record.")));
@@ -131,6 +194,8 @@ namespace
         static_cast<types::FileScanStatus>(scanStatusValue),
         fingerprint,
         static_cast<SourceBindingState>(sourceStateValue),
+        static_cast<CatalogCullingState>(cullingStateValue),
+        static_cast<CatalogInclusionState>(inclusionStateValue),
     });
 }
 
@@ -161,6 +226,20 @@ namespace
         return types::CoreError{
             types::ErrorCode::InvalidArgument,
             QStringLiteral("Backward catalog paging requires a cursor."),
+        };
+    }
+    if (!isCatalogCullingFilter(request.cullingFilter))
+    {
+        return types::CoreError{
+            types::ErrorCode::InvalidArgument,
+            QStringLiteral("Catalog photo culling filter is invalid."),
+        };
+    }
+    if (!isCatalogInclusionFilter(request.inclusionFilter))
+    {
+        return types::CoreError{
+            types::ErrorCode::InvalidArgument,
+            QStringLiteral("Catalog photo inclusion filter is invalid."),
         };
     }
     if (request.exactFolderPath.has_value() && folderScope->isEmpty())
@@ -198,7 +277,8 @@ namespace
                 ? std::optional<QString>{normalizeSourceFolderPath(*request.cursor->exactFolderPath)}
                 : std::nullopt;
         if ((request.cursor->exactFolderPath.has_value() && cursorScope->isEmpty()) || cursorScope != folderScope ||
-            request.cursor->projectId != request.projectId)
+            request.cursor->projectId != request.projectId || request.cursor->cullingFilter != request.cullingFilter ||
+            request.cursor->inclusionFilter != request.inclusionFilter)
         {
             return types::CoreError{
                 types::ErrorCode::InvalidArgument,
@@ -218,7 +298,9 @@ namespace
     const bool backwards = request.direction == CatalogPhotoPageDirection::Backward;
     QString statement =
         QStringLiteral("SELECT photos.id, source_path, last_known_path, extension, display_name, kind, scan_status, "
-                       "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state FROM photos ");
+                       "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state, culling_state, "
+                       "inclusion_state "
+                       "FROM photos ");
     if (request.projectId.has_value())
     {
         statement += QStringLiteral("INNER JOIN project_photos ON project_photos.photo_id = photos.id ");
@@ -231,11 +313,18 @@ namespace
     {
         statement += QStringLiteral("WHERE project_photos.project_id = :projectId ");
     }
+    statement +=
+        (folderScope.has_value() || request.projectId.has_value()) ? QStringLiteral("AND ") : QStringLiteral("WHERE ");
+    statement += QStringLiteral("inclusion_state = :inclusionState ");
+    if (request.cullingFilter != CatalogCullingFilter::All)
+    {
+        statement += QStringLiteral("AND ");
+        statement += QStringLiteral("culling_state = :cullingState ");
+    }
     if (request.cursor.has_value())
     {
         const QString comparison = backwards ? QStringLiteral("<") : QStringLiteral(">");
-        statement += (folderScope.has_value() || request.projectId.has_value()) ? QStringLiteral("AND ")
-                                                                                : QStringLiteral("WHERE ");
+        statement += QStringLiteral("AND ");
         statement += QStringLiteral("display_name COLLATE NOCASE %1= :cursorDisplayName COLLATE NOCASE "
                                     "AND ((display_name COLLATE NOCASE %1 :cursorDisplayName COLLATE NOCASE) "
                                     "OR (display_name COLLATE NOCASE = :cursorDisplayName COLLATE NOCASE "
@@ -253,9 +342,11 @@ namespace
 // 출력: display name, immutable PhotoId와 동일 scope를 보존한 cursor
 [[nodiscard]] CatalogPhotoPageCursor makePageCursor(const CatalogPhotoRecord& photo,
                                                     const std::optional<QString>& folderScope,
-                                                    std::optional<ProjectId> projectId)
+                                                    std::optional<ProjectId> projectId,
+                                                    CatalogCullingFilter cullingFilter,
+                                                    CatalogInclusionFilter inclusionFilter)
 {
-    return {photo.displayName, photo.id, folderScope, projectId};
+    return {photo.displayName, photo.id, folderScope, projectId, cullingFilter, inclusionFilter};
 }
 
 }  // namespace
@@ -361,6 +452,11 @@ CatalogPhotoQueryResult CatalogPhotoRepository::queryPage(const CatalogPhotoPage
     {
         query.bindValue(QStringLiteral(":projectId"), request.projectId->value);
     }
+    query.bindValue(QStringLiteral(":inclusionState"), inclusionStateForFilter(request.inclusionFilter));
+    if (const std::optional<int> cullingState = cullingStateForFilter(request.cullingFilter); cullingState.has_value())
+    {
+        query.bindValue(QStringLiteral(":cullingState"), *cullingState);
+    }
     if (request.cursor.has_value())
     {
         query.bindValue(QStringLiteral(":cursorDisplayName"), request.cursor->displayName);
@@ -407,22 +503,188 @@ CatalogPhotoQueryResult CatalogPhotoRepository::queryPage(const CatalogPhotoPage
     {
         if (hasMore)
         {
-            page.previousCursor = makePageCursor(page.photos.front(), folderScope, request.projectId);
+            page.previousCursor = makePageCursor(
+                page.photos.front(), folderScope, request.projectId, request.cullingFilter, request.inclusionFilter);
         }
-        page.nextCursor = makePageCursor(page.photos.back(), folderScope, request.projectId);
+        page.nextCursor = makePageCursor(
+            page.photos.back(), folderScope, request.projectId, request.cullingFilter, request.inclusionFilter);
     }
     else
     {
         if (request.cursor.has_value())
         {
-            page.previousCursor = makePageCursor(page.photos.front(), folderScope, request.projectId);
+            page.previousCursor = makePageCursor(
+                page.photos.front(), folderScope, request.projectId, request.cullingFilter, request.inclusionFilter);
         }
         if (hasMore)
         {
-            page.nextCursor = makePageCursor(page.photos.back(), folderScope, request.projectId);
+            page.nextCursor = makePageCursor(
+                page.photos.back(), folderScope, request.projectId, request.cullingFilter, request.inclusionFilter);
         }
     }
     return CatalogPhotoQueryResult::success(std::move(page));
+}
+
+// 목적: stable Photo identity batch에 동일한 Catalog 선별 상태를 원자적으로 적용
+// 입력: photoIds: 중복 가능 identity 목록, state: 적용할 Neutral·Pick·Reject 상태
+// 출력: 오름차순으로 정규화된 identity 목록 또는 validation·not-found·database 오류
+CatalogCullingMutationResult CatalogPhotoRepository::setCullingState(const QVector<types::PhotoId>& photoIds,
+                                                                     CatalogCullingState state)
+{
+    if (photoIds.isEmpty() || photoIds.size() > MaximumCatalogCullingBatchSize ||
+        !isCatalogCullingState(static_cast<int>(state)))
+    {
+        return CatalogCullingMutationResult::failure(
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog culling batch is invalid.")});
+    }
+
+    QVector<types::PhotoId> normalizedPhotoIds = photoIds;
+    std::sort(normalizedPhotoIds.begin(), normalizedPhotoIds.end(), [](types::PhotoId first, types::PhotoId second) {
+        return first.value < second.value;
+    });
+    normalizedPhotoIds.erase(
+        std::unique(normalizedPhotoIds.begin(),
+                    normalizedPhotoIds.end(),
+                    [](types::PhotoId first, types::PhotoId second) { return first.value == second.value; }),
+        normalizedPhotoIds.end());
+    if (std::any_of(normalizedPhotoIds.cbegin(), normalizedPhotoIds.cend(), [](types::PhotoId photoId) {
+            return !types::isValidPhotoId(photoId);
+        }))
+    {
+        return CatalogCullingMutationResult::failure(
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog culling Photo ID is invalid.")});
+    }
+
+    QSqlDatabase& database = m_database.m_database;
+    if (!database.transaction())
+    {
+        return CatalogCullingMutationResult::failure(makeDatabaseError(
+            QStringLiteral("Unable to begin Catalog culling transaction: %1").arg(database.lastError().text())));
+    }
+
+    QSqlQuery validationQuery(database);
+    validationQuery.prepare(QStringLiteral("SELECT 1 FROM photos WHERE id = :photoId"));
+    for (types::PhotoId photoId : normalizedPhotoIds)
+    {
+        validationQuery.bindValue(QStringLiteral(":photoId"), photoId.value);
+        if (!validationQuery.exec())
+        {
+            database.rollback();
+            return CatalogCullingMutationResult::failure(
+                makeDatabaseError(QStringLiteral("Unable to validate Catalog culling Photo: %1")
+                                      .arg(validationQuery.lastError().text())));
+        }
+        if (!validationQuery.next())
+        {
+            database.rollback();
+            return CatalogCullingMutationResult::failure(
+                {types::ErrorCode::NotFound, QStringLiteral("Catalog culling Photo does not exist.")});
+        }
+        validationQuery.finish();
+    }
+
+    QSqlQuery updateQuery(database);
+    updateQuery.prepare(QStringLiteral("UPDATE photos SET culling_state = :state WHERE id = :photoId"));
+    for (types::PhotoId photoId : normalizedPhotoIds)
+    {
+        updateQuery.bindValue(QStringLiteral(":state"), static_cast<int>(state));
+        updateQuery.bindValue(QStringLiteral(":photoId"), photoId.value);
+        if (!updateQuery.exec())
+        {
+            database.rollback();
+            return CatalogCullingMutationResult::failure(makeDatabaseError(
+                QStringLiteral("Unable to update Catalog culling state: %1").arg(updateQuery.lastError().text())));
+        }
+    }
+
+    if (!database.commit())
+    {
+        database.rollback();
+        return CatalogCullingMutationResult::failure(makeDatabaseError(
+            QStringLiteral("Unable to commit Catalog culling transaction: %1").arg(database.lastError().text())));
+    }
+    return CatalogCullingMutationResult::success(std::move(normalizedPhotoIds));
+}
+
+// 목적: stable Photo identity batch에 동일한 Catalog 등록 포함 상태를 원자적으로 적용
+// 입력: photoIds: 중복 가능 identity 목록, state: 적용할 Included·Excluded 상태
+// 출력: 오름차순으로 정규화된 identity 목록 또는 validation·not-found·database 오류
+CatalogInclusionMutationResult CatalogPhotoRepository::setInclusionState(const QVector<types::PhotoId>& photoIds,
+                                                                         CatalogInclusionState state)
+{
+    if (photoIds.isEmpty() || photoIds.size() > MaximumCatalogInclusionBatchSize ||
+        !isCatalogInclusionState(static_cast<int>(state)))
+    {
+        return CatalogInclusionMutationResult::failure(
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog inclusion batch is invalid.")});
+    }
+
+    QVector<types::PhotoId> normalizedPhotoIds = photoIds;
+    std::sort(normalizedPhotoIds.begin(), normalizedPhotoIds.end(), [](types::PhotoId first, types::PhotoId second) {
+        return first.value < second.value;
+    });
+    normalizedPhotoIds.erase(
+        std::unique(normalizedPhotoIds.begin(),
+                    normalizedPhotoIds.end(),
+                    [](types::PhotoId first, types::PhotoId second) { return first.value == second.value; }),
+        normalizedPhotoIds.end());
+    if (std::any_of(normalizedPhotoIds.cbegin(), normalizedPhotoIds.cend(), [](types::PhotoId photoId) {
+            return !types::isValidPhotoId(photoId);
+        }))
+    {
+        return CatalogInclusionMutationResult::failure(
+            {types::ErrorCode::InvalidArgument, QStringLiteral("Catalog inclusion Photo ID is invalid.")});
+    }
+
+    QSqlDatabase& database = m_database.m_database;
+    if (!database.transaction())
+    {
+        return CatalogInclusionMutationResult::failure(makeDatabaseError(
+            QStringLiteral("Unable to begin Catalog inclusion transaction: %1").arg(database.lastError().text())));
+    }
+
+    QSqlQuery validationQuery(database);
+    validationQuery.prepare(QStringLiteral("SELECT 1 FROM photos WHERE id = :photoId"));
+    for (types::PhotoId photoId : normalizedPhotoIds)
+    {
+        validationQuery.bindValue(QStringLiteral(":photoId"), photoId.value);
+        if (!validationQuery.exec())
+        {
+            database.rollback();
+            return CatalogInclusionMutationResult::failure(
+                makeDatabaseError(QStringLiteral("Unable to validate Catalog inclusion Photo: %1")
+                                      .arg(validationQuery.lastError().text())));
+        }
+        if (!validationQuery.next())
+        {
+            database.rollback();
+            return CatalogInclusionMutationResult::failure(
+                {types::ErrorCode::NotFound, QStringLiteral("Catalog inclusion Photo does not exist.")});
+        }
+        validationQuery.finish();
+    }
+
+    QSqlQuery updateQuery(database);
+    updateQuery.prepare(QStringLiteral("UPDATE photos SET inclusion_state = :state WHERE id = :photoId"));
+    for (types::PhotoId photoId : normalizedPhotoIds)
+    {
+        updateQuery.bindValue(QStringLiteral(":state"), static_cast<int>(state));
+        updateQuery.bindValue(QStringLiteral(":photoId"), photoId.value);
+        if (!updateQuery.exec())
+        {
+            database.rollback();
+            return CatalogInclusionMutationResult::failure(makeDatabaseError(
+                QStringLiteral("Unable to update Catalog inclusion state: %1").arg(updateQuery.lastError().text())));
+        }
+    }
+
+    if (!database.commit())
+    {
+        database.rollback();
+        return CatalogInclusionMutationResult::failure(makeDatabaseError(
+            QStringLiteral("Unable to commit Catalog inclusion transaction: %1").arg(database.lastError().text())));
+    }
+    return CatalogInclusionMutationResult::success(std::move(normalizedPhotoIds));
 }
 
 // 목적: linked photo가 존재하는 Catalog Folder path와 photo 수 조회
@@ -465,9 +727,11 @@ CatalogPhotoRecordResult CatalogPhotoRepository::findById(types::PhotoId photoId
     }
 
     QSqlQuery query(m_database.m_database);
-    query.prepare(QStringLiteral(
-        "SELECT id, source_path, last_known_path, extension, display_name, kind, scan_status, "
-        "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state FROM photos WHERE id = :photoId"));
+    query.prepare(
+        QStringLiteral("SELECT id, source_path, last_known_path, extension, display_name, kind, scan_status, "
+                       "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state, culling_state, "
+                       "inclusion_state "
+                       "FROM photos WHERE id = :photoId"));
     query.bindValue(QStringLiteral(":photoId"), photoId.value);
     if (!query.exec())
     {
@@ -496,9 +760,11 @@ CatalogPhotoRecordResult CatalogPhotoRepository::findBySourcePath(const QString&
     }
 
     QSqlQuery query(m_database.m_database);
-    query.prepare(QStringLiteral("SELECT id, source_path, last_known_path, extension, display_name, kind, scan_status, "
-                                 "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state "
-                                 "FROM photos WHERE source_path = :sourcePath"));
+    query.prepare(
+        QStringLiteral("SELECT id, source_path, last_known_path, extension, display_name, kind, scan_status, "
+                       "source_size_bytes, source_mtime_ms, source_sha256, source_binding_state, culling_state, "
+                       "inclusion_state "
+                       "FROM photos WHERE source_path = :sourcePath"));
     query.bindValue(QStringLiteral(":sourcePath"), sourcePath);
     if (!query.exec())
     {

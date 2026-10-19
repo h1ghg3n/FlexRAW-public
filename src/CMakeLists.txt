@@ -4,6 +4,10 @@ endif()
 
 add_subdirectory(core)
 
+if(FLEXRAW_BUILD_CLI)
+    add_subdirectory(cli)
+endif()
+
 if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_MCP)
     add_subdirectory(runtime)
 endif()

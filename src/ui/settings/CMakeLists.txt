@@ -15,6 +15,8 @@ target_sources(flexraw_ui_settings PRIVATE
     qt_export_settings_adapter.h
     settings_dialog.cpp
     settings_dialog.h
+    settings_page_header.cpp
+    settings_page_header.h
     qt_worker_profile_settings_adapter.cpp
     qt_worker_profile_settings_adapter.h
     qt_worker_health_event_adapter.cpp

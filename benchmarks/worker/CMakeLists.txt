@@ -44,6 +44,7 @@ if(TARGET flexraw_export_placement_benchmark)
     target_link_libraries(flexraw_export_placement_benchmark PRIVATE
         flexraw_core_measurement
         flexraw_core_orchestration
+        flexraw_core_render
         flexraw_core_util
         flexraw_platform_current
         flexraw_worker_client

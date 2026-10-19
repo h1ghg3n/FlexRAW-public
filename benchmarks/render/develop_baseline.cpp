@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 
 #include <QByteArray>
@@ -18,6 +19,16 @@
 
 namespace
 {
+
+enum class DevelopBaselineProfile
+{
+    Base,
+    NoiseReduction,
+    Clarity,
+    Sharpening,
+    LegacySharpening,
+    Representative,
+};
 
 // 목적: 현재 CPU develop 경로의 주요 보정 stage를 실행하는 대표 parameter 생성
 // 입력: 없음
@@ -51,6 +62,67 @@ namespace
     return params;
 }
 
+// 목적: command-line profile ID를 Develop baseline profile로 해석
+// 입력: profileId: base-v1 또는 neighborhood stage별 version 1 ID
+// 출력: 지원 profile이면 enum 값, 아니면 nullopt
+[[nodiscard]] std::optional<DevelopBaselineProfile> parseProfile(const QString& profileId)
+{
+    if (profileId == QStringLiteral("base-v1"))
+    {
+        return DevelopBaselineProfile::Base;
+    }
+    if (profileId == QStringLiteral("noise-reduction-v1"))
+    {
+        return DevelopBaselineProfile::NoiseReduction;
+    }
+    if (profileId == QStringLiteral("clarity-v1"))
+    {
+        return DevelopBaselineProfile::Clarity;
+    }
+    if (profileId == QStringLiteral("sharpening-v1"))
+    {
+        return DevelopBaselineProfile::Sharpening;
+    }
+    if (profileId == QStringLiteral("legacy-sharpening-v1"))
+    {
+        return DevelopBaselineProfile::LegacySharpening;
+    }
+    if (profileId == QStringLiteral("representative-v1"))
+    {
+        return DevelopBaselineProfile::Representative;
+    }
+    return std::nullopt;
+}
+
+// 목적: pixelwise 대표 보정에 선택한 neighborhood stage만 활성화
+// 입력: profile: 실행할 Develop baseline profile
+// 출력: profile별 DevelopParams
+[[nodiscard]] flexraw::core::types::DevelopParams makeProfileParams(DevelopBaselineProfile profile)
+{
+    flexraw::core::types::DevelopParams params = makeRepresentativeParams();
+    if (profile != DevelopBaselineProfile::NoiseReduction && profile != DevelopBaselineProfile::Representative)
+    {
+        params.luminanceNoiseReduction = 0.0F;
+        params.colorNoiseReduction = 0.0F;
+    }
+    if (profile != DevelopBaselineProfile::Clarity && profile != DevelopBaselineProfile::Representative)
+    {
+        params.clarity = 0.0F;
+    }
+    if (profile != DevelopBaselineProfile::Sharpening && profile != DevelopBaselineProfile::LegacySharpening &&
+        profile != DevelopBaselineProfile::Representative)
+    {
+        params.sharpeningAmount = 0.0F;
+    }
+    if (profile == DevelopBaselineProfile::LegacySharpening)
+    {
+        params.sharpeningRadius = 1.0F;
+        params.sharpeningDetail = 0.0F;
+        params.sharpeningMasking = 0.0F;
+    }
+    return params;
+}
+
 // 목적: QString을 CSV record에 보존할 UTF-8 standard string으로 변환
 // 입력: value: 변환할 Qt text
 // 출력: UTF-8 byte sequence
@@ -60,8 +132,8 @@ namespace
     return {bytes.constData(), static_cast<std::size_t>(bytes.size())};
 }
 
-// 목적: CPU develop baseline 인자 해석, 입력 decode와 1회 측정 결과 출력
-// 입력: argc/argv: --input, --run-id, --target command-line option
+// 목적: CPU develop baseline 인자 해석, profile 선택, 입력 decode와 1회 측정 결과 출력
+// 입력: argc/argv: --input, --run-id, --target, --profile command-line option
 // 출력: 성공 0, 인자·decode·develop 실패 시 non-zero process code
 int runBaseline(QCoreApplication& application)
 {
@@ -84,13 +156,30 @@ int runBaseline(QCoreApplication& application)
         QCoreApplication::translate("DevelopBaseline", "Machine and architecture label recorded in CSV."),
         QCoreApplication::translate("DevelopBaseline", "name"),
         QStringLiteral("unspecified"));
-    parser.addOptions({inputOption, runIdOption, targetOption});
+    const QCommandLineOption profileOption(
+        QStringLiteral("profile"),
+        QCoreApplication::translate(
+            "DevelopBaseline",
+            "Develop profile: base-v1, noise-reduction-v1, clarity-v1, sharpening-v1, legacy-sharpening-v1, or "
+            "representative-v1."),
+        QCoreApplication::translate("DevelopBaseline", "id"),
+        QStringLiteral("representative-v1"));
+    parser.addOptions({inputOption, runIdOption, targetOption, profileOption});
     parser.process(application);
 
     const QString inputPath = parser.value(inputOption);
     if (inputPath.trimmed().isEmpty())
     {
         std::cerr << toUtf8(QCoreApplication::translate("DevelopBaseline", "Missing required --input path.")) << '\n';
+        return 2;
+    }
+
+    const QString profileId = parser.value(profileOption);
+    const std::optional<DevelopBaselineProfile> profile = parseProfile(profileId);
+    if (!profile.has_value())
+    {
+        std::cerr << toUtf8(QCoreApplication::translate("DevelopBaseline", "Unsupported --profile value: "))
+                  << toUtf8(profileId) << '\n';
         return 2;
     }
 
@@ -105,12 +194,12 @@ int runBaseline(QCoreApplication& application)
 
     const flexraw::core::measurement::StageTimer timer;
     const flexraw::core::develop::DevelopImageResult developed =
-        flexraw::core::develop::applyDevelop(sourceImage, makeRepresentativeParams());
+        flexraw::core::develop::applyDevelop(sourceImage, makeProfileParams(*profile));
     const std::uint64_t elapsedNanoseconds = timer.elapsedNanoseconds();
 
     flexraw::core::measurement::RenderMeasurementRecord record;
     record.runId = toUtf8(parser.value(runIdOption));
-    record.mode = "cpu-develop";
+    record.mode = "cpu-develop-" + toUtf8(profileId);
     record.target = toUtf8(parser.value(targetOption));
     record.sourceLabel = toUtf8(QFileInfo(inputPath).fileName());
     record.width = static_cast<std::uint32_t>(sourceImage.width());

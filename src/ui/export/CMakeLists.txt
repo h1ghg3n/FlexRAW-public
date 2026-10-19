@@ -5,7 +5,6 @@ add_library(flexraw_ui_export STATIC)
 target_sources(flexraw_ui_export PRIVATE
     export_dialog.cpp
     export_dialog.h
-    qt_export_client_adapter.cpp
     qt_export_client_adapter.h
 )
 
@@ -17,6 +16,7 @@ target_link_libraries(flexraw_ui_export PUBLIC
     flexraw_core_client
     flexraw_core_export
     flexraw_core_orchestration
+    flexraw_product_runtime
     flexraw_worker_client
     Qt6::Core
     Qt6::Gui

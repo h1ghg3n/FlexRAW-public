@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <QObject>
+#include <QSize>
 
 #include "preview_presentation_client.h"
 
@@ -73,10 +74,20 @@ private:
     // 출력: 다음 Preview presentation event sequence
     [[nodiscard]] core::client::PreviewPresentationEventSequence nextEventSequence() noexcept;
 
+    // 목적: Core owner의 별도 비교 lifecycle signal을 delivery adapter에 연결
+    // 입력: 없음
+    // 출력: 동일 Qt thread의 direct signal 연결
+    void connectComparisonSignals();
+
     // 목적: Editor owner의 viewport·selection·request state를 presentation snapshot에 동기화
     // 입력: 없음
     // 출력: photo·develop revision·preview sequence가 다른 frame을 제거한 최신 snapshot
     void synchronizeOwnerState();
+
+    // 목적: 현재 사진·viewport와 Core 비교 상태에 맞춰 비교 frame을 보존 또는 폐기
+    // 입력: targetSize: owner의 최신 render viewport
+    // 출력: 비교 snapshot과 frame validity 동기화
+    void synchronizeComparisonState(const QSize& targetSize);
 
     // 목적: owner state invalidation을 frame 없는 presentation event로 전달
     // 입력: 없음
@@ -92,6 +103,41 @@ private:
     // 입력: result: current request의 image, analysis와 identity
     // 출력: currentFrame이 갱신된 event 또는 projection warning
     void recordFrame(const core::orchestration::PreviewResult& result);
+
+    // 목적: 비교 활성화 또는 무효화를 독립 transition으로 발행
+    // 입력: 없음
+    // 출력: 비교 상태가 반영된 event
+    void recordComparisonStateChanged();
+
+    // 목적: accepted 비교 요청의 캡처 identity를 보관
+    // 입력: requestId: Core owner가 발급한 identity
+    // 출력: 비교 시작 event
+    void recordComparisonStarted(std::uint64_t requestId);
+
+    // 목적: 기본 Develop frame을 일반 Preview와 별도 snapshot에 투영
+    // 입력: result: owner가 검증한 비교 frame
+    // 출력: 비교 frame event 또는 projection warning
+    void recordComparisonFrame(const core::orchestration::PreviewResult& result);
+
+    // 목적: 비교 pipeline 경고를 일반 Preview 경고와 분리
+    // 입력: issue: accepted 비교 request context
+    // 출력: 비교 warning event
+    void recordComparisonWarning(const core::orchestration::PreviewIssue& issue);
+
+    // 목적: accepted 비교 정상 완료를 exact terminal로 투영
+    // 입력: requestId: 완료된 비교 request identity
+    // 출력: 비교 Completed terminal event
+    void recordComparisonCompleted(std::uint64_t requestId);
+
+    // 목적: 비교 실패를 일반 Preview frame에 영향 없이 투영
+    // 입력: issue: 비교 request와 typed error
+    // 출력: 비교 Failed terminal event
+    void recordComparisonFailed(const core::orchestration::PreviewIssue& issue);
+
+    // 목적: 비교 취소를 일반 Preview와 분리해 전달
+    // 입력: requestId: 취소된 비교 request identity
+    // 출력: 비교 Cancelled terminal event
+    void recordComparisonCancelled(std::uint64_t requestId);
 
     // 목적: owner의 비치명적 Preview issue를 client warning으로 투영
     // 입력: issue: optional accepted identity와 technical error
@@ -119,7 +165,8 @@ private:
     void publishEvent(bool requestStarted,
                       bool frameUpdated,
                       std::optional<core::client::PreviewWarning> warning,
-                      std::optional<core::client::PreviewTerminal> terminal);
+                      std::optional<core::client::PreviewTerminal> terminal,
+                      std::optional<core::client::PreviewComparisonTransition> comparison = std::nullopt);
 
     // 목적: 한 subscription에 immutable event를 Qt queued callback으로 등록
     // 입력: state: subscription lifetime, event: 전달할 Preview presentation event
@@ -135,6 +182,8 @@ private:
     core::orchestration::EditorOrchestrator* m_editorOrchestrator{nullptr};
     core::client::PreviewPresentationSnapshot m_snapshot;
     std::optional<ActiveRequestContext> m_activeRequest;
+    std::optional<ActiveRequestContext> m_activeComparison;
+    std::optional<QSize> m_comparisonViewport;
     std::vector<std::weak_ptr<SubscriptionState>> m_subscriptions;
     std::uint64_t m_nextEventSequence{1};
     bool m_shuttingDown{false};

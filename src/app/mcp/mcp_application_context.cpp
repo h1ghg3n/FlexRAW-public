@@ -8,8 +8,12 @@
 
 #include "catalog_orchestrator.h"
 #include "client_error_projection.h"
+#include "current_path_identity_service.h"
 #include "editor_orchestrator.h"
+#include "export_orchestrator.h"
+#include "export_pipeline.h"
 #include "preview_pipeline.h"
+#include "product_export_client_adapter.h"
 #include "product_runtime.h"
 
 namespace flexraw::app::mcp
@@ -48,7 +52,13 @@ public:
 // 입력: 없음
 // 출력: 아직 Catalog가 열리지 않은 application context
 McpApplicationContext::McpApplicationContext()
-    : m_productRuntime(std::make_unique<runtime::ProductRuntime>(std::make_unique<McpUnavailablePreviewPipeline>()))
+    : m_pathIdentityService(platform::createCurrentPathIdentityService()),
+      m_productRuntime(std::make_unique<runtime::ProductRuntime>(
+          std::make_unique<McpUnavailablePreviewPipeline>(),
+          std::make_unique<core::orchestration::ExportOrchestrator>(
+              std::make_unique<core::orchestration::FileExportPipeline>(*m_pathIdentityService)))),
+      m_exportClientAdapter(
+          std::make_unique<runtime::ProductExportClientAdapter>(m_productRuntime->exportOrchestrator()))
 {}
 
 // 목적: Catalog connection과 background resource를 MCP server보다 늦게 정리
@@ -129,6 +139,22 @@ core::client::ISourceResolutionClient& McpApplicationContext::sourceResolutionCl
 core::client::ISourceResolutionEventSource& McpApplicationContext::sourceResolutionEventSource() noexcept
 {
     return m_productRuntime->sourceResolutionEventSource();
+}
+
+// 목적: MCP Export command adapter가 사용할 frontend-neutral client 반환
+// 입력: 없음
+// 출력: context lifetime 동안 유효한 Local-only Export client 참조
+core::client::IExportClient& McpApplicationContext::exportClient() noexcept
+{
+    return *m_exportClientAdapter;
+}
+
+// 목적: MCP async delivery adapter가 구독할 frontend-neutral Export event source 반환
+// 입력: 없음
+// 출력: context lifetime 동안 유효한 ordered Export event source 참조
+core::client::IExportEventSource& McpApplicationContext::exportEventSource() noexcept
+{
+    return *m_exportClientAdapter;
 }
 
 }  // namespace flexraw::app::mcp

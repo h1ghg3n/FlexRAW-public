@@ -62,6 +62,38 @@ public:
     }
 };
 
+class ComparisonPreviewPipeline final : public core::orchestration::IPreviewPipeline
+{
+public:
+    // 목적: 기본 Develop Preview만 선택적으로 실패시키는 test pipeline 구성
+    // 입력: failBaseline: 기본 recipe 실패 여부를 공유하는 state
+    // 출력: 두 recipe를 색으로 구분하는 deterministic pipeline
+    explicit ComparisonPreviewPipeline(std::shared_ptr<std::atomic_bool> failBaseline)
+        : m_failBaseline(std::move(failBaseline))
+    {}
+
+    // 목적: Before와 After를 구별하고 실패 시 일반 Preview와 격리되는지 검사
+    // 입력: request: Develop recipe, tier/token: test execution context
+    // 출력: 기본 recipe는 red, 보정 recipe는 blue 또는 실패
+    [[nodiscard]] core::orchestration::PreviewPipelineResult render(const core::orchestration::PreviewRequest& request,
+                                                                    core::orchestration::PreviewTier,
+                                                                    const core::types::CancellationToken&) override
+    {
+        const bool baseline = request.params.exposureEv == 0.0F;
+        if (baseline && m_failBaseline->load())
+        {
+            return core::orchestration::PreviewPipelineResult::failure(
+                {core::types::ErrorCode::Unknown, QStringLiteral("Comparison test failure.")});
+        }
+        QImage image(2, 1, QImage::Format_RGBA8888);
+        image.fill(baseline ? Qt::red : Qt::blue);
+        return core::orchestration::PreviewPipelineResult::success({image, {}, {}, {}});
+    }
+
+private:
+    std::shared_ptr<std::atomic_bool> m_failBaseline;
+};
+
 struct ProgressiveCancellationProbe
 {
     QSemaphore standardStarted;
@@ -202,6 +234,106 @@ TEST(QtPreviewPresentationEventAdapterTest, DeliversInitialSnapshotAndValidatesV
     ASSERT_TRUE(waitForCondition([&events] { return events.size() >= 2; }));
     ASSERT_TRUE(events.back().snapshot.viewport.has_value());
     EXPECT_EQ(core::client::PreviewViewport({800, 600}), *events.back().snapshot.viewport);
+}
+
+TEST(QtPreviewPresentationEventAdapterTest, ComparisonEventsKeepCapturedIdentityAndDoNotReplaceAfter)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("comparison.jpg"));
+    ASSERT_TRUE(writeSourceFile(sourcePath));
+    auto failBaseline = std::make_shared<std::atomic_bool>(false);
+    core::orchestration::PreviewOrchestrator previewOrchestrator(
+        std::make_unique<ComparisonPreviewPipeline>(failBaseline));
+    core::orchestration::CatalogOrchestrator catalogOrchestrator;
+    ASSERT_TRUE(
+        catalogOrchestrator.openCatalog(QDir(directory.path()).filePath(QStringLiteral("catalog.flexraw-catalog")))
+            .hasValue());
+    core::orchestration::EditorOrchestrator editor(previewOrchestrator, catalogOrchestrator);
+    QtPreviewPresentationEventAdapter adapter(editor);
+    std::vector<core::client::PreviewPresentationEvent> events;
+    const auto subscription = adapter.subscribeToPreviewPresentation(
+        [&events](const core::client::PreviewPresentationEvent& event) { events.push_back(event); });
+    ASSERT_TRUE(subscription.hasValue());
+    const core::catalog::CatalogEntry entry{{sourcePath,
+                                             QStringLiteral("jpg"),
+                                             QStringLiteral("comparison.jpg"),
+                                             core::types::SupportedFileKind::RasterImage},
+                                            core::types::FileScanStatus::Ready};
+    ASSERT_TRUE(editor.activatePhoto(entry, QSize{640, 480}).hasValue());
+    core::client::EditorDevelopParams params = editor.editorSnapshot().params;
+    params.exposureEv = 1.0F;
+    ASSERT_TRUE(editor.updateDevelopParams({params}).hasValue());
+    ASSERT_TRUE(waitForCondition([&events] {
+        return !events.empty() && events.back().snapshot.currentFrame.has_value() &&
+               events.back().snapshot.currentFrame->frame.bytes()[0] == 255;
+    }));
+
+    const auto started = editor.setPreviewComparison({true});
+    ASSERT_TRUE(started.hasValue());
+    ASSERT_TRUE(started.value().activeRequestId.has_value());
+    const auto comparisonId = *started.value().activeRequestId;
+    ASSERT_TRUE(waitForCondition([&events, comparisonId] {
+        return std::any_of(events.cbegin(), events.cend(), [comparisonId](const auto& event) {
+            return event.comparison.has_value() && event.comparison->terminal.has_value() &&
+                   event.comparison->terminal->requestId == comparisonId;
+        });
+    }));
+    const auto comparisonFrame = std::find_if(events.cbegin(), events.cend(), [comparisonId](const auto& event) {
+        return event.comparison.has_value() && event.comparison->frameUpdated &&
+               event.snapshot.comparison.baselineFrame.has_value() &&
+               event.snapshot.comparison.baselineFrame->requestId == comparisonId;
+    });
+    ASSERT_NE(events.cend(), comparisonFrame);
+    EXPECT_EQ(255U, comparisonFrame->snapshot.currentFrame->frame.bytes()[0]);
+    EXPECT_EQ(0U, comparisonFrame->snapshot.comparison.baselineFrame->frame.bytes()[0]);
+    EXPECT_EQ(255U, comparisonFrame->snapshot.comparison.baselineFrame->frame.bytes()[2]);
+    EXPECT_NE(comparisonFrame->snapshot.currentFrame->requestId, comparisonId);
+    EXPECT_EQ(comparisonFrame->snapshot.comparison.baselineFrame->capturedDevelopRevision,
+              editor.editorSnapshot().developRevision);
+    const auto terminal = std::find_if(events.cbegin(), events.cend(), [comparisonId](const auto& event) {
+        return event.comparison.has_value() && event.comparison->terminal.has_value() &&
+               event.comparison->terminal->requestId == comparisonId;
+    });
+    EXPECT_EQ(core::client::PreviewTerminalState::Completed, terminal->comparison->terminal->state);
+    EXPECT_FALSE(terminal->snapshot.comparison.activeRequestId.has_value());
+    EXPECT_TRUE(terminal->snapshot.currentFrame.has_value());
+
+    params.exposureEv = 2.0F;
+    ASSERT_TRUE(editor.updateDevelopParams({params}).hasValue());
+    ASSERT_TRUE(waitForCondition([&events] {
+        return !events.empty() && events.back().snapshot.currentFrame.has_value() &&
+               events.back().snapshot.currentFrame->developRevision.value > 1;
+    }));
+    ASSERT_TRUE(events.back().snapshot.comparison.baselineFrame.has_value());
+    EXPECT_EQ(comparisonId, events.back().snapshot.comparison.baselineFrame->requestId);
+    ASSERT_TRUE(editor.setPreviewViewport({{800, 600}}).hasValue());
+    ASSERT_TRUE(waitForCondition([&events] {
+        return !events.empty() && !events.back().snapshot.comparison.enabled &&
+               !events.back().snapshot.comparison.baselineFrame.has_value();
+    }));
+    ASSERT_TRUE(
+        waitForCondition([&events] { return !events.empty() && events.back().snapshot.currentFrame.has_value(); }));
+    failBaseline->store(true);
+    const auto failing = editor.setPreviewComparison({true});
+    ASSERT_TRUE(failing.hasValue());
+    ASSERT_TRUE(failing.value().activeRequestId.has_value());
+    const auto failedId = *failing.value().activeRequestId;
+    ASSERT_TRUE(waitForCondition([&events, failedId] {
+        return std::any_of(events.cbegin(), events.cend(), [failedId](const auto& event) {
+            return event.comparison.has_value() && event.comparison->terminal.has_value() &&
+                   event.comparison->terminal->requestId == failedId;
+        });
+    }));
+    const auto failed = std::find_if(events.cbegin(), events.cend(), [failedId](const auto& event) {
+        return event.comparison.has_value() && event.comparison->terminal.has_value() &&
+               event.comparison->terminal->requestId == failedId;
+    });
+    EXPECT_EQ(core::client::PreviewTerminalState::Failed, failed->comparison->terminal->state);
+    EXPECT_TRUE(failed->comparison->terminal->error.has_value());
+    EXPECT_FALSE(failed->snapshot.comparison.enabled);
+    EXPECT_FALSE(failed->snapshot.comparison.baselineFrame.has_value());
+    EXPECT_TRUE(failed->snapshot.currentFrame.has_value());
 }
 
 TEST(QtPreviewPresentationEventAdapterTest, PublishesFrameAnalysisAndExactCompletedTerminal)

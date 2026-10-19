@@ -9,6 +9,8 @@
 namespace flexraw::core::orchestration
 {
 
+class ComputePermitPool;
+
 struct PreviewPipelineFrame
 {
     QImage image;
@@ -39,9 +41,9 @@ class FilePreviewPipeline final : public IPreviewPipeline
 {
 public:
     // 목적: file-backed preview cache를 사용하는 production pipeline 초기화
-    // 입력: cacheRoot: preview cache root directory
+    // 입력: cacheRoot: preview cache root directory, computePermitPool: Develop 계산 capacity authority
     // 출력: 초기화된 pipeline 객체
-    explicit FilePreviewPipeline(QString cacheRoot);
+    FilePreviewPipeline(QString cacheRoot, ComputePermitPool& computePermitPool);
 
     // 목적: pipeline implementation resource 정리
     // 입력: 없음

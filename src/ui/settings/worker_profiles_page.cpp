@@ -13,6 +13,7 @@
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+#include "settings_page_header.h"
 #include "worker_health_panel.h"
 
 namespace flexraw::ui::settings
@@ -44,12 +45,16 @@ WorkerProfilesPage::WorkerProfilesPage(core::client::IWorkerProfileClient& worke
     m_profileList->setObjectName(QStringLiteral("workerProfileList"));
     m_profileList->setMinimumWidth(150);
     m_displayNameEdit->setObjectName(QStringLiteral("workerProfileNameEdit"));
+    m_displayNameEdit->setPlaceholderText(tr("Worker name"));
     m_hostEdit->setObjectName(QStringLiteral("workerProfileHostEdit"));
+    m_hostEdit->setPlaceholderText(tr("Host name or IP address"));
     m_portSpinBox->setObjectName(QStringLiteral("workerProfilePortSpinBox"));
     m_portSpinBox->setRange(1, 65535);
     m_enabledCheckBox->setObjectName(QStringLiteral("workerProfileEnabledCheckBox"));
     m_sourceStorageIdEdit->setObjectName(QStringLiteral("workerProfileSourceStorageIdEdit"));
+    m_sourceStorageIdEdit->setPlaceholderText(tr("Optional UUID"));
     m_outputStorageIdEdit->setObjectName(QStringLiteral("workerProfileOutputStorageIdEdit"));
+    m_outputStorageIdEdit->setPlaceholderText(tr("Optional UUID"));
     m_newButton->setObjectName(QStringLiteral("workerProfileNewButton"));
     m_saveButton->setObjectName(QStringLiteral("workerProfileSaveButton"));
     m_deleteButton->setObjectName(QStringLiteral("workerProfileDeleteButton"));
@@ -76,9 +81,18 @@ WorkerProfilesPage::WorkerProfilesPage(core::client::IWorkerProfileClient& worke
     rightLayout->addWidget(m_healthPanel);
     rightLayout->addStretch(1);
     rightLayout->addLayout(buttonLayout);
-    auto* layout = new QHBoxLayout(this);
-    layout->addWidget(m_profileList);
-    layout->addLayout(rightLayout, 1);
+    auto* saveNotice = new QLabel(
+        tr("New, Save, and Delete update Worker profiles immediately and are not rolled back by Cancel."), this);
+    saveNotice->setObjectName(QStringLiteral("workerProfileSaveBehaviorLabel"));
+    saveNotice->setWordWrap(true);
+    auto* contentLayout = new QHBoxLayout();
+    contentLayout->addWidget(m_profileList);
+    contentLayout->addLayout(rightLayout, 1);
+    auto* layout = new QVBoxLayout(this);
+    layout->addWidget(new SettingsPageHeader(
+        tr("Workers"), tr("Manage remote render endpoints and inspect their latest health snapshot."), this));
+    layout->addWidget(saveNotice);
+    layout->addLayout(contentLayout, 1);
 
     connect(m_profileList, &QListWidget::currentRowChanged, this, &WorkerProfilesPage::selectProfile);
     connect(m_newButton, &QPushButton::clicked, this, &WorkerProfilesPage::beginNewProfile);

@@ -81,6 +81,25 @@ TEST(CatalogListWidgetTest, SupportsRangeAndToggleSelection)
     EXPECT_EQ(17, selectedPhotos.at(1).id.value);
 }
 
+TEST(CatalogListWidgetTest, DisplaysPersistedCullingStateAsRowBadge)
+{
+    CatalogListWidget widget;
+    core::catalog::CatalogPhotoRecord neutral = makePhoto(21, QStringLiteral("neutral.jpg"));
+    core::catalog::CatalogPhotoRecord picked = makePhoto(23, QStringLiteral("picked.jpg"));
+    picked.cullingState = core::catalog::CatalogCullingState::Pick;
+    core::catalog::CatalogPhotoRecord rejected = makePhoto(25, QStringLiteral("rejected.jpg"));
+    rejected.cullingState = core::catalog::CatalogCullingState::Reject;
+
+    widget.setPhotos({neutral, picked, rejected});
+
+    ASSERT_EQ(3, widget.count());
+    EXPECT_EQ(QStringLiteral("neutral.jpg"), widget.item(0)->text());
+    EXPECT_EQ(QStringLiteral("✓ picked.jpg"), widget.item(1)->text());
+    EXPECT_EQ(widget.tr("Picked"), widget.item(1)->toolTip());
+    EXPECT_EQ(QStringLiteral("✕ rejected.jpg"), widget.item(2)->text());
+    EXPECT_EQ(widget.tr("Rejected"), widget.item(2)->toolTip());
+}
+
 TEST(CatalogListWidgetTest, ReplacesTransientEntriesWhenCatalogPhotosAreLoaded)
 {
     CatalogListWidget widget;

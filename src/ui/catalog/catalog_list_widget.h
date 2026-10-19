@@ -32,10 +32,11 @@ public:
     // 출력: 없음
     void setEntries(const QVector<core::catalog::CatalogEntry>& entries);
 
-    // 목적: stable PhotoId를 포함한 catalog photo record를 목록에 표시하고 첫 항목 선택
-    // 입력: photos: 열린 SQLite catalog에서 조회한 photo record 목록
-    // 출력: 없음
-    void setPhotos(const QVector<core::catalog::CatalogPhotoRecord>& photos);
+    // 목적: stable PhotoId를 포함한 catalog photo record를 목록에 표시하고 preferred 또는 첫 항목 선택
+    // 입력: photos: 조회한 photo record, preferredPhotoId: signal 없이 유지할 optional Editor identity
+    // 출력: preferred identity가 없으면 첫 항목을 새 Editor 선택으로 publish
+    void setPhotos(const QVector<core::catalog::CatalogPhotoRecord>& photos,
+                   std::optional<core::types::PhotoId> preferredPhotoId = std::nullopt);
 
     // 목적: 현재 multi-selection에 포함된 transient Folder 항목을 화면 row 순서로 반환
     // 입력: 없음

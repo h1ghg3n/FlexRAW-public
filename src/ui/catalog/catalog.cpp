@@ -5,6 +5,7 @@
 #include <utility>
 
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QItemSelectionModel>
@@ -79,6 +80,28 @@ constexpr int CatalogThumbnailRowHeight = 80;
                              static_cast<qsizetype>(identity.transientSourceLocator.size()));
 }
 
+// 목적: persisted Catalog 선별 상태를 file 이름과 분리된 compact row badge로 표시
+// 입력: item: 갱신할 list item, photo: 표시 이름과 선별 상태를 가진 record
+// 출력: Neutral은 원래 이름, Pick·Reject는 symbol prefix와 translated tooltip 적용
+void applyCullingPresentation(QListWidgetItem& item, const core::catalog::CatalogPhotoRecord& photo)
+{
+    switch (photo.cullingState)
+    {
+    case core::catalog::CatalogCullingState::Neutral:
+        item.setText(photo.displayName);
+        item.setToolTip({});
+        return;
+    case core::catalog::CatalogCullingState::Pick:
+        item.setText(QStringLiteral("✓ ") + photo.displayName);
+        item.setToolTip(QCoreApplication::translate("CatalogListWidget", "Picked"));
+        return;
+    case core::catalog::CatalogCullingState::Reject:
+        item.setText(QStringLiteral("✕ ") + photo.displayName);
+        item.setToolTip(QCoreApplication::translate("CatalogListWidget", "Rejected"));
+        return;
+    }
+}
+
 }  // namespace
 
 // 목적: catalog 목록 표시를 위한 widget 초기화
@@ -115,10 +138,11 @@ void CatalogListWidget::setEntries(const QVector<core::catalog::CatalogEntry>& e
     scheduleThumbnailWindowRefresh();
 }
 
-// 목적: stable PhotoId를 포함한 catalog photo record를 목록에 표시하고 첫 항목 선택
-// 입력: photos: 열린 SQLite catalog에서 조회한 photo record 목록
-// 출력: 없음
-void CatalogListWidget::setPhotos(const QVector<core::catalog::CatalogPhotoRecord>& photos)
+// 목적: stable PhotoId를 포함한 catalog photo record를 목록에 표시하고 preferred 또는 첫 항목 선택
+// 입력: photos: 조회한 photo record, preferredPhotoId: signal 없이 유지할 optional Editor identity
+// 출력: preferred identity가 없으면 첫 항목을 새 Editor 선택으로 publish
+void CatalogListWidget::setPhotos(const QVector<core::catalog::CatalogPhotoRecord>& photos,
+                                  std::optional<core::types::PhotoId> preferredPhotoId)
 {
     clearEntries();
     m_photos = photos;
@@ -126,11 +150,16 @@ void CatalogListWidget::setPhotos(const QVector<core::catalog::CatalogPhotoRecor
 
     for (const core::catalog::CatalogPhotoRecord& photo : m_photos)
     {
-        auto* item = new QListWidgetItem(photo.displayName, this);
+        auto* item = new QListWidgetItem(this);
+        applyCullingPresentation(*item, photo);
         item->setSizeHint(QSize{0, CatalogThumbnailRowHeight});
     }
 
-    if (!m_photos.isEmpty())
+    if (preferredPhotoId.has_value())
+    {
+        restorePhotoSelection(*preferredPhotoId);
+    }
+    else if (!m_photos.isEmpty())
     {
         setCurrentRow(0);
     }
@@ -243,7 +272,7 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
         if (m_photos.at(row).id.value == photo.id.value)
         {
             m_photos[row] = photo;
-            item(row)->setText(photo.displayName);
+            applyCullingPresentation(*item(row), photo);
             item(row)->setIcon({});
             m_thumbnailTerminalKeys.remove(
                 thumbnailIdentityKey({core::client::CatalogThumbnailIdentityKind::CatalogPhoto, {photo.id.value}, {}}));
@@ -259,7 +288,7 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
             if (m_photos.at(row).id.value == createdPhoto->id.value)
             {
                 m_photos[row] = *createdPhoto;
-                item(row)->setText(createdPhoto->displayName);
+                applyCullingPresentation(*item(row), *createdPhoto);
                 item(row)->setIcon({});
                 m_thumbnailTerminalKeys.remove(thumbnailIdentityKey(
                     {core::client::CatalogThumbnailIdentityKind::CatalogPhoto, {createdPhoto->id.value}, {}}));
@@ -270,7 +299,8 @@ void CatalogListWidget::applyPhotoUpdate(const core::catalog::CatalogPhotoRecord
         if (!alreadyListed)
         {
             m_photos.push_back(*createdPhoto);
-            auto* createdItem = new QListWidgetItem(createdPhoto->displayName, this);
+            auto* createdItem = new QListWidgetItem(this);
+            applyCullingPresentation(*createdItem, *createdPhoto);
             createdItem->setSizeHint(QSize{0, CatalogThumbnailRowHeight});
         }
     }

@@ -1,13 +1,19 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include <QColor>
 #include <QImage>
+#include <QSize>
 
 #include <gtest/gtest.h>
 
 #include "develop.h"
+#include "develop_processing.h"
 
 namespace flexraw::core::develop
 {
@@ -37,14 +43,506 @@ namespace
     return std::pow((encodedValue + 0.055F) / 1.055F, 2.4F);
 }
 
+// 목적: test reference에서 linear-light 값을 normalized sRGB로 변환
+// 입력: linearValue — 변환할 linear-light 값
+// 출력: IEC 61966-2-1 transfer function을 적용한 normalized 값
+[[nodiscard]] float referenceLinearToSrgb(float linearValue)
+{
+    return linearValue <= 0.0031308F ? linearValue * 12.92F : 1.055F * std::pow(linearValue, 1.0F / 2.4F) - 0.055F;
+}
+
 // 목적: test reference에서 linear-light 값을 8-bit sRGB channel로 변환
-// 입력: linearValue: exposure가 적용된 linear-light 값
+// 입력: linearValue — exposure가 적용된 linear-light 값
 // 출력: IEC 61966-2-1 transfer function과 clamp/round를 적용한 channel 값
 [[nodiscard]] int referenceLinearToSrgbChannel(float linearValue)
 {
-    const float encodedValue =
-        linearValue <= 0.0031308F ? linearValue * 12.92F : 1.055F * std::pow(linearValue, 1.0F / 2.4F) - 0.055F;
-    return static_cast<int>(std::lround(std::clamp(encodedValue, 0.0F, 1.0F) * 255.0F));
+    return static_cast<int>(std::lround(std::clamp(referenceLinearToSrgb(linearValue), 0.0F, 1.0F) * 255.0F));
+}
+
+// 목적: 기존 Clarity 경로와 동일한 linear-light 휘도 계산
+// 입력: pixel: RGBA8888 source pixel
+// 출력: 0~1 범위의 linear-light 휘도
+[[nodiscard]] float referenceClarityLuminance(const uchar* pixel)
+{
+    return referenceSrgbChannelToLinear(pixel[0]) * 0.2126F + referenceSrgbChannelToLinear(pixel[1]) * 0.7152F +
+           referenceSrgbChannelToLinear(pixel[2]) * 0.0722F;
+}
+
+// 목적: cache 이전의 3x3 Clarity 계산을 독립적인 pixel reference로 재현
+// 입력: source: RGBA8888 image, clarity: 적용할 보정량
+// 출력: 원본 alpha를 보존한 기준 image
+[[nodiscard]] QImage referenceClarityImage(const QImage& source, float clarity)
+{
+    QImage result = source.copy();
+    for (int row = 0; row < source.height(); ++row)
+    {
+        uchar* destinationPixels = result.scanLine(row);
+        for (int column = 0; column < source.width(); ++column)
+        {
+            const uchar* sourcePixel = source.constScanLine(row) + column * 4;
+            const float luminance = referenceClarityLuminance(sourcePixel);
+            float localLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, source.height() - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, source.width() - 1);
+                    localLuminance += referenceClarityLuminance(source.constScanLine(sampleRow) + sampleColumn * 4);
+                }
+            }
+
+            localLuminance /= 9.0F;
+            const float midtoneWeight = 1.0F - std::abs(luminance * 2.0F - 1.0F);
+            const float adjustedLuminance =
+                std::clamp(luminance + (luminance - localLuminance) * clarity * midtoneWeight, 0.0F, 1.0F);
+            const float luminanceScale = luminance > 0.00001F ? adjustedLuminance / luminance : 1.0F;
+            uchar* destinationPixel = destinationPixels + column * 4;
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                destinationPixel[channel] = static_cast<uchar>(
+                    referenceLinearToSrgbChannel(referenceSrgbChannelToLinear(sourcePixel[channel]) * luminanceScale));
+            }
+        }
+    }
+    return result;
+}
+
+// 목적: cache 이전 Noise Reduction의 3x3 RGB·휘도 누산을 독립적으로 재현
+// 입력: source: RGBA8888 image, luminanceStrength/colorStrength: 적용할 감쇄 강도
+// 출력: 원본 alpha와 경계 clamp를 유지한 기준 image
+[[nodiscard]] QImage referenceNoiseReductionImage(const QImage& source, float luminanceStrength, float colorStrength)
+{
+    QImage result = source.copy();
+    for (int row = 0; row < source.height(); ++row)
+    {
+        uchar* destinationPixels = result.scanLine(row);
+        for (int column = 0; column < source.width(); ++column)
+        {
+            const uchar* sourcePixel = source.constScanLine(row) + column * 4;
+            const float sourceRed = referenceSrgbChannelToLinear(sourcePixel[0]);
+            const float sourceGreen = referenceSrgbChannelToLinear(sourcePixel[1]);
+            const float sourceBlue = referenceSrgbChannelToLinear(sourcePixel[2]);
+            const float sourceLuminance = sourceRed * 0.2126F + sourceGreen * 0.7152F + sourceBlue * 0.0722F;
+            float averageRed = 0.0F;
+            float averageGreen = 0.0F;
+            float averageBlue = 0.0F;
+            float localLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, source.height() - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, source.width() - 1);
+                    const uchar* samplePixel = source.constScanLine(sampleRow) + sampleColumn * 4;
+                    const float red = referenceSrgbChannelToLinear(samplePixel[0]);
+                    const float green = referenceSrgbChannelToLinear(samplePixel[1]);
+                    const float blue = referenceSrgbChannelToLinear(samplePixel[2]);
+                    averageRed += red;
+                    averageGreen += green;
+                    averageBlue += blue;
+                    localLuminance += red * 0.2126F + green * 0.7152F + blue * 0.0722F;
+                }
+            }
+
+            averageRed /= 9.0F;
+            averageGreen /= 9.0F;
+            averageBlue /= 9.0F;
+            localLuminance /= 9.0F;
+            const float targetLuminance = sourceLuminance + (localLuminance - sourceLuminance) * luminanceStrength;
+            const float luminanceScale = sourceLuminance > 0.00001F ? targetLuminance / sourceLuminance : 1.0F;
+            float destinationRed = sourceRed * luminanceScale;
+            float destinationGreen = sourceGreen * luminanceScale;
+            float destinationBlue = sourceBlue * luminanceScale;
+            if (colorStrength != 0.0F)
+            {
+                destinationRed += (averageRed - localLuminance - (sourceRed - sourceLuminance)) * colorStrength;
+                destinationGreen += (averageGreen - localLuminance - (sourceGreen - sourceLuminance)) * colorStrength;
+                destinationBlue += (averageBlue - localLuminance - (sourceBlue - sourceLuminance)) * colorStrength;
+            }
+
+            uchar* destinationPixel = destinationPixels + column * 4;
+            destinationPixel[0] = static_cast<uchar>(referenceLinearToSrgbChannel(destinationRed));
+            destinationPixel[1] = static_cast<uchar>(referenceLinearToSrgbChannel(destinationGreen));
+            destinationPixel[2] = static_cast<uchar>(referenceLinearToSrgbChannel(destinationBlue));
+        }
+    }
+    return result;
+}
+
+struct ReferenceLinearPixel
+{
+    float red{0.0F};
+    float green{0.0F};
+    float blue{0.0F};
+};
+
+// 목적: Float32 reference pixel의 Rec.709 luminance 계산
+// 입력: pixel — linear RGB 값
+// 출력: linear-light luminance
+[[nodiscard]] float referenceLinearLuminance(const ReferenceLinearPixel& pixel)
+{
+    return pixel.red * 0.2126F + pixel.green * 0.7152F + pixel.blue * 0.0722F;
+}
+
+// 목적: NR 뒤 중간 양자화 없이 Clarity까지 유지하는 full-frame Float32 reference 계산
+// 입력: source와 NR/Clarity 보정 강도
+// 출력: 최종 RGBA8 projection과 원본 alpha를 가진 기준 image
+[[nodiscard]] QImage referenceFloat32NoiseReductionThenClarityImage(const QImage& source,
+                                                                    float luminanceStrength,
+                                                                    float colorStrength,
+                                                                    float clarity)
+{
+    const int width = source.width();
+    const int height = source.height();
+    const auto offset = [width](int row, int column) {
+        return static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(column);
+    };
+    std::vector<ReferenceLinearPixel> linear(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    std::vector<ReferenceLinearPixel> noise(linear.size());
+
+    for (int row = 0; row < height; ++row)
+    {
+        const uchar* sourcePixels = source.constScanLine(row);
+        for (int column = 0; column < width; ++column)
+        {
+            const uchar* pixel = sourcePixels + column * 4;
+            linear[offset(row, column)] = {
+                referenceSrgbChannelToLinear(pixel[0]),
+                referenceSrgbChannelToLinear(pixel[1]),
+                referenceSrgbChannelToLinear(pixel[2]),
+            };
+        }
+    }
+
+    for (int row = 0; row < height; ++row)
+    {
+        for (int column = 0; column < width; ++column)
+        {
+            const ReferenceLinearPixel& sourcePixel = linear[offset(row, column)];
+            const float sourceLuminance = referenceLinearLuminance(sourcePixel);
+            ReferenceLinearPixel average{};
+            float averageLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, height - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, width - 1);
+                    const ReferenceLinearPixel& sample = linear[offset(sampleRow, sampleColumn)];
+                    average.red += sample.red;
+                    average.green += sample.green;
+                    average.blue += sample.blue;
+                    averageLuminance += referenceLinearLuminance(sample);
+                }
+            }
+
+            average.red /= 9.0F;
+            average.green /= 9.0F;
+            average.blue /= 9.0F;
+            averageLuminance /= 9.0F;
+            const float targetLuminance = sourceLuminance + (averageLuminance - sourceLuminance) * luminanceStrength;
+            const float scale = sourceLuminance > 0.00001F ? targetLuminance / sourceLuminance : 1.0F;
+            ReferenceLinearPixel destination{
+                sourcePixel.red * scale,
+                sourcePixel.green * scale,
+                sourcePixel.blue * scale,
+            };
+            destination.red += (average.red - averageLuminance - (sourcePixel.red - sourceLuminance)) * colorStrength;
+            destination.green +=
+                (average.green - averageLuminance - (sourcePixel.green - sourceLuminance)) * colorStrength;
+            destination.blue +=
+                (average.blue - averageLuminance - (sourcePixel.blue - sourceLuminance)) * colorStrength;
+            noise[offset(row, column)] = {
+                std::clamp(destination.red, 0.0F, 1.0F),
+                std::clamp(destination.green, 0.0F, 1.0F),
+                std::clamp(destination.blue, 0.0F, 1.0F),
+            };
+        }
+    }
+
+    QImage result = source.copy();
+    for (int row = 0; row < height; ++row)
+    {
+        uchar* destinationPixels = result.scanLine(row);
+        for (int column = 0; column < width; ++column)
+        {
+            const ReferenceLinearPixel& sourcePixel = noise[offset(row, column)];
+            const float sourceLuminance = referenceLinearLuminance(sourcePixel);
+            float localLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, height - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, width - 1);
+                    localLuminance += referenceLinearLuminance(noise[offset(sampleRow, sampleColumn)]);
+                }
+            }
+
+            localLuminance /= 9.0F;
+            const float midtoneWeight = 1.0F - std::abs(sourceLuminance * 2.0F - 1.0F);
+            const float adjustedLuminance =
+                std::clamp(sourceLuminance + (sourceLuminance - localLuminance) * clarity * midtoneWeight, 0.0F, 1.0F);
+            const float scale = sourceLuminance > 0.00001F ? adjustedLuminance / sourceLuminance : 1.0F;
+            uchar* destinationPixel = destinationPixels + column * 4;
+            destinationPixel[0] = static_cast<uchar>(referenceLinearToSrgbChannel(sourcePixel.red * scale));
+            destinationPixel[1] = static_cast<uchar>(referenceLinearToSrgbChannel(sourcePixel.green * scale));
+            destinationPixel[2] = static_cast<uchar>(referenceLinearToSrgbChannel(sourcePixel.blue * scale));
+        }
+    }
+    return result;
+}
+
+// 목적: full-frame reference로 Float32 NR→Clarity→Sharpening chain 독립 계산
+// 입력: source — RGBA8888 stage 입력, params — spatial Develop parameter
+// 출력: 중간 byte 양자화 없이 계산한 최종 RGBA8 image
+[[nodiscard]] QImage referenceFloat32SpatialChainImage(const QImage& source, const types::DevelopParams& params)
+{
+    const int width = source.width();
+    const int height = source.height();
+    const auto offset = [width](int row, int column) {
+        return static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(column);
+    };
+    std::vector<ReferenceLinearPixel> linear(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    std::vector<ReferenceLinearPixel> noise(linear.size());
+    std::vector<ReferenceLinearPixel> encoded(linear.size());
+
+    for (int row = 0; row < height; ++row)
+    {
+        const uchar* sourcePixels = source.constScanLine(row);
+        for (int column = 0; column < width; ++column)
+        {
+            const uchar* pixel = sourcePixels + column * 4;
+            linear[offset(row, column)] = {
+                referenceSrgbChannelToLinear(pixel[0]),
+                referenceSrgbChannelToLinear(pixel[1]),
+                referenceSrgbChannelToLinear(pixel[2]),
+            };
+        }
+    }
+
+    for (int row = 0; row < height; ++row)
+    {
+        for (int column = 0; column < width; ++column)
+        {
+            const ReferenceLinearPixel& sourcePixel = linear[offset(row, column)];
+            const float sourceLuminance = referenceLinearLuminance(sourcePixel);
+            ReferenceLinearPixel average{};
+            float averageLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, height - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, width - 1);
+                    const ReferenceLinearPixel& sample = linear[offset(sampleRow, sampleColumn)];
+                    average.red += sample.red;
+                    average.green += sample.green;
+                    average.blue += sample.blue;
+                    averageLuminance += referenceLinearLuminance(sample);
+                }
+            }
+
+            average.red /= 9.0F;
+            average.green /= 9.0F;
+            average.blue /= 9.0F;
+            averageLuminance /= 9.0F;
+            const float targetLuminance =
+                sourceLuminance + (averageLuminance - sourceLuminance) * params.luminanceNoiseReduction;
+            const float scale = sourceLuminance > 0.00001F ? targetLuminance / sourceLuminance : 1.0F;
+            ReferenceLinearPixel destination{
+                sourcePixel.red * scale,
+                sourcePixel.green * scale,
+                sourcePixel.blue * scale,
+            };
+            destination.red +=
+                (average.red - averageLuminance - (sourcePixel.red - sourceLuminance)) * params.colorNoiseReduction;
+            destination.green +=
+                (average.green - averageLuminance - (sourcePixel.green - sourceLuminance)) * params.colorNoiseReduction;
+            destination.blue +=
+                (average.blue - averageLuminance - (sourcePixel.blue - sourceLuminance)) * params.colorNoiseReduction;
+            noise[offset(row, column)] = {
+                std::clamp(destination.red, 0.0F, 1.0F),
+                std::clamp(destination.green, 0.0F, 1.0F),
+                std::clamp(destination.blue, 0.0F, 1.0F),
+            };
+        }
+    }
+
+    for (int row = 0; row < height; ++row)
+    {
+        for (int column = 0; column < width; ++column)
+        {
+            const ReferenceLinearPixel& sourcePixel = noise[offset(row, column)];
+            const float sourceLuminance = referenceLinearLuminance(sourcePixel);
+            float localLuminance = 0.0F;
+            for (int rowOffset = -1; rowOffset <= 1; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, height - 1);
+                for (int columnOffset = -1; columnOffset <= 1; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, width - 1);
+                    localLuminance += referenceLinearLuminance(noise[offset(sampleRow, sampleColumn)]);
+                }
+            }
+
+            localLuminance /= 9.0F;
+            const float midtoneWeight = 1.0F - std::abs(sourceLuminance * 2.0F - 1.0F);
+            const float adjustedLuminance = std::clamp(
+                sourceLuminance + (sourceLuminance - localLuminance) * params.clarity * midtoneWeight, 0.0F, 1.0F);
+            const float scale = sourceLuminance > 0.00001F ? adjustedLuminance / sourceLuminance : 1.0F;
+            const ReferenceLinearPixel adjusted{
+                sourcePixel.red * scale,
+                sourcePixel.green * scale,
+                sourcePixel.blue * scale,
+            };
+            encoded[offset(row, column)] = {
+                std::clamp(referenceLinearToSrgb(adjusted.red), 0.0F, 1.0F),
+                std::clamp(referenceLinearToSrgb(adjusted.green), 0.0F, 1.0F),
+                std::clamp(referenceLinearToSrgb(adjusted.blue), 0.0F, 1.0F),
+            };
+        }
+    }
+
+    QImage result = source.copy();
+    const int radius = static_cast<int>(std::lround(params.sharpeningRadius));
+    const int broadSampleCount = (radius * 2 + 1) * (radius * 2 + 1);
+    const float detailWeight = (params.sharpeningDetail + 1.0F) * 0.5F;
+    for (int row = 0; row < height; ++row)
+    {
+        uchar* destinationPixels = result.scanLine(row);
+        for (int column = 0; column < width; ++column)
+        {
+            const ReferenceLinearPixel& center = encoded[offset(row, column)];
+            float maximumDifference = 0.0F;
+            for (const auto [sampleRow, sampleColumn] : {std::pair{row, std::max(column - 1, 0)},
+                                                         std::pair{row, std::min(column + 1, width - 1)},
+                                                         std::pair{std::max(row - 1, 0), column},
+                                                         std::pair{std::min(row + 1, height - 1), column}})
+            {
+                const ReferenceLinearPixel& sample = encoded[offset(sampleRow, sampleColumn)];
+                maximumDifference = std::max(maximumDifference, std::abs(center.red - sample.red));
+                maximumDifference = std::max(maximumDifference, std::abs(center.green - sample.green));
+                maximumDifference = std::max(maximumDifference, std::abs(center.blue - sample.blue));
+            }
+            const float edgeWeight = 1.0F - params.sharpeningMasking * (1.0F - maximumDifference);
+
+            const std::array<float, 3> centerChannels{center.red, center.green, center.blue};
+            std::array<float, 3> broadSum{};
+            std::array<float, 3> fineSum{};
+            for (int rowOffset = -radius; rowOffset <= radius; ++rowOffset)
+            {
+                const int sampleRow = std::clamp(row + rowOffset, 0, height - 1);
+                for (int columnOffset = -radius; columnOffset <= radius; ++columnOffset)
+                {
+                    const int sampleColumn = std::clamp(column + columnOffset, 0, width - 1);
+                    const ReferenceLinearPixel& sample = encoded[offset(sampleRow, sampleColumn)];
+                    const std::array<float, 3> sampleChannels{sample.red, sample.green, sample.blue};
+                    for (std::size_t channel = 0; channel < sampleChannels.size(); ++channel)
+                    {
+                        broadSum[channel] += sampleChannels[channel];
+                        if (radius > 1 && std::abs(rowOffset) <= 1 && std::abs(columnOffset) <= 1)
+                        {
+                            fineSum[channel] += sampleChannels[channel];
+                        }
+                    }
+                }
+            }
+
+            uchar* destinationPixel = destinationPixels + column * 4;
+            for (std::size_t channel = 0; channel < centerChannels.size(); ++channel)
+            {
+                const float broadSignal =
+                    centerChannels[channel] - broadSum[channel] / static_cast<float>(broadSampleCount);
+                const float fineSignal = centerChannels[channel] - fineSum[channel] / 9.0F;
+                const float signal =
+                    radius == 1 ? broadSignal : broadSignal + (fineSignal - broadSignal) * detailWeight;
+                const float value =
+                    std::clamp(centerChannels[channel] + signal * params.sharpeningAmount * edgeWeight, 0.0F, 1.0F);
+                destinationPixel[channel] = static_cast<uchar>(value * 255.0F + 0.5F);
+            }
+        }
+    }
+    return result;
+}
+
+// 목적: test reference에서 QColor의 RGB channel을 위치별로 읽기
+// 입력: pixel: 원본 색상, channel: RGB channel index
+// 출력: 지정 channel의 8-bit 값
+[[nodiscard]] int referenceRgbChannel(const QColor& pixel, int channel)
+{
+    return channel == 0 ? pixel.red() : channel == 1 ? pixel.green() : pixel.blue();
+}
+
+// 목적: source 좌표 접근만 사용해 controlled Sharpening의 경계·masking 결과를 독립 계산
+// 입력: source: RGBA8888 입력, params: Sharpening 제어값
+// 출력: 원본 alpha와 stage별 8-bit rounding을 보존한 기준 image
+[[nodiscard]] QImage referenceControlledSharpeningImage(const QImage& source, const types::DevelopParams& params)
+{
+    QImage result = source.copy();
+    const int radius = static_cast<int>(std::lround(params.sharpeningRadius));
+    const float detailWeight = (params.sharpeningDetail + 1.0F) * 0.5F;
+    const int broadSampleCount = (radius * 2 + 1) * (radius * 2 + 1);
+    for (int row = 0; row < source.height(); ++row)
+    {
+        for (int column = 0; column < source.width(); ++column)
+        {
+            const QColor center = source.pixelColor(column, row);
+            float edgeWeight = 1.0F;
+            if (params.sharpeningMasking != 0.0F)
+            {
+                const std::array<QColor, 4> neighbors{
+                    source.pixelColor(std::max(column - 1, 0), row),
+                    source.pixelColor(std::min(column + 1, source.width() - 1), row),
+                    source.pixelColor(column, std::max(row - 1, 0)),
+                    source.pixelColor(column, std::min(row + 1, source.height() - 1))};
+                float maximumDifference = 0.0F;
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    for (const QColor& neighbor : neighbors)
+                    {
+                        maximumDifference =
+                            std::max(maximumDifference,
+                                     std::abs(static_cast<float>(referenceRgbChannel(center, channel) -
+                                                                 referenceRgbChannel(neighbor, channel))));
+                    }
+                }
+                edgeWeight = 1.0F - params.sharpeningMasking * (1.0F - maximumDifference / 255.0F);
+            }
+
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                int broadSum = 0;
+                int fineSum = 0;
+                for (int rowOffset = -radius; rowOffset <= radius; ++rowOffset)
+                {
+                    for (int columnOffset = -radius; columnOffset <= radius; ++columnOffset)
+                    {
+                        const QColor sample =
+                            source.pixelColor(std::clamp(column + columnOffset, 0, source.width() - 1),
+                                              std::clamp(row + rowOffset, 0, source.height() - 1));
+                        const int value = referenceRgbChannel(sample, channel);
+                        broadSum += value;
+                        if (radius > 1 && std::abs(rowOffset) <= 1 && std::abs(columnOffset) <= 1)
+                        {
+                            fineSum += value;
+                        }
+                    }
+                }
+
+                const float sourceValue = static_cast<float>(referenceRgbChannel(center, channel));
+                const float broadSignal =
+                    sourceValue - static_cast<float>(broadSum) / static_cast<float>(broadSampleCount);
+                const float fineSignal = sourceValue - static_cast<float>(fineSum) / 9.0F;
+                const float signal =
+                    radius == 1 ? broadSignal : broadSignal + (fineSignal - broadSignal) * detailWeight;
+                result.scanLine(row)[column * 4 + channel] = static_cast<uchar>(
+                    std::clamp(sourceValue + signal * params.sharpeningAmount * edgeWeight, 0.0F, 255.0F) + 0.5F);
+            }
+        }
+    }
+    return result;
 }
 
 TEST(Develop, PreservesImageForZeroExposure)
@@ -315,6 +813,48 @@ TEST(Develop, AdjustsMidtoneLocalContrastForClarity)
     EXPECT_EQ(90, positiveResult.value().pixelColor(1, 1).alpha());
 }
 
+TEST(Develop, PreservesClarityBytesForClampedBordersAndAlpha)
+{
+    for (const QSize& size : {QSize(1, 1), QSize(1, 9), QSize(9, 1), QSize(2, 2), QSize(9, 7), QSize(256, 3)})
+    {
+        QImage source(size, QImage::Format_RGBA8888);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            for (int column = 0; column < size.width(); ++column)
+            {
+                source.setPixelColor(column,
+                                     row,
+                                     QColor((row * 37 + column * 53 + 7) % 256,
+                                            (row * 97 + column * 11 + 109) % 256,
+                                            (row * 13 + column * 83 + 211) % 256,
+                                            (row * 23 + column * 19 + 41) % 256));
+            }
+        }
+
+        types::DevelopParams params;
+        params.exposureEv = 0.35F;
+        const DevelopImageResult base = applyDevelop(source, params);
+        ASSERT_TRUE(base.hasValue());
+        for (const float clarity : {-0.7F, 0.6F})
+        {
+            params.clarity = clarity;
+            const DevelopImageResult actual = applyDevelop(source, params);
+            ASSERT_TRUE(actual.hasValue());
+            const QImage expected = referenceClarityImage(base.value(), clarity);
+            for (int row = 0; row < size.height(); ++row)
+            {
+                const uchar* expectedPixels = expected.constScanLine(row);
+                const uchar* actualPixels = actual.value().constScanLine(row);
+                for (int byte = 0; byte < size.width() * 4; ++byte)
+                {
+                    EXPECT_EQ(expectedPixels[byte], actualPixels[byte])
+                        << "size=" << size.width() << "x" << size.height() << " row=" << row << " byte=" << byte;
+                }
+            }
+        }
+    }
+}
+
 TEST(Develop, IncreasesContrastAndChromaForPositiveDehaze)
 {
     const QImage source = createPixelImage(QColor{160, 128, 96, 90});
@@ -387,6 +927,209 @@ TEST(Develop, ReducesLuminanceAndColorNoiseIndependently)
     EXPECT_EQ(90, colorResult.value().pixelColor(1, 1).alpha());
 }
 
+TEST(Develop, PreservesNoiseReductionBytesForClampedBordersAndAlpha)
+{
+    for (const QSize& size : {QSize(1, 1), QSize(1, 9), QSize(9, 1), QSize(2, 2), QSize(9, 7), QSize(256, 3)})
+    {
+        QImage source(size, QImage::Format_RGBA8888);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            for (int column = 0; column < size.width(); ++column)
+            {
+                source.setPixelColor(column,
+                                     row,
+                                     QColor((row * 37 + column * 53 + 7) % 256,
+                                            (row * 97 + column * 11 + 109) % 256,
+                                            (row * 13 + column * 83 + 211) % 256,
+                                            (row * 23 + column * 19 + 41) % 256));
+            }
+        }
+
+        types::DevelopParams params;
+        params.exposureEv = 0.35F;
+        const DevelopImageResult base = applyDevelop(source, params);
+        ASSERT_TRUE(base.hasValue());
+        for (const std::pair<float, float> strengths :
+             {std::pair{0.7F, 0.0F}, std::pair{0.0F, 0.6F}, std::pair{0.7F, 0.6F}})
+        {
+            params.luminanceNoiseReduction = strengths.first;
+            params.colorNoiseReduction = strengths.second;
+            const DevelopImageResult actual = applyDevelop(source, params);
+            ASSERT_TRUE(actual.hasValue());
+            const QImage expected = referenceNoiseReductionImage(base.value(), strengths.first, strengths.second);
+            for (int row = 0; row < size.height(); ++row)
+            {
+                const uchar* expectedPixels = expected.constScanLine(row);
+                const uchar* actualPixels = actual.value().constScanLine(row);
+                for (int byte = 0; byte < size.width() * 4; ++byte)
+                {
+                    EXPECT_EQ(expectedPixels[byte], actualPixels[byte])
+                        << "size=" << size.width() << "x" << size.height() << " row=" << row << " byte=" << byte;
+                }
+            }
+        }
+    }
+}
+
+TEST(Develop, PreservesNoiseReductionThenClarityStageOrderAndBytes)
+{
+    for (const QSize& size : {QSize(1, 1), QSize(1, 7), QSize(7, 1), QSize(2, 2), QSize(9, 7)})
+    {
+        QImage source(size, QImage::Format_RGBA8888);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            for (int column = 0; column < size.width(); ++column)
+            {
+                source.setPixelColor(column,
+                                     row,
+                                     QColor((row * 37 + column * 53 + 7) % 256,
+                                            (row * 97 + column * 11 + 109) % 256,
+                                            (row * 13 + column * 83 + 211) % 256,
+                                            (row * 23 + column * 19 + 41) % 256));
+            }
+        }
+
+        types::DevelopParams params;
+        params.exposureEv = 0.35F;
+        const DevelopImageResult base = applyDevelop(source, params);
+        ASSERT_TRUE(base.hasValue());
+
+        params.luminanceNoiseReduction = 0.7F;
+        params.colorNoiseReduction = 0.6F;
+        params.clarity = 0.8F;
+        const DevelopImageResult actual = applyDevelop(source, params);
+        ASSERT_TRUE(actual.hasValue());
+
+        const QImage expected = referenceFloat32NoiseReductionThenClarityImage(
+            base.value(), params.luminanceNoiseReduction, params.colorNoiseReduction, params.clarity);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            const uchar* expectedPixels = expected.constScanLine(row);
+            const uchar* actualPixels = actual.value().constScanLine(row);
+            for (int byte = 0; byte < size.width() * 4; ++byte)
+            {
+                EXPECT_EQ(expectedPixels[byte], actualPixels[byte])
+                    << "size=" << size.width() << "x" << size.height() << " row=" << row << " byte=" << byte;
+            }
+        }
+
+        if (size == QSize(9, 7))
+        {
+            const QImage reversed = referenceNoiseReductionImage(referenceClarityImage(base.value(), params.clarity),
+                                                                 params.luminanceNoiseReduction,
+                                                                 params.colorNoiseReduction);
+            EXPECT_NE(expected, reversed);
+        }
+    }
+}
+
+TEST(Develop, PreservesBoundedFloat32SpatialChainAcrossPermitsAndDynamicHalo)
+{
+    for (const QSize& size : {QSize(17, 131), QSize(5, 513)})
+    {
+        QImage source(size, QImage::Format_RGBA8888);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            for (int column = 0; column < size.width(); ++column)
+            {
+                source.setPixelColor(column,
+                                     row,
+                                     QColor((row * 37 + column * 53 + 7) % 256,
+                                            (row * 97 + column * 11 + 109) % 256,
+                                            (row * 13 + column * 83 + 211) % 256,
+                                            (row * 23 + column * 19 + 41) % 256));
+            }
+        }
+
+        types::DevelopParams params;
+        params.exposureEv = 0.35F;
+        params.luminanceNoiseReduction = 0.7F;
+        params.colorNoiseReduction = 0.6F;
+        params.clarity = 0.8F;
+        params.sharpeningAmount = 0.65F;
+        params.sharpeningDetail = 0.35F;
+        params.sharpeningMasking = 0.4F;
+        types::DevelopParams baseParams;
+        baseParams.exposureEv = params.exposureEv;
+        const DevelopImageResult base = applyDevelop(source, baseParams);
+        ASSERT_TRUE(base.hasValue());
+
+        for (const float radius : {1.0F, 2.0F, 3.0F})
+        {
+            params.sharpeningRadius = radius;
+            const DevelopImageResult serial = applyDevelop(source, params, 1);
+            const DevelopImageResult fourPermits = applyDevelop(source, params, 4);
+            const DevelopImageResult eightPermits = applyDevelop(source, params, 8);
+            const QImage expected = referenceFloat32SpatialChainImage(base.value(), params);
+
+            ASSERT_TRUE(serial.hasValue());
+            ASSERT_TRUE(fourPermits.hasValue());
+            ASSERT_TRUE(eightPermits.hasValue());
+            EXPECT_EQ(expected, serial.value())
+                << "size=" << size.width() << "x" << size.height() << " radius=" << radius;
+            EXPECT_EQ(serial.value(), fourPermits.value())
+                << "size=" << size.width() << "x" << size.height() << " radius=" << radius;
+            EXPECT_EQ(serial.value(), eightPermits.value())
+                << "size=" << size.width() << "x" << size.height() << " radius=" << radius;
+        }
+    }
+}
+
+TEST(Develop, PreservesOptionalFloat32SpatialStagesAcrossPermitCounts)
+{
+    const QSize size{13, 131};
+    QImage source(size, QImage::Format_RGBA8888);
+    for (int row = 0; row < size.height(); ++row)
+    {
+        for (int column = 0; column < size.width(); ++column)
+        {
+            source.setPixelColor(column,
+                                 row,
+                                 QColor((row * 43 + column * 59 + 17) % 256,
+                                        (row * 89 + column * 23 + 71) % 256,
+                                        (row * 31 + column * 97 + 149) % 256,
+                                        (row * 19 + column * 29 + 37) % 256));
+        }
+    }
+
+    struct SpatialCase
+    {
+        const char* name;
+        types::DevelopParams params;
+    };
+    std::array<SpatialCase, 5> cases{};
+    cases[0].name = "noise-only";
+    cases[0].params.luminanceNoiseReduction = 0.7F;
+    cases[0].params.colorNoiseReduction = 0.6F;
+    cases[1].name = "clarity-only";
+    cases[1].params.clarity = 0.8F;
+    cases[2].name = "sharpening-only";
+    cases[2].params.sharpeningAmount = 0.65F;
+    cases[2].params.sharpeningRadius = 3.0F;
+    cases[2].params.sharpeningDetail = 0.35F;
+    cases[2].params.sharpeningMasking = 0.4F;
+    cases[3] = cases[2];
+    cases[3].name = "noise-sharpening";
+    cases[3].params.luminanceNoiseReduction = 0.7F;
+    cases[3].params.colorNoiseReduction = 0.6F;
+    cases[3].params.sharpeningRadius = 2.0F;
+    cases[4] = cases[2];
+    cases[4].name = "clarity-sharpening";
+    cases[4].params.clarity = 0.8F;
+
+    for (const SpatialCase& testCase : cases)
+    {
+        const DevelopImageResult serial = applyDevelop(source, testCase.params, 1);
+        const DevelopImageResult parallel = applyDevelop(source, testCase.params, 8);
+        const QImage expected = referenceFloat32SpatialChainImage(source, testCase.params);
+
+        ASSERT_TRUE(serial.hasValue()) << testCase.name;
+        ASSERT_TRUE(parallel.hasValue()) << testCase.name;
+        EXPECT_EQ(expected, serial.value()) << testCase.name;
+        EXPECT_EQ(serial.value(), parallel.value()) << testCase.name;
+    }
+}
+
 TEST(Develop, AdjustsLocalDetailForSharpeningAmount)
 {
     QImage source(QSize(3, 3), QImage::Format_RGBA8888);
@@ -405,6 +1148,23 @@ TEST(Develop, AdjustsLocalDetailForSharpeningAmount)
     EXPECT_GT(sharpened.value().pixelColor(1, 1).red(), source.pixelColor(1, 1).red());
     EXPECT_LT(softened.value().pixelColor(1, 1).red(), source.pixelColor(1, 1).red());
     EXPECT_EQ(90, sharpened.value().pixelColor(1, 1).alpha());
+}
+
+TEST(Develop, PreservesSharpeningEdgeClampingAndAlpha)
+{
+    QImage source(QSize(2, 2), QImage::Format_RGBA8888);
+    source.setPixelColor(0, 0, QColor(100, 100, 100, 90));
+    source.setPixelColor(1, 0, QColor(120, 120, 120, 90));
+    source.setPixelColor(0, 1, QColor(140, 140, 140, 90));
+    source.setPixelColor(1, 1, QColor(160, 160, 160, 90));
+    types::DevelopParams params;
+    params.sharpeningAmount = 1.0F;
+
+    const DevelopImageResult result = applyDevelop(source, params);
+
+    ASSERT_TRUE(result.hasValue());
+    EXPECT_EQ(QColor(80, 80, 80, 90), result.value().pixelColor(0, 0));
+    EXPECT_EQ(QColor(180, 180, 180, 90), result.value().pixelColor(1, 1));
 }
 
 TEST(Develop, AdjustsSharpeningScaleAndDetailWithRadius)
@@ -429,6 +1189,31 @@ TEST(Develop, AdjustsSharpeningScaleAndDetailWithRadius)
     EXPECT_EQ(90, broadResult.value().pixelColor(3, 3).alpha());
 }
 
+TEST(Develop, RoundsControlledSharpeningHalfSteps)
+{
+    QImage raised(QSize(5, 5), QImage::Format_RGBA8888);
+    raised.fill(QColor(127, 127, 127, 90));
+    raised.setPixelColor(2, 2, QColor(128, 128, 128, 90));
+    raised.setPixelColor(0, 0, QColor(126, 126, 126, 90));
+    QImage lowered(QSize(5, 5), QImage::Format_RGBA8888);
+    lowered.fill(QColor(129, 129, 129, 90));
+    lowered.setPixelColor(2, 2, QColor(128, 128, 128, 90));
+    lowered.setPixelColor(0, 0, QColor(130, 130, 130, 90));
+    types::DevelopParams params;
+    params.sharpeningAmount = 0.5F;
+    params.sharpeningRadius = 2.0F;
+    params.sharpeningDetail = -1.0F;
+
+    const DevelopImageResult raisedResult = applyDevelop(raised, params);
+    const DevelopImageResult loweredResult = applyDevelop(lowered, params);
+
+    ASSERT_TRUE(raisedResult.hasValue());
+    ASSERT_TRUE(loweredResult.hasValue());
+    EXPECT_EQ(129, raisedResult.value().pixelColor(2, 2).red());
+    EXPECT_EQ(128, loweredResult.value().pixelColor(2, 2).red());
+    EXPECT_EQ(90, raisedResult.value().pixelColor(2, 2).alpha());
+}
+
 TEST(Develop, MasksSharpeningAwayFromLowContrastPixels)
 {
     QImage source(QSize(5, 5), QImage::Format_RGBA8888);
@@ -449,12 +1234,127 @@ TEST(Develop, MasksSharpeningAwayFromLowContrastPixels)
     EXPECT_EQ(90, maskedResult.value().pixelColor(2, 2).alpha());
 }
 
+TEST(Develop, RadiusOneMaskedSharpeningKeepsDetailEquivalent)
+{
+    QImage source(QSize(3, 3), QImage::Format_RGBA8888);
+    source.fill(QColor(128, 120, 112, 90));
+    source.setPixelColor(0, 0, QColor(255, 0, 64, 70));
+    source.setPixelColor(1, 1, QColor(80, 200, 140, 110));
+
+    for (const float amount : {1.0F, -1.0F})
+    {
+        for (const float masking : {0.1F, 1.0F})
+        {
+            types::DevelopParams broadDetail;
+            broadDetail.sharpeningAmount = amount;
+            broadDetail.sharpeningRadius = 1.0F;
+            broadDetail.sharpeningDetail = -1.0F;
+            broadDetail.sharpeningMasking = masking;
+            types::DevelopParams fineDetail = broadDetail;
+            fineDetail.sharpeningDetail = 1.0F;
+
+            const DevelopImageResult broadResult = applyDevelop(source, broadDetail);
+            const DevelopImageResult fineResult = applyDevelop(source, fineDetail);
+
+            ASSERT_TRUE(broadResult.hasValue());
+            ASSERT_TRUE(fineResult.hasValue());
+            EXPECT_EQ(broadResult.value(), fineResult.value());
+            EXPECT_EQ(source.pixelColor(0, 0).alpha(), broadResult.value().pixelColor(0, 0).alpha());
+            EXPECT_EQ(source.pixelColor(1, 1).alpha(), broadResult.value().pixelColor(1, 1).alpha());
+        }
+    }
+}
+
+TEST(Develop, PreservesControlledSharpeningBytesAtClampedBorders)
+{
+    for (const QSize& size : {QSize(1, 1), QSize(1, 7), QSize(7, 1), QSize(2, 2), QSize(9, 7)})
+    {
+        QImage source(size, QImage::Format_RGBA8888);
+        for (int row = 0; row < size.height(); ++row)
+        {
+            for (int column = 0; column < size.width(); ++column)
+            {
+                source.setPixelColor(column,
+                                     row,
+                                     QColor((row * 37 + column * 53 + 7) % 256,
+                                            (row * 97 + column * 11 + 109) % 256,
+                                            (row * 13 + column * 83 + 211) % 256,
+                                            (row * 23 + column * 19 + 41) % 256));
+            }
+        }
+
+        types::DevelopParams params;
+        params.exposureEv = 0.35F;
+        const DevelopImageResult base = applyDevelop(source, params);
+        ASSERT_TRUE(base.hasValue());
+        for (const float amount : {-0.65F, 0.8F})
+        {
+            for (const float radius : {1.0F, 2.0F, 3.0F})
+            {
+                for (const float masking : {0.0F, 0.6F})
+                {
+                    if (radius == 1.0F && masking == 0.0F)
+                    {
+                        continue;  // 기본 Sharpening 경로는 별도 test에서 확인합니다.
+                    }
+                    for (const float detail : {-1.0F, 1.0F})
+                    {
+                        params.sharpeningAmount = amount;
+                        params.sharpeningRadius = radius;
+                        params.sharpeningDetail = detail;
+                        params.sharpeningMasking = masking;
+                        const DevelopImageResult actual = applyDevelop(source, params);
+                        ASSERT_TRUE(actual.hasValue());
+                        const QImage expected = referenceControlledSharpeningImage(base.value(), params);
+                        for (int row = 0; row < size.height(); ++row)
+                        {
+                            const uchar* actualPixels = actual.value().constScanLine(row);
+                            const uchar* expectedPixels = expected.constScanLine(row);
+                            for (int byte = 0; byte < size.width() * 4; ++byte)
+                            {
+                                EXPECT_EQ(expectedPixels[byte], actualPixels[byte])
+                                    << "size=" << size.width() << "x" << size.height() << " radius=" << radius
+                                    << " masking=" << masking << " detail=" << detail << " row=" << row
+                                    << " byte=" << byte;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST(Develop, RejectsNullImage)
 {
     const DevelopImageResult result = applyDevelop(QImage{}, types::DevelopParams{});
 
     ASSERT_TRUE(result.hasError());
     EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+}
+
+TEST(Develop, RejectsNonPositiveCpuPermitCount)
+{
+    const QImage source = createPixelImage(QColor{128, 128, 128, 255});
+
+    const DevelopImageResult result = applyDevelop(source, types::DevelopParams{}, 0);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, result.error().code);
+}
+
+TEST(Develop, ReportsMaximumUsefulCpuPermitsForActiveNeighborhood)
+{
+    types::DevelopParams params;
+    EXPECT_EQ(1, maximumUsefulDevelopCpuPermits(513, params));
+
+    params.clarity = 0.8F;
+    EXPECT_EQ(1, maximumUsefulDevelopCpuPermits(1, params));
+    EXPECT_GE(maximumUsefulDevelopCpuPermits(513, params), 4);
+
+    params.clarity = 0.0F;
+    params.sharpeningAmount = 0.5F;
+    EXPECT_GE(maximumUsefulDevelopCpuPermits(513, params), 4);
 }
 
 TEST(Develop, RejectsNonFiniteExposure)
@@ -478,6 +1378,8 @@ TEST(Develop, RejectsInvalidContrast)
     ASSERT_TRUE(nonFinite.hasError());
     EXPECT_EQ(types::ErrorCode::InvalidArgument, outOfRange.error().code);
     EXPECT_EQ(types::ErrorCode::InvalidArgument, nonFinite.error().code);
+    EXPECT_EQ(QStringLiteral("Develop contrast must be finite and between -1.0 and 1.0."), outOfRange.error().message);
+    EXPECT_EQ(QStringLiteral("Develop contrast must be finite and between -1.0 and 1.0."), nonFinite.error().message);
 }
 
 TEST(Develop, RejectsInvalidHighlightAndShadow)

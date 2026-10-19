@@ -28,3 +28,10 @@ target_link_libraries(flexraw_app
         flexraw_worker_health_adapter
         Qt6::Core
 )
+
+if(WIN32)
+    target_link_libraries(flexraw_app PRIVATE
+        flexraw_platform_windows
+        flexraw_platform_windows_desktop
+    )
+endif()

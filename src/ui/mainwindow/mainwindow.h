@@ -1,13 +1,17 @@
 #pragma once
 
+#include <memory>
 #include <optional>
 
 #include <QHash>
 #include <QMainWindow>
+#include <QString>
 
 #include "activity_client.h"
+#include "catalog_culling_client.h"
 #include "catalog_entry.h"
 #include "catalog_folder_client.h"
+#include "catalog_inclusion_client.h"
 #include "catalog_photo_client.h"
 #include "catalog_project.h"
 #include "catalog_project_client.h"
@@ -21,6 +25,7 @@
 #include "export_defaults_client.h"
 #include "folder_import_client.h"
 #include "preview_presentation_client.h"
+#include "qt_display_presentation_adapter.h"
 #include "source_resolution_client.h"
 #include "worker_health_client.h"
 #include "worker_profile_client.h"
@@ -47,6 +52,14 @@ namespace flexraw::core::orchestration
 struct EditorState;
 }  // namespace flexraw::core::orchestration
 
+namespace flexraw::platform
+{
+class IDisplayProfileService;
+}
+
+class QScreen;
+class QShowEvent;
+
 namespace flexraw::ui::facade
 {
 class CatalogEditorFacade;
@@ -70,13 +83,27 @@ class QToolButton;
 namespace flexraw::ui::mainwindow
 {
 
+enum class CatalogStartupNoticeKind
+{
+    None,
+    CatalogOpened,
+    RecoveredWithManagedCatalog,
+    StartupCatalogUnavailable,
+};
+
+struct CatalogStartupNotice
+{
+    CatalogStartupNoticeKind kind{CatalogStartupNoticeKind::None};
+    QString requestedCatalogPath;
+};
+
 class MainWindow : public QMainWindow
 {
 public:
     // 목적: Flexraw 첫 catalog-to-preview window를 editor session adapter로 초기화
     // 입력: catalogEditorFacade: GUI와 Folder lifecycle boundary,
     //       Export command/event/default contract, applicationSettings/profile client, optional Worker health와
-    //       Catalog startup settings capability, parent: Qt 부모 widget
+    //       Catalog startup notice/settings와 display profile/resolver capability, parent: Qt 부모 widget
     // 출력: 초기화된 MainWindow 객체
     explicit MainWindow(facade::CatalogEditorFacade& catalogEditorFacade,
                         core::client::IExportClient& exportClient,
@@ -84,9 +111,12 @@ public:
                         core::client::IExportDefaultsClient& exportDefaultsClient,
                         QSettings& applicationSettings,
                         core::client::IWorkerProfileClient& workerProfileClient,
+                        CatalogStartupNotice catalogStartupNotice = {},
                         core::client::IWorkerHealthClient* workerHealthClient = nullptr,
                         core::client::IWorkerHealthEventSource* workerHealthEventSource = nullptr,
                         core::client::ICatalogStartupSettingsClient* catalogStartupSettingsClient = nullptr,
+                        platform::IDisplayProfileService* displayProfileService = nullptr,
+                        facade::DisplayTargetResolver displayTargetResolver = {},
                         QWidget* parent = nullptr);
 
 protected:
@@ -95,11 +125,21 @@ protected:
     // 출력: 저장·폐기 선택 시 종료, 취소·저장 실패 시 종료 중단
     void closeEvent(QCloseEvent* event) override;
 
+    // 목적: native top-level window 생성 뒤 current QScreen 관찰과 첫 ICC presentation target 설정
+    // 입력: event: Qt show lifecycle event
+    // 출력: screenChanged 연결과 retained Preview frame의 current monitor 재투영
+    void showEvent(QShowEvent* event) override;
+
 private:
     // 목적: status bar의 compact Activity label, indeterminate progress와 cancel control 구성
     // 입력: 없음
     // 출력: 초기에는 숨겨진 Activity presentation widget 생성
     void initializeActivityStatus();
+
+    // 목적: Managed Catalog startup open, 복구 또는 실패 결과를 비차단 사용자 안내로 표시
+    // 입력: 없음
+    // 출력: 정상 open 상태 표시 또는 복구·실패 warning dialog 생성
+    void presentCatalogStartupNotice();
 
     // 목적: Qt-free Activity client를 실제 MainWindow presentation consumer에 연결
     // 입력: 없음
@@ -116,6 +156,11 @@ private:
     // 출력: RAII subscription 보관 또는 구조화된 오류 logging
     void subscribeToPreviewPresentationEvents();
 
+    // 목적: QWindow current screen의 ICC target으로 retained Preview presentation 갱신
+    // 입력: screen: Qt backend가 선택한 current screen
+    // 출력: target이 바뀌면 Current/Before frame을 RAW 재처리 없이 다시 표시
+    void updateDisplayPresentationTarget(QScreen* screen);
+
     // 목적: Qt-free Catalog thumbnail event source를 MainWindow view에 연결
     // 입력: 없음
     // 출력: RAII subscription 보관 또는 구조화된 오류 logging
@@ -130,6 +175,16 @@ private:
     // 입력: event: initial state, frame update, warning 또는 terminal
     // 출력: PreviewWidget과 DevelopPanel 표시 갱신
     void handlePreviewPresentationEvent(const core::client::PreviewPresentationEvent& event);
+
+    // 목적: 비교 snapshot과 warning/terminal을 After frame과 독립적으로 표시
+    // 입력: event: immutable 비교 transition 또는 초기 snapshot
+    // 출력: 비교 frame·action 상태 갱신
+    void handlePreviewComparisonEvent(const core::client::PreviewPresentationEvent& event);
+
+    // 목적: Before·Split GUI mode를 Core 비교 command와 동기화
+    // 입력: split: 분할 표시 여부, enabled: 선택한 action의 활성 상태
+    // 출력: 비교 요청 또는 After 표시 복귀
+    void setPreviewComparisonMode(bool split, bool enabled);
 
     // 목적: immutable Catalog thumbnail frame/issue/terminal을 list presentation에 반영
     // 입력: event: initial state 또는 window lifecycle transition
@@ -170,6 +225,11 @@ private:
     // 입력: 없음
     // 출력: 없음
     void openCatalog();
+
+    // 목적: active Catalog를 닫고 Catalog·Editor presentation을 비활성 상태로 초기화
+    // 입력: 없음
+    // 출력: 없음
+    void closeCatalog();
 
     // 목적: 지정 catalog를 단일 active session으로 열고 stable PhotoId 목록 표시
     // 입력: catalogPath: 생성하거나 열 catalog file 경로, openMode: explicit create/open 의도
@@ -231,6 +291,36 @@ private:
     // 입력: 없음
     // 출력: 유효한 Project command만 활성화
     void updateProjectActions();
+
+    // 목적: 선택된 Catalog Photo batch에 persisted Pick·Reject·Neutral 상태 적용
+    // 입력: state: 선택 Photo 전체에 적용할 target culling state
+    // 출력: mutation receipt 뒤 같은 scope/filter page와 selection presentation 갱신
+    void setSelectedPhotoCulling(core::client::CatalogCullingState state);
+
+    // 목적: 사용자가 선택한 선별 filter로 현재 Catalog/Folder/Project 첫 page 전환
+    // 입력: index: culling filter combo box index
+    // 출력: dirty state 저장 후 All·Pick·Reject filter 적용
+    void changeCatalogCullingFilter(int index);
+
+    // 목적: Catalog page와 selection availability에 맞춰 선별 controls 활성화 갱신
+    // 입력: 없음
+    // 출력: filter와 mutation action이 유효한 context에서만 활성화
+    void updateCatalogCullingActions();
+
+    // 목적: 선택된 Catalog Photo batch에 persisted 포함·제외 상태 적용
+    // 입력: state: 선택 Photo 전체에 적용할 target inclusion state
+    // 출력: mutation receipt 뒤 같은 scope/filter page와 selection presentation 갱신
+    void setSelectedPhotoInclusion(core::client::CatalogInclusionState state);
+
+    // 목적: 사용자가 선택한 등록 포함 filter로 현재 Catalog/Folder/Project 첫 page 전환
+    // 입력: index: inclusion filter combo box index
+    // 출력: dirty state 저장 후 Included·Excluded filter 적용
+    void changeCatalogInclusionFilter(int index);
+
+    // 목적: Catalog page와 selection availability에 맞춰 등록 포함 controls 활성화 갱신
+    // 입력: 없음
+    // 출력: 현재 view에서 유효한 제외 또는 복원 action만 활성화
+    void updateCatalogInclusionActions();
 
     // 목적: cursor 요청에 해당하는 bounded Catalog photo page를 현재 목록에 적용
     // 입력: request: page 크기, 이동 방향과 exclusive cursor
@@ -397,8 +487,11 @@ private:
     editor::DevelopPanel* m_developPanel{nullptr};
     catalog::SourceResolutionWidget* m_sourceResolutionWidget{nullptr};
     editor::PreviewWidget* m_previewWidget{nullptr};
+    std::unique_ptr<facade::QtDisplayPresentationAdapter> m_displayPresentationAdapter;
     cli::ConsoleModeWidget* m_consoleWidget{nullptr};
     core::client::ICatalogPhotoClient* m_catalogPhotoClient{nullptr};
+    core::client::ICatalogCullingClient* m_catalogCullingClient{nullptr};
+    core::client::ICatalogInclusionClient* m_catalogInclusionClient{nullptr};
     core::client::ICatalogProjectClient* m_catalogProjectClient{nullptr};
     core::client::ICatalogFolderClient* m_catalogFolderClient{nullptr};
     core::client::ICatalogSessionClient* m_catalogSessionClient{nullptr};
@@ -409,6 +502,7 @@ private:
     core::client::ICatalogThumbnailClient* m_catalogThumbnailClient{nullptr};
     core::client::ICatalogThumbnailEventSource* m_catalogThumbnailEventSource{nullptr};
     core::client::IPreviewPresentationClient* m_previewPresentationClient{nullptr};
+    core::client::IPreviewComparisonClient* m_previewComparisonClient{nullptr};
     core::client::IPreviewPresentationEventSource* m_previewPresentationEventSource{nullptr};
     core::client::ISourceResolutionClient* m_sourceResolutionClient{nullptr};
     core::client::ISourceResolutionEventSource* m_sourceResolutionEventSource{nullptr};
@@ -427,13 +521,16 @@ private:
     core::client::IWorkerHealthClient* m_workerHealthClient{nullptr};
     core::client::IWorkerHealthEventSource* m_workerHealthEventSource{nullptr};
     core::client::ICatalogStartupSettingsClient* m_catalogStartupSettingsClient{nullptr};
+    CatalogStartupNotice m_catalogStartupNotice;
     QStackedWidget* m_contentStack{nullptr};
     QLabel* m_activityLabel{nullptr};
     QProgressBar* m_activityProgressBar{nullptr};
     QToolButton* m_cancelActivityButton{nullptr};
+    QTimer* m_activityHideTimer{nullptr};
     std::optional<core::client::ActivityId> m_cancelActivityId;
     QAction* m_newCatalogAction{nullptr};
     QAction* m_openCatalogAction{nullptr};
+    QAction* m_closeCatalogAction{nullptr};
     QAction* m_importFolderAction{nullptr};
     QAction* m_openFolderAction{nullptr};
     QAction* m_saveDevelopAction{nullptr};
@@ -442,21 +539,35 @@ private:
     QAction* m_undoDevelopAction{nullptr};
     QAction* m_redoDevelopAction{nullptr};
     QAction* m_settingsAction{nullptr};
+    QAction* m_beforePreviewAction{nullptr};
+    QAction* m_splitPreviewAction{nullptr};
     QAction* m_createProjectAction{nullptr};
     QAction* m_renameProjectAction{nullptr};
     QAction* m_removeProjectAction{nullptr};
     QAction* m_addSelectedPhotosToProjectAction{nullptr};
     QAction* m_removeSelectedPhotosFromProjectAction{nullptr};
+    QAction* m_pickSelectedPhotosAction{nullptr};
+    QAction* m_rejectSelectedPhotosAction{nullptr};
+    QAction* m_clearSelectedCullingAction{nullptr};
+    QAction* m_excludeSelectedPhotosAction{nullptr};
+    QAction* m_restoreSelectedPhotosAction{nullptr};
     QToolButton* m_previousCatalogPageButton{nullptr};
     QToolButton* m_nextCatalogPageButton{nullptr};
     QComboBox* m_catalogFolderScopeComboBox{nullptr};
     QComboBox* m_catalogProjectScopeComboBox{nullptr};
+    QComboBox* m_catalogInclusionFilterComboBox{nullptr};
+    QComboBox* m_catalogCullingFilterComboBox{nullptr};
     QToolButton* m_catalogProjectMenuButton{nullptr};
     std::optional<core::client::CatalogPhotoPage> m_catalogPhotoPage;
+    std::optional<core::client::CatalogPhotoPageRequest> m_catalogPhotoPageRequest;
     std::optional<QString> m_catalogFolderPath;
     std::optional<core::catalog::ProjectId> m_catalogProjectId;
+    core::client::CatalogInclusionFilter m_catalogInclusionFilter{
+        core::client::CatalogInclusionFilter::IncludedOnly};
+    core::client::CatalogCullingFilter m_catalogCullingFilter{core::client::CatalogCullingFilter::All};
     QHash<qint64, core::client::SourceRequestId> m_sourceResolutionRequests;
     bool m_folderOperationActive{false};
+    bool m_observingDisplayScreen{false};
 };
 
 }  // namespace flexraw::ui::mainwindow

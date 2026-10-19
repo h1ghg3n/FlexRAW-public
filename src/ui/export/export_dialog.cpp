@@ -41,6 +41,9 @@ namespace flexraw::ui::export_
 namespace
 {
 
+constexpr int SourceLocatorRole = Qt::UserRole;
+constexpr int OutputLocatorRole = Qt::UserRole + 1;
+
 // 목적: Qt string을 byte length가 보존된 UTF-8 client string으로 변환
 // 입력: value: source/output/catalog locator 또는 display text
 // 출력: Qt-free UTF-8 string
@@ -240,16 +243,14 @@ ExportDialog::ExportDialog(core::client::IExportClient& exportClient,
                            QVector<ExportDialogSource> sources,
                            core::client::IWorkerProfileClient& workerProfileClient,
                            core::client::IExportDefaultsClient& exportDefaultsClient,
-                           QWidget* parent)
+                           QWidget* parent,
+                           const qsizetype skippedSourceCount)
     : QDialog(parent),
       m_exportClient(&exportClient),
       m_workerProfileClient(&workerProfileClient),
       m_exportDefaultsClient(&exportDefaultsClient),
       m_sources(std::move(sources)),
       m_source(m_sources.isEmpty() ? core::types::FileDescriptor{} : m_sources.constFirst().source),
-      m_developParams(m_sources.isEmpty() || !m_sources.constFirst().developParams.has_value()
-                          ? core::types::DevelopParams{}
-                          : *m_sources.constFirst().developParams),
       m_sourceLabel(new QLabel(this)),
       m_outputTable(new QTableWidget(this)),
       m_browseButton(new QToolButton(this)),
@@ -277,13 +278,20 @@ ExportDialog::ExportDialog(core::client::IExportClient& exportClient,
     m_sourceLabel->setObjectName(QStringLiteral("exportSourceLabel"));
     m_sourceLabel->setText(m_sources.size() == 1 ? tr("1 photo selected")
                                                  : tr("%1 photos selected").arg(m_sources.size()));
+    if (skippedSourceCount > 0)
+    {
+        m_sourceLabel->setText(tr("%1 — %2 skipped because the source is unavailable or not ready.")
+                                   .arg(m_sourceLabel->text())
+                                   .arg(skippedSourceCount));
+    }
     m_sourceLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     m_outputTable->setObjectName(QStringLiteral("exportOutputTable"));
-    m_outputTable->setColumnCount(2);
-    m_outputTable->setHorizontalHeaderLabels({tr("Source"), tr("Output file")});
+    m_outputTable->setColumnCount(3);
+    m_outputTable->setHorizontalHeaderLabels({tr("Source"), tr("Output file"), tr("Result")});
     m_outputTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_outputTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_outputTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_outputTable->verticalHeader()->setVisible(false);
     m_outputTable->setSelectionMode(QAbstractItemView::NoSelection);
     m_outputTable->setMinimumHeight(140);
@@ -374,6 +382,10 @@ ExportDialog::ExportDialog(core::client::IExportClient& exportClient,
         outputPathEdit->setObjectName(row == 0 ? QStringLiteral("exportOutputPathEdit")
                                                : QStringLiteral("exportOutputPathEdit%1").arg(row + 1));
         m_outputTable->setCellWidget(static_cast<int>(row), 1, outputPathEdit);
+        auto* resultItem = new QTableWidgetItem(tr("Ready"));
+        resultItem->setData(SourceLocatorRole, source.source.path);
+        resultItem->setFlags(resultItem->flags() & ~Qt::ItemIsEditable);
+        m_outputTable->setItem(static_cast<int>(row), 2, resultItem);
         m_outputPathEdits.push_back(outputPathEdit);
     }
     m_outputPathEdit = m_outputPathEdits.isEmpty() ? nullptr : m_outputPathEdits.constFirst();
@@ -496,7 +508,8 @@ void ExportDialog::startExport()
     const core::export_::RasterExportPathResult validatedPath = core::export_::validateRasterExportPath(outputPath);
     if (validatedPath.hasError())
     {
-        m_statusLabel->setText(tr("Export cannot start: %1").arg(validatedPath.error().message));
+        LOG_WARN("export", "Raster Export path validation failed: {}", validatedPath.error().message.toStdString());
+        m_statusLabel->setText(tr("Export cannot start: %1").arg(pathValidationErrorText(validatedPath.error())));
         return;
     }
 
@@ -527,13 +540,18 @@ void ExportDialog::startExport()
         }
     }
 
-    core::client::ExportFileRequest request{
-        toClientSource(m_source),
-        toClientString(validatedPath.value()),
-        {},
-        core::orchestration::toClientDevelopParams(m_developParams),
-        toClientOptions(options),
-    };
+    const ExportDialogSource& source = m_sources.constFirst();
+    std::optional<core::client::EditorDevelopParams> developParams;
+    if (source.developParams.has_value())
+    {
+        developParams = core::orchestration::toClientDevelopParams(*source.developParams);
+    }
+    core::client::ExportFileRequest request{toClientSource(source.source),
+                                            toClientString(validatedPath.value()),
+                                            toClientString(source.catalogPath),
+                                            std::move(developParams),
+                                            toClientOptions(options),
+                                            source.useDefaultDevelopParamsWhenCatalogPhotoMissing};
     const core::client::SubmitExportCommand command{core::client::ExportRequest{std::move(request)},
                                                     collectPlacementOptions(execution)};
     const core::client::ExportSubmissionResult submitted = m_exportClient->submitExport(command);
@@ -551,6 +569,10 @@ void ExportDialog::startExport()
         LOG_WARN("export", "Unable to save Export execution defaults: {}", savedDefaults.error().technicalMessage);
     }
     m_executionDefaults = execution;
+    if (QTableWidgetItem* const resultItem = m_outputTable->item(0, 2); resultItem != nullptr)
+    {
+        resultItem->setData(OutputLocatorRole, validatedPath.value());
+    }
     beginRequest(submitted.value().requestId, execution.placementPolicy, options, validatedPath.value());
 }
 
@@ -578,14 +600,23 @@ void ExportDialog::startItemListExport()
         const core::export_::RasterExportPathResult validatedPath = core::export_::validateRasterExportPath(outputPath);
         if (validatedPath.hasError())
         {
-            m_statusLabel->setText(tr("Export cannot start for %1: %2")
-                                       .arg(m_sources.at(index).source.displayName, validatedPath.error().message));
+            LOG_WARN("export",
+                     "Raster Export item path validation failed for {}: {}",
+                     m_sources.at(index).source.displayName.toStdString(),
+                     validatedPath.error().message.toStdString());
+            m_statusLabel->setText(
+                tr("Export cannot start for %1: %2")
+                    .arg(m_sources.at(index).source.displayName, pathValidationErrorText(validatedPath.error())));
             return;
         }
 
         existingOutputCount += QFileInfo::exists(validatedPath.value()) ? 1 : 0;
 
         const ExportDialogSource& source = m_sources.at(index);
+        if (QTableWidgetItem* const resultItem = m_outputTable->item(static_cast<int>(index), 2); resultItem != nullptr)
+        {
+            resultItem->setData(OutputLocatorRole, validatedPath.value());
+        }
         std::optional<core::client::EditorDevelopParams> developParams;
         if (source.developParams.has_value())
         {
@@ -911,6 +942,7 @@ void ExportDialog::beginRequest(const core::client::ExportRequestId requestId,
     m_elapsedClock.start();
     m_elapsedTimer->start();
     setOptionControlsEnabled(false);
+    setAllItemStatuses(tr("Running..."));
     m_exportButton->setEnabled(false);
     m_cancelButton->setText(tr("Cancel"));
     m_cancelButton->setEnabled(true);
@@ -965,6 +997,8 @@ void ExportDialog::handleCompleted(const core::client::ExportResult& result)
     {
         return;
     }
+
+    presentItemResults(result.report.items);
 
     if (result.report.items.size() == 1 && result.report.items.front().succeeded)
     {
@@ -1037,7 +1071,9 @@ void ExportDialog::handleFailed(const core::client::ExportIssue& issue)
     }
 
     LOG_WARN("export", "GUI Export request failed: {}", issue.error.technicalMessage);
-    m_statusLabel->setText(tr("Export failed: %1").arg(exportErrorText(issue.error)));
+    const QString errorText = exportErrorText(issue.error);
+    setAllItemStatuses(tr("Failed: %1").arg(errorText));
+    m_statusLabel->setText(tr("Export failed: %1").arg(errorText));
     finishRequest(true);
 }
 
@@ -1051,8 +1087,67 @@ void ExportDialog::handleCancelled(const core::client::ExportRequestId requestId
         return;
     }
 
+    setAllItemStatuses(tr("Cancelled"));
     m_statusLabel->setText(tr("Export cancelled."));
     finishRequest(true);
+}
+
+// 목적: terminal item result를 matching source/output 표 행에 표시
+// 입력: items: source/output identity와 성공·실패 의미를 가진 terminal result 목록
+// 출력: 각 matching Result cell에 localized terminal 상태 표시
+void ExportDialog::presentItemResults(const std::vector<core::client::ExportItemResult>& items)
+{
+    for (const core::client::ExportItemResult& item : items)
+    {
+        const QString sourceLocator = fromClientString(item.sourceLocator);
+        const QString outputLocator = fromClientString(item.outputLocator);
+        for (int row = 0; row < m_outputTable->rowCount(); ++row)
+        {
+            QTableWidgetItem* const resultItem = m_outputTable->item(row, 2);
+            if (resultItem == nullptr)
+            {
+                continue;
+            }
+            const bool outputMatches =
+                outputLocator.isEmpty() || resultItem->data(OutputLocatorRole).toString() == outputLocator;
+            if (resultItem->data(SourceLocatorRole).toString() != sourceLocator || !outputMatches)
+            {
+                continue;
+            }
+
+            if (item.succeeded)
+            {
+                resultItem->setText(tr("Succeeded"));
+            }
+            else if (item.error.has_value() && item.error->code == core::client::ClientErrorCode::Cancelled)
+            {
+                resultItem->setText(tr("Cancelled"));
+            }
+            else if (item.error.has_value())
+            {
+                resultItem->setText(tr("Failed: %1").arg(exportErrorText(*item.error, item.failureKind)));
+            }
+            else
+            {
+                resultItem->setText(tr("Failed"));
+            }
+            break;
+        }
+    }
+}
+
+// 목적: 아직 개별 terminal이 없는 모든 output 행의 상태 표시
+// 입력: statusText: 모든 행에 적용할 localized 상태 문구
+// 출력: Result column text 갱신
+void ExportDialog::setAllItemStatuses(const QString& statusText)
+{
+    for (int row = 0; row < m_outputTable->rowCount(); ++row)
+    {
+        if (QTableWidgetItem* const resultItem = m_outputTable->item(row, 2); resultItem != nullptr)
+        {
+            resultItem->setText(statusText);
+        }
+    }
 }
 
 // 목적: common ClientError와 Export domain failure를 localized presentation으로 변환
@@ -1097,6 +1192,34 @@ QString ExportDialog::exportErrorText(const core::client::ClientError& error,
         return tr("The export could not be completed.");
     }
     return tr("The export could not be completed.");
+}
+
+// 목적: Core raster path validation 오류를 stable localized 문구로 변환
+// 입력: error: 진단 message와 stable code를 가진 path validation 오류
+// 출력: diagnostic 원문을 노출하지 않는 사용자용 문자열
+QString ExportDialog::pathValidationErrorText(const core::types::CoreError& error) const
+{
+    switch (error.code)
+    {
+    case core::types::ErrorCode::InvalidArgument:
+        return tr("Choose a valid output file path.");
+    case core::types::ErrorCode::NotFound:
+        return tr("The selected output folder does not exist.");
+    case core::types::ErrorCode::PermissionDenied:
+        return tr("Flexraw cannot write to the selected output location.");
+    case core::types::ErrorCode::Conflict:
+        return tr("The output file must be different from the source photo.");
+    case core::types::ErrorCode::UnsupportedFormat:
+        return tr("The selected output format is not supported.");
+    case core::types::ErrorCode::Cancelled:
+        return tr("Output validation was cancelled.");
+    case core::types::ErrorCode::ThumbnailUnavailable:
+    case core::types::ErrorCode::DecodeFailed:
+    case core::types::ErrorCode::DatabaseError:
+    case core::types::ErrorCode::Unknown:
+        return tr("The selected output path cannot be used.");
+    }
+    return tr("The selected output path cannot be used.");
 }
 
 // 목적: active request 경과시간 label 갱신

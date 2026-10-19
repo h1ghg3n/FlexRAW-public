@@ -2,13 +2,18 @@
 #include <memory>
 #include <utility>
 
+#include <QAction>
+#include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QImage>
+#include <QLabel>
+#include <QMouseEvent>
 #include <QSettings>
+#include <QSlider>
 #include <QStatusBar>
 #include <QTemporaryDir>
 #include <QThread>
@@ -45,7 +50,7 @@ public:
     // 입력: request/tier/cancellationToken: identity와 cancellation contract를 위한 context
     // 출력: known-color 2x1 image와 fixed histogram/clipping
     [[nodiscard]] core::orchestration::PreviewPipelineResult render(
-        const core::orchestration::PreviewRequest&,
+        const core::orchestration::PreviewRequest& request,
         core::orchestration::PreviewTier,
         const core::types::CancellationToken& cancellationToken) override
     {
@@ -57,11 +62,15 @@ public:
         QImage image(2, 1, QImage::Format_RGBA8888);
         image.setPixelColor(0, 0, QColor(10, 20, 30));
         image.setPixelColor(1, 0, QColor(40, 50, 60));
+        if (request.params.exposureEv != 0.0F)
+        {
+            image.fill(Qt::blue);
+        }
         core::develop::ImageHistogram histogram;
         histogram.red[10] = 2;
         histogram.pixelCount = 2;
         core::develop::ClippingSummary clipping;
-        clipping.highlightPixelCount = 1;
+        clipping.highlightPixelCount = request.params.exposureEv == 0.0F ? 0 : 2;
         clipping.pixelCount = 2;
         return core::orchestration::PreviewPipelineResult::success(
             {std::move(image), std::move(histogram), clipping, {}});
@@ -121,6 +130,26 @@ TEST(MainWindowPreviewPresentationTest, ConsumesFrameThroughQtFreePreviewContrac
         catalogEditorFacade, exportAdapter, exportAdapter, exportDefaults, applicationSettings, workerProfiles);
     auto* previewWidget = window.findChild<editor::PreviewWidget*>();
     ASSERT_NE(nullptr, previewWidget);
+    auto* highlightClippingIndicator = window.findChild<QLabel*>(QStringLiteral("highlightClippingIndicator"));
+    ASSERT_NE(nullptr, highlightClippingIndicator);
+    auto* exposureSlider = window.findChild<QSlider*>(QStringLiteral("exposureSlider"));
+    ASSERT_NE(nullptr, exposureSlider);
+    auto* fitAction = window.findChild<QAction*>(QStringLiteral("fitPreviewAction"));
+    auto* previewPixelsAction = window.findChild<QAction*>(QStringLiteral("previewPixelsAction"));
+    auto* zoomInAction = window.findChild<QAction*>(QStringLiteral("zoomPreviewInAction"));
+    auto* zoomOutAction = window.findChild<QAction*>(QStringLiteral("zoomPreviewOutAction"));
+    auto* beforeAction = window.findChild<QAction*>(QStringLiteral("beforePreviewAction"));
+    auto* splitAction = window.findChild<QAction*>(QStringLiteral("splitPreviewAction"));
+    ASSERT_NE(nullptr, fitAction);
+    ASSERT_NE(nullptr, previewPixelsAction);
+    ASSERT_NE(nullptr, zoomInAction);
+    ASSERT_NE(nullptr, zoomOutAction);
+    ASSERT_NE(nullptr, beforeAction);
+    ASSERT_NE(nullptr, splitAction);
+    EXPECT_FALSE(fitAction->shortcut().isEmpty());
+    EXPECT_FALSE(previewPixelsAction->shortcut().isEmpty());
+    EXPECT_FALSE(zoomInAction->shortcuts().isEmpty());
+    EXPECT_FALSE(zoomOutAction->shortcuts().isEmpty());
     const core::catalog::CatalogEntry entry{
         {sourcePath,
          QStringLiteral("jpg"),
@@ -139,7 +168,50 @@ TEST(MainWindowPreviewPresentationTest, ConsumesFrameThroughQtFreePreviewContrac
     ASSERT_TRUE(waitForCondition([previewWidget] {
         return previewWidget->text().isEmpty() && !previewWidget->pixmap(Qt::ReturnByValue).isNull();
     }));
+    EXPECT_EQ(QStringLiteral("H 0.0%"), highlightClippingIndicator->text());
     EXPECT_TRUE(window.statusBar()->currentMessage().contains(QStringLiteral("presented.jpg")));
+
+    const QPoint sample(previewWidget->width() / 4, previewWidget->height() / 2);
+    const QColor fittedColor = previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample);
+    previewPixelsAction->trigger();
+    EXPECT_NE(previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample), fittedColor);
+    fitAction->trigger();
+    EXPECT_EQ(previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample), fittedColor);
+
+    const QPoint exposurePosition(exposureSlider->width() - 2, exposureSlider->height() / 2);
+    const QPoint exposureGlobalPosition = exposureSlider->mapToGlobal(exposurePosition);
+    QMouseEvent exposurePress(QEvent::MouseButtonPress,
+                              QPointF(exposurePosition),
+                              QPointF(exposureGlobalPosition),
+                              Qt::LeftButton,
+                              Qt::LeftButton,
+                              Qt::NoModifier);
+    QApplication::sendEvent(exposureSlider, &exposurePress);
+    QMouseEvent exposureRelease(QEvent::MouseButtonRelease,
+                                QPointF(exposurePosition),
+                                QPointF(exposureGlobalPosition),
+                                Qt::LeftButton,
+                                Qt::NoButton,
+                                Qt::NoModifier);
+    QApplication::sendEvent(exposureSlider, &exposureRelease);
+    EXPECT_GT(catalogEditorFacade.editorSnapshot().params.exposureEv, 0.0F);
+    ASSERT_TRUE(waitForCondition([previewWidget, sample] {
+        return previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample) == QColor(Qt::blue);
+    }));
+    ASSERT_TRUE(waitForCondition(
+        [highlightClippingIndicator] { return highlightClippingIndicator->text() == QStringLiteral("H 100.0%"); }));
+    splitAction->trigger();
+    ASSERT_TRUE(waitForCondition([previewWidget, fittedColor, sample] {
+        return previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample) == fittedColor;
+    }));
+    EXPECT_EQ(
+        previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor({previewWidget->width() * 3 / 4, sample.y()}),
+        QColor(Qt::blue));
+    beforeAction->trigger();
+    EXPECT_TRUE(beforeAction->isChecked());
+    EXPECT_FALSE(splitAction->isChecked());
+    beforeAction->trigger();
+    EXPECT_EQ(previewWidget->pixmap(Qt::ReturnByValue).toImage().pixelColor(sample), QColor(Qt::blue));
 }
 
 }  // namespace

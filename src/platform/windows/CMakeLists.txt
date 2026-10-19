@@ -3,6 +3,8 @@
 add_library(flexraw_platform_windows STATIC)
 
 target_sources(flexraw_platform_windows PRIVATE
+    windows_display_profile_service.cpp
+    windows_display_profile_service.h
     windows_path_identity_service.cpp
     windows_path_identity_service.h
     windows_process_memory_probe.cpp
@@ -20,7 +22,9 @@ target_link_libraries(flexraw_platform_windows PUBLIC
 )
 
 target_link_libraries(flexraw_platform_windows PRIVATE
+    Gdi32
     Psapi
+    User32
 )
 
 set_target_properties(flexraw_platform_windows PROPERTIES

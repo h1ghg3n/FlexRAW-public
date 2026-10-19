@@ -5,6 +5,8 @@ add_library(flexraw_core_measurement STATIC)
 target_sources(flexraw_core_measurement PRIVATE
     high_water_counter.cpp
     high_water_counter.h
+    image_regression.cpp
+    image_regression.h
     measurement_csv.cpp
     measurement_csv.h
     render_stats.h

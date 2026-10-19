@@ -5,8 +5,18 @@ set_target_properties(flexraw_platform_tests PROPERTIES
 )
 
 target_sources(flexraw_platform_tests PRIVATE
+    display_profile_contract_test.cpp
     path_identity_service_test.cpp
 )
+
+if(WIN32)
+    target_sources(flexraw_platform_tests PRIVATE
+        windows_display_profile_service_test.cpp
+    )
+    target_link_libraries(flexraw_platform_tests PRIVATE
+        flexraw_platform_windows
+    )
+endif()
 
 target_link_libraries(flexraw_platform_tests PRIVATE
     flexraw_platform_current

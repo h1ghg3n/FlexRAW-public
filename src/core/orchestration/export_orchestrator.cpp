@@ -14,7 +14,7 @@
 #include <QSet>
 #include <QThread>
 
-#include "develop.h"
+#include "develop_validation_adapter.h"
 #include "export.h"
 #include "log.h"
 #include "system_memory_probe.h"
@@ -1067,18 +1067,30 @@ bool ExportOrchestrator::hasJobs(const types::RequestId requestId) const
 // 출력: 새 Local item을 포함해 허용할 total Local in-flight 수
 int ExportOrchestrator::availableLocalSlotLimit() const
 {
+    const auto report = [this](const std::optional<std::uint64_t> available,
+                               const int cpuSlots,
+                               const int memorySlots,
+                               const int limit) {
+        if (m_configuration.localAdmissionObserver)
+        {
+            m_configuration.localAdmissionObserver(
+                {available, m_configuration.localSlotLimit, cpuSlots, memorySlots, limit, m_localInFlight});
+        }
+        return limit;
+    };
     if (!m_configuration.enforceLocalResourceReserve)
     {
-        return m_configuration.localSlotLimit;
+        return report(std::nullopt, -1, -1, m_configuration.localSlotLimit);
     }
     if (m_memoryProbe == nullptr)
     {
-        return 0;
+        return report(std::nullopt, -1, -1, 0);
     }
     const std::optional<platform::SystemMemorySnapshot> memory = m_memoryProbe->snapshot();
     if (!memory.has_value() || memory->availableBytes <= m_configuration.memoryReserveBytes)
     {
-        return 0;
+        return report(
+            memory.has_value() ? std::optional<std::uint64_t>(memory->availableBytes) : std::nullopt, -1, -1, 0);
     }
 
     const int cpuSlots = std::max(0, QThread::idealThreadCount() - m_configuration.reservedLogicalProcessors);
@@ -1086,7 +1098,10 @@ int ExportOrchestrator::availableLocalSlotLimit() const
         (memory->availableBytes - m_configuration.memoryReserveBytes) / m_configuration.memoryClaimPerJobBytes;
     const int boundedMemorySlots = static_cast<int>(
         std::min<std::uint64_t>(memorySlots, static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
-    return std::max(0, std::min({m_configuration.localSlotLimit, cpuSlots, boundedMemorySlots}));
+    return report(memory->availableBytes,
+                  cpuSlots,
+                  boundedMemorySlots,
+                  std::max(0, std::min({m_configuration.localSlotLimit, cpuSlots, boundedMemorySlots})));
 }
 
 // 목적: cooldown/resource wait 중인 pending item을 위한 non-blocking wakeup 예약

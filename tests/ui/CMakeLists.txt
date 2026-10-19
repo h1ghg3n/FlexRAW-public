@@ -18,14 +18,19 @@ target_sources(flexraw_ui_tests PRIVATE
     export_defaults_page_test.cpp
     export_command_service_test.cpp
     export_dialog_test.cpp
+    export_source_projection_test.cpp
     general_settings_test.cpp
     qt_export_settings_adapter_test.cpp
     qt_export_client_adapter_test.cpp
     qt_folder_import_event_adapter_test.cpp
     qt_catalog_thumbnail_event_adapter_test.cpp
+    qt_display_presentation_adapter_test.cpp
     qt_preview_presentation_event_adapter_test.cpp
     worker_profile_settings_adapter_test.cpp
     worker_health_settings_test.cpp
+    mainwindow_catalog_culling_test.cpp
+    mainwindow_catalog_inclusion_test.cpp
+    mainwindow_catalog_session_test.cpp
     mainwindow_catalog_pagination_test.cpp
     mainwindow_folder_operation_test.cpp
     mainwindow_preview_presentation_test.cpp
@@ -35,6 +40,15 @@ target_sources(flexraw_ui_tests PRIVATE
     source_resolution_widget_test.cpp
     ui_test_main.cpp
 )
+
+if(WIN32)
+    target_sources(flexraw_ui_tests PRIVATE
+        windows_display_target_resolver_test.cpp
+    )
+    target_link_libraries(flexraw_ui_tests PRIVATE
+        flexraw_platform_windows_desktop
+    )
+endif()
 
 target_link_libraries(flexraw_ui_tests PRIVATE
     flexraw_test_support

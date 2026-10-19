@@ -10,17 +10,19 @@ namespace flexraw::core::orchestration
 {
 class CatalogThumbnailOrchestrator;
 class CatalogSessionOrchestrator;
-class ExportOrchestrator;
+class ComputePermitPool;
 class WorkerHealthOrchestrator;
 }  // namespace flexraw::core::orchestration
 
 namespace flexraw::runtime
 {
+class ProductExportClientAdapter;
 class ProductRuntime;
-}
+}  // namespace flexraw::runtime
 
 namespace flexraw::platform
 {
+class IDisplayProfileService;
 class IPathIdentityService;
 class ISystemMemoryProbe;
 }  // namespace flexraw::platform
@@ -28,11 +30,6 @@ class ISystemMemoryProbe;
 namespace flexraw::ui::facade
 {
 class CatalogEditorFacade;
-}
-
-namespace flexraw::ui::export_
-{
-class QtExportClientAdapter;
 }
 
 namespace flexraw::ui::settings
@@ -67,11 +64,12 @@ public:
     [[nodiscard]] ui::mainwindow::MainWindow& mainWindow();
 
 private:
+    std::unique_ptr<platform::IPathIdentityService> m_pathIdentityService;
+    std::unique_ptr<platform::IDisplayProfileService> m_displayProfileService;
+    std::unique_ptr<platform::ISystemMemoryProbe> m_systemMemoryProbe;
+    std::unique_ptr<core::orchestration::ComputePermitPool> m_computePermitPool;
     std::unique_ptr<runtime::ProductRuntime> m_productRuntime;
     std::unique_ptr<core::orchestration::CatalogThumbnailOrchestrator> m_catalogThumbnailOrchestrator;
-    std::unique_ptr<platform::IPathIdentityService> m_pathIdentityService;
-    std::unique_ptr<platform::ISystemMemoryProbe> m_systemMemoryProbe;
-    std::unique_ptr<core::orchestration::ExportOrchestrator> m_exportOrchestrator;
     std::unique_ptr<QSettings> m_applicationSettings;
     std::unique_ptr<ui::settings::QtCatalogStartupSettingsAdapter> m_catalogStartupSettings;
     std::unique_ptr<ManagedCatalogSession> m_managedCatalogSession;
@@ -81,7 +79,7 @@ private:
     std::unique_ptr<ui::settings::QtWorkerProfileSettingsAdapter> m_workerProfileSettings;
     std::unique_ptr<core::orchestration::WorkerHealthOrchestrator> m_workerHealthOrchestrator;
     std::unique_ptr<ui::settings::QtWorkerHealthEventAdapter> m_workerHealthEventAdapter;
-    std::unique_ptr<ui::export_::QtExportClientAdapter> m_exportClientAdapter;
+    std::unique_ptr<runtime::ProductExportClientAdapter> m_exportClientAdapter;
     std::unique_ptr<ui::mainwindow::MainWindow> m_mainWindow;
 };
 

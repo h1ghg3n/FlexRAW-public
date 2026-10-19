@@ -10,7 +10,7 @@
 #include <QByteArray>
 #include <QString>
 
-#include "develop.h"
+#include "develop_validation_adapter.h"
 #include "export.h"
 #include "protocol_contracts.h"
 
@@ -319,19 +319,21 @@ private:
     return {code, std::move(message)};
 }
 
-// 목적: 모든 payload 앞에 v1 schema version 기록
-// 입력: writer: payload output cursor
+// 목적: payload 앞에 명시한 schema version 기록
+// 입력: writer: payload output cursor, minorVersion: request 확장 또는 기본 version
 // 출력: 없음
-void writePayloadVersion(PayloadWriter& writer)
+void writePayloadVersion(PayloadWriter& writer, std::uint16_t minorVersion = RenderPayloadMinorVersion)
 {
     writer.writeUnsigned16(RenderPayloadMajorVersion);
-    writer.writeUnsigned16(RenderPayloadMinorVersion);
+    writer.writeUnsigned16(minorVersion);
 }
 
-// 목적: payload schema version을 읽고 현재 exact v1 지원 여부 확인
-// 입력: reader: payload input cursor, error: 실패 정보 출력
+// 목적: payload schema version을 읽고 기본 또는 request HSL 확장 지원 여부 확인
+// 입력: reader: input cursor, error: 실패 정보, requestMinorVersion: request 전용 minor 출력
 // 출력: version header가 완전하고 지원되면 true
-[[nodiscard]] bool readPayloadVersion(PayloadReader& reader, PayloadError& error)
+[[nodiscard]] bool readPayloadVersion(PayloadReader& reader,
+                                      PayloadError& error,
+                                      std::uint16_t* requestMinorVersion = nullptr)
 {
     std::uint16_t majorVersion = 0;
     std::uint16_t minorVersion = 0;
@@ -341,7 +343,13 @@ void writePayloadVersion(PayloadWriter& writer)
                                  QStringLiteral("Render payload version header is truncated."));
         return false;
     }
-    if (majorVersion != RenderPayloadMajorVersion || minorVersion != RenderPayloadMinorVersion)
+    if (requestMinorVersion != nullptr)
+    {
+        *requestMinorVersion = minorVersion;
+    }
+    if (majorVersion != RenderPayloadMajorVersion ||
+        (minorVersion != RenderPayloadMinorVersion &&
+         !(requestMinorVersion != nullptr && minorVersion == HslRenderRequestMinorVersion)))
     {
         error = makePayloadError(PayloadErrorCode::UnsupportedVersion,
                                  QStringLiteral("Render payload version is not supported."));
@@ -430,6 +438,37 @@ void writePayloadVersion(PayloadWriter& writer)
         {
             error = makePayloadError(PayloadErrorCode::MalformedPayload,
                                      QStringLiteral("Develop parameter payload is truncated."));
+            return false;
+        }
+    }
+    return true;
+}
+
+// 목적: HSL 확장 request의 8채널 float를 고정 순서로 기록
+// 입력: writer — payload cursor, params — validated HSL
+// 출력: channel마다 hue/saturation/luminance 순서로 96 byte 추가
+void writeHslParams(PayloadWriter& writer, const core::types::HslParams& params)
+{
+    for (const auto& channel : params.channels)
+    {
+        writer.writeFloat(channel.hue);
+        writer.writeFloat(channel.saturation);
+        writer.writeFloat(channel.luminance);
+    }
+}
+
+// 목적: HSL 확장 request의 고정 크기 recipe 복원
+// 입력: reader — payload cursor, params/error — 복원값 또는 오류 출력
+// 출력: 전체 HSL 값을 읽었으면 true; 범위 검증은 request validation이 수행
+[[nodiscard]] bool readHslParams(PayloadReader& reader, core::types::HslParams& params, PayloadError& error)
+{
+    for (auto& channel : params.channels)
+    {
+        if (!reader.readFloat(channel.hue) || !reader.readFloat(channel.saturation) ||
+            !reader.readFloat(channel.luminance))
+        {
+            error = makePayloadError(PayloadErrorCode::MalformedPayload,
+                                     QStringLiteral("HSL parameter payload is truncated."));
             return false;
         }
     }
@@ -778,13 +817,18 @@ EncodePayloadResult encodeRenderRequestPayload(const RenderRequestPayload& paylo
 
     PayloadWriter writer;
     PayloadError error;
-    writePayloadVersion(writer);
+    const bool hasHsl = payload.developParams.hsl != core::types::HslParams{};
+    writePayloadVersion(writer, hasHsl ? HslRenderRequestMinorVersion : RenderPayloadMinorVersion);
     if (!writer.writeString(payload.sourceRelativePath, MaximumWirePathBytes, error) ||
         !writer.writeString(payload.outputRelativePath, MaximumWirePathBytes, error) ||
         !writeDevelopParams(writer, developValidation.value(), error) ||
         !writeOutputOptions(writer, payload.outputOptions, error))
     {
         return EncodePayloadResult::failure(std::move(error));
+    }
+    if (hasHsl)
+    {
+        writeHslParams(writer, payload.developParams.hsl);
     }
     return finishEncoding(writer.takeBytes());
 }
@@ -801,11 +845,15 @@ DecodeRenderRequestResult decodeRenderRequestPayload(const QByteArrayView bytes)
     PayloadReader reader(bytes);
     PayloadError error;
     RenderRequestPayload payload;
-    if (!readPayloadVersion(reader, error) ||
+    std::uint16_t requestMinorVersion = 0;
+    if (!readPayloadVersion(reader, error, &requestMinorVersion) ||
         !reader.readString(MaximumWirePathBytes, payload.sourceRelativePath, error) ||
         !reader.readString(MaximumWirePathBytes, payload.outputRelativePath, error) ||
         !readDevelopParams(reader, payload.developParams, error) ||
-        !readOutputOptions(reader, payload.outputOptions, error) || !validateFinished(reader, error))
+        !readOutputOptions(reader, payload.outputOptions, error) ||
+        (requestMinorVersion == HslRenderRequestMinorVersion &&
+         !readHslParams(reader, payload.developParams.hsl, error)) ||
+        !validateFinished(reader, error))
     {
         return DecodeRenderRequestResult::failure(std::move(error));
     }

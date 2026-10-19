@@ -386,6 +386,24 @@ TEST(QtActivityAdapterTest, MainWindowConsumesActivitySnapshotInStatusBar)
 
     context.editorOrchestrator.previewCompleted(73);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    EXPECT_FALSE(label->isHidden());
+    EXPECT_FALSE(progress->isHidden());
+    EXPECT_TRUE(cancelButton->isHidden());
+
+    context.editorOrchestrator.previewStarted(74);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    EXPECT_FALSE(label->isHidden());
+    EXPECT_FALSE(progress->isHidden());
+    EXPECT_EQ(QObject::tr("Rendering preview..."), label->text());
+
+    context.editorOrchestrator.previewCompleted(74);
+    QElapsedTimer hideTimeout;
+    hideTimeout.start();
+    while (!label->isHidden() && hideTimeout.elapsed() < 1500)
+    {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
     EXPECT_TRUE(label->isHidden());
     EXPECT_TRUE(progress->isHidden());
     EXPECT_TRUE(cancelButton->isHidden());

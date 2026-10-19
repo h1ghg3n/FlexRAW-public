@@ -14,9 +14,12 @@
 
 #include <gtest/gtest.h>
 
+#include "compute_permit_pool.h"
+#include "export_pipeline.h"
 #include "preview_orchestrator.h"
 #include "preview_pipeline.h"
 #include "test_application.h"
+#include "test_path_identity_service.h"
 
 namespace flexraw::core::orchestration
 {
@@ -40,6 +43,27 @@ namespace
     }
 
     return file.write(bitmap) == bitmap.size();
+}
+
+// 목적: 여러 bounded stripe를 사용하는 Preview integration용 BMP 파일 생성
+// 입력: path/size — 저장 위치와 image geometry
+// 출력: 파일 생성 성공 여부
+[[nodiscard]] bool createGradientBitmapFile(const QString& path, const QSize& size)
+{
+    QImage image(size, QImage::Format_RGBA8888);
+    for (int row = 0; row < size.height(); ++row)
+    {
+        uchar* pixels = image.scanLine(row);
+        for (int column = 0; column < size.width(); ++column)
+        {
+            uchar* pixel = pixels + column * 4;
+            pixel[0] = static_cast<uchar>((row * 37 + column * 53 + 7) % 256);
+            pixel[1] = static_cast<uchar>((row * 97 + column * 11 + 109) % 256);
+            pixel[2] = static_cast<uchar>((row * 13 + column * 83 + 211) % 256);
+            pixel[3] = 255;
+        }
+    }
+    return image.save(path, "BMP");
 }
 
 // 목적: orchestration contract test용 raster request 생성
@@ -206,11 +230,59 @@ private:
     std::shared_ptr<CancellationProbe> m_probe;
 };
 
+TEST(PreviewPipelineTest, MatchesLocalPngExportForHslRecipeAtSameGeometry)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QSize size{37, 29};
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("hsl.bmp"));
+    ASSERT_TRUE(createGradientBitmapFile(sourcePath, size));
+    ComputePermitPool permits(1);
+    FilePreviewPipeline preview(QDir(directory.path()).filePath(QStringLiteral("cache")), permits);
+    auto request = makeRasterRequest(sourcePath, 1, 1);
+    request.targetSize = size;
+    request.renderMode = PreviewRenderMode::Final;
+    request.params.hsl.channels[0] = {0.4F, -0.3F, 0.2F};
+    request.params.hsl.channels[3] = {-0.5F, 0.2F, -0.1F};
+    request.params.hsl.channels[7] = {0.2F, -0.1F, 0.3F};
+    const types::CancellationSource cancellation;
+    const auto frame = preview.render(request, PreviewTier::Thumbnail, cancellation.token());
+    ASSERT_TRUE(frame.hasValue());
+    ASSERT_EQ(frame.value().image.size(), size);
+
+    ExportFileRequest exportRequest;
+    exportRequest.source = request.source;
+    exportRequest.outputPath = QDir(directory.path()).filePath(QStringLiteral("hsl.png"));
+    exportRequest.developParams = request.params;
+    exportRequest.options.format = export_::RasterExportFormat::Png;
+    exportRequest.options.includeMetadata = false;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    const auto prepared = pipeline.prepare(exportRequest, cancellation.token());
+    ASSERT_TRUE(prepared.hasValue());
+    ASSERT_EQ(prepared.value().items.size(), 1);
+    const auto exported = pipeline.executeItem(prepared.value().items.front(), cancellation.token());
+    ASSERT_TRUE(exported.succeeded) << exported.error.message.toStdString();
+    const QImage output(exportRequest.outputPath);
+    ASSERT_FALSE(output.isNull());
+    const auto actual = output.convertToFormat(QImage::Format_RGBA8888);
+    const auto expected = frame.value().image.convertToFormat(QImage::Format_RGBA8888);
+    ASSERT_EQ(actual.size(), expected.size());
+    for (int row = 0; row < expected.height(); ++row)
+    {
+        for (int column = 0; column < expected.width(); ++column)
+        {
+            EXPECT_EQ(actual.pixel(column, row), expected.pixel(column, row)) << column << "," << row;
+        }
+    }
+}
+
 TEST(PreviewPipelineTest, StopsBeforeFilesystemAccessWhenAlreadyCancelled)
 {
     QTemporaryDir directory;
     ASSERT_TRUE(directory.isValid());
-    FilePreviewPipeline pipeline(QDir(directory.path()).filePath(QStringLiteral("cache")));
+    ComputePermitPool computePermitPool(1);
+    FilePreviewPipeline pipeline(QDir(directory.path()).filePath(QStringLiteral("cache")), computePermitPool);
     types::CancellationSource cancellationSource;
     cancellationSource.requestCancellation();
     const PreviewRequest request = makeRasterRequest(QStringLiteral("C:/missing/cancelled.bmp"), 0, 0);
@@ -227,7 +299,8 @@ TEST(PreviewPipelineTest, DownscalesInteractiveFrameAndSkipsAnalysis)
     ASSERT_TRUE(directory.isValid());
     const QString imagePath = QDir(directory.path()).filePath(QStringLiteral("interactive.bmp"));
     ASSERT_TRUE(createBitmapFile(imagePath));
-    FilePreviewPipeline pipeline(QDir(directory.path()).filePath(QStringLiteral("cache")));
+    ComputePermitPool computePermitPool(1);
+    FilePreviewPipeline pipeline(QDir(directory.path()).filePath(QStringLiteral("cache")), computePermitPool);
     PreviewRequest request = makeRasterRequest(imagePath, 1, 1);
     request.renderMode = PreviewRenderMode::Interactive;
     const types::CancellationSource cancellationSource;
@@ -239,6 +312,36 @@ TEST(PreviewPipelineTest, DownscalesInteractiveFrameAndSkipsAnalysis)
     EXPECT_EQ(result.value().histogram.pixelCount, 0U);
     EXPECT_EQ(result.value().clipping.pixelCount, 0U);
     EXPECT_EQ(result.value().stats.analysisMs, 0);
+    EXPECT_EQ(computePermitPool.snapshot().permitHighWater, 1);
+}
+
+TEST(PreviewPipelineTest, UsesBoundedComputePermitsForFloat32SpatialChain)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QSize imageSize{17, 513};
+    const QString imagePath = QDir(directory.path()).filePath(QStringLiteral("bounded.bmp"));
+    ASSERT_TRUE(createGradientBitmapFile(imagePath, imageSize));
+    ComputePermitPool computePermitPool(4);
+    FilePreviewPipeline pipeline(QDir(directory.path()).filePath(QStringLiteral("cache")), computePermitPool);
+    PreviewRequest request = makeRasterRequest(imagePath, 1, 1);
+    request.targetSize = imageSize;
+    request.renderMode = PreviewRenderMode::Final;
+    request.params.luminanceNoiseReduction = 0.7F;
+    request.params.colorNoiseReduction = 0.6F;
+    request.params.clarity = 0.8F;
+    request.params.sharpeningAmount = 0.65F;
+    request.params.sharpeningRadius = 3.0F;
+    request.params.sharpeningDetail = 0.35F;
+    request.params.sharpeningMasking = 0.4F;
+    const types::CancellationSource cancellationSource;
+
+    const PreviewPipelineResult result = pipeline.render(request, PreviewTier::Thumbnail, cancellationSource.token());
+
+    ASSERT_TRUE(result.hasValue());
+    EXPECT_EQ(imageSize, result.value().image.size());
+    EXPECT_EQ(4, computePermitPool.snapshot().permitHighWater);
+    EXPECT_EQ(0, computePermitPool.snapshot().permitsInUse);
 }
 
 TEST(PreviewOrchestratorTest, RunsRasterPipelineOffThreadAndPublishesAnalyzedFrame)
@@ -248,8 +351,9 @@ TEST(PreviewOrchestratorTest, RunsRasterPipelineOffThreadAndPublishesAnalyzedFra
     ASSERT_TRUE(directory.isValid());
     const QString imagePath = QDir(directory.path()).filePath(QStringLiteral("sample.bmp"));
     ASSERT_TRUE(createBitmapFile(imagePath));
-    PreviewOrchestrator orchestrator(
-        std::make_unique<FilePreviewPipeline>(QDir(directory.path()).filePath(QStringLiteral("cache"))));
+    ComputePermitPool computePermitPool(1);
+    PreviewOrchestrator orchestrator(std::make_unique<FilePreviewPipeline>(
+        QDir(directory.path()).filePath(QStringLiteral("cache")), computePermitPool));
     QEventLoop eventLoop;
     QTimer timeoutTimer;
     timeoutTimer.setSingleShot(true);

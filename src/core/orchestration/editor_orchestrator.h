@@ -19,7 +19,10 @@ class CatalogOrchestrator;
 class PreviewOrchestrator;
 struct CatalogSourceUpdate;
 
-class EditorOrchestrator final : public QObject, public client::IEditorClient, public client::IPreviewPresentationClient
+class EditorOrchestrator final : public QObject,
+                                 public client::IEditorClient,
+                                 public client::IPreviewPresentationClient,
+                                 public client::IPreviewComparisonClient
 {
     Q_OBJECT
 
@@ -51,6 +54,17 @@ public:
     // 입력: requestId: owner가 발급해 presentation snapshot에 공개한 identity
     // 출력: 취소된 identity 또는 stale·validation 오류
     [[nodiscard]] client::PreviewRequestCancelResult cancelPreviewRequest(client::PreviewRequestId requestId) override;
+
+    // 목적: 현재 Editor selection의 기본 Develop Preview 비교를 시작하거나 해제
+    // 입력: command: 비교 활성화 여부
+    // 출력: 비교 상태와 accepted request identity 또는 validation/submit 오류
+    [[nodiscard]] client::PreviewComparisonResult setPreviewComparison(
+        const client::SetPreviewComparisonCommand& command) override;
+
+    // 목적: delivery adapter가 현재 authoritative 비교 활성 상태와 request ID 조회
+    // 입력: 없음
+    // 출력: frame 복제를 포함하지 않는 비교 command state
+    [[nodiscard]] client::PreviewComparisonCommandState previewComparisonState() const noexcept;
 
     // 목적: Preview presentation adapter가 현재 target 크기를 owner context에서 조회
     // 입력: 없음
@@ -213,11 +227,51 @@ signals:
     // 출력: 없음
     void previewCancelled(types::RequestId requestId);
 
+    // 목적: 비교 활성화·해제 또는 frame invalidation을 delivery adapter에 통지
+    // 입력: 없음
+    // 출력: 없음
+    void previewComparisonStateChanged();
+
+    // 목적: 기본 Develop 비교의 accepted request identity를 별도로 통지
+    // 입력: requestId: owner가 발급한 비교 request identity
+    // 출력: 없음
+    void previewComparisonStarted(types::RequestId requestId);
+
+    // 목적: 현재 비교 요청에 속하는 frame만 delivery adapter에 전달
+    // 입력: result: 사진·source·viewport가 검증된 비교 frame
+    // 출력: 없음
+    void previewComparisonUpdated(const PreviewResult& result);
+
+    // 목적: 비교 frame이 유효해도 남길 수 있는 pipeline warning 전달
+    // 입력: issue: 비교 request의 diagnostic issue
+    // 출력: 없음
+    void previewComparisonWarning(const PreviewIssue& issue);
+
+    // 목적: accepted 비교 요청의 정상 terminal을 한 번 전달
+    // 입력: requestId: 완료된 비교 request identity
+    // 출력: 없음
+    void previewComparisonCompleted(types::RequestId requestId);
+
+    // 목적: accepted 비교 요청의 실패 terminal을 일반 Preview와 분리
+    // 입력: issue: 실패한 비교 request와 error
+    // 출력: 없음
+    void previewComparisonFailed(const PreviewIssue& issue);
+
+    // 목적: accepted 비교 요청의 취소 terminal을 한 번 전달
+    // 입력: requestId: 취소된 비교 request identity
+    // 출력: 없음
+    void previewComparisonCancelled(types::RequestId requestId);
+
 private:
     // 목적: 공통 timer와 preview event 연결을 먼저 구성하는 delegating constructor
     // 입력: previewOrchestrator: preview request 실행자, parent: Qt 부모 object
     // 출력: public catalog-backed constructor가 완성할 내부 EditorOrchestrator 객체
     explicit EditorOrchestrator(PreviewOrchestrator& previewOrchestrator, QObject* parent);
+
+    // 목적: Preview worker 결과를 일반 Preview와 기본 Develop 비교 owner로 분리
+    // 입력: 없음
+    // 출력: 비교 frame·warning·terminal signal 연결
+    void connectPreviewComparisonSignals();
 
     enum class PreviewTiming
     {
@@ -265,6 +319,16 @@ private:
     // 출력: adapter에 전달 가능한 현재 결과이면 true
     [[nodiscard]] bool isCurrentPreview(const PreviewResult& result) const;
 
+    // 목적: 늦은 비교 frame이 아직 같은 session·source·viewport의 요청인지 확인
+    // 입력: result: worker가 완료한 비교 Preview frame
+    // 출력: 현재 비교 요청과 모든 캡처 identity가 일치하면 true
+    [[nodiscard]] bool isCurrentComparison(const PreviewResult& result) const;
+
+    // 목적: 현재 비교 요청을 취소하고 보유한 identity와 활성 상태 정리
+    // 입력: 없음
+    // 출력: accepted 요청이 있었으면 Cancelled terminal과 상태 변경 signal
+    void clearPreviewComparison();
+
     // 목적: 현재 선택 PhotoId의 background source binding transition을 editor state에 반영
     // 입력: update: 완료된 fingerprint request와 갱신된 catalog photo
     // 출력: processing availability와 필요 시 progressive preview 갱신
@@ -297,6 +361,13 @@ private:
     PreviewProgression m_previewProgression{PreviewProgression::Progressive};
     PreviewRenderMode m_previewRenderMode{PreviewRenderMode::Final};
     types::RequestId m_activePreviewRequestId{0};
+    types::RequestId m_comparisonRequestId{0};
+    types::DevelopRevision m_comparisonCapturedRevision{0};
+    types::PreviewSequence m_comparisonCapturedSequence{0};
+    QString m_comparisonSessionKey;
+    QString m_comparisonSourcePath;
+    QSize m_comparisonTargetSize;
+    bool m_comparisonEnabled{false};
     types::PreviewSequence m_previewSequence{0};
     bool m_editInProgress{false};
     bool m_editPreviewChanged{false};

@@ -118,25 +118,36 @@ using OpenRawFileResult = types::Result<std::unique_ptr<LibRaw>, types::CoreErro
     }
 }
 
-// 목적: LibRaw flip 값을 Flexraw preview orientation으로 변환
-// 입력: flip: LibRaw의 0/3/5/6 또는 degree orientation 값
-// 출력: 대응하는 RawPreviewOrientation 값
-[[nodiscard]] RawPreviewOrientation toRawPreviewOrientation(int flip)
+// 목적: neutral RAW decode 오류를 기존 CoreError contract로 projection
+// 입력: error: Qt와 LibRaw detail을 노출하지 않는 neutral decode 오류
+// 출력: 기존 caller가 처리하는 CoreError code와 diagnostic message
+[[nodiscard]] types::CoreError projectRawDecodeError(const RawDecodeError& error)
 {
-    switch (flip)
+    switch (error.code)
     {
-    case 3:
-    case 180:
-        return RawPreviewOrientation::Rotate180;
-    case 5:
-    case 270:
-        return RawPreviewOrientation::Rotate90CounterClockwise;
-    case 6:
-    case 90:
-        return RawPreviewOrientation::Rotate90Clockwise;
-    default:
-        return RawPreviewOrientation::AsDecoded;
+    case RawDecodeErrorCode::InvalidPath:
+        return types::CoreError{types::ErrorCode::InvalidArgument, QStringLiteral("RAW file path is invalid.")};
+    case RawDecodeErrorCode::UnsupportedFormat:
+        return types::CoreError{types::ErrorCode::UnsupportedFormat,
+                                QStringLiteral("File is not a supported RAW source.")};
+    case RawDecodeErrorCode::OpenFailed:
+        return types::CoreError{types::ErrorCode::DecodeFailed, QStringLiteral("Unable to open RAW image.")};
+    case RawDecodeErrorCode::UnpackFailed:
+        return types::CoreError{types::ErrorCode::DecodeFailed, QStringLiteral("Unable to unpack RAW image.")};
+    case RawDecodeErrorCode::ProcessFailed:
+        return types::CoreError{types::ErrorCode::DecodeFailed, QStringLiteral("Unable to process RAW image.")};
+    case RawDecodeErrorCode::OutputCreationFailed:
+        return types::CoreError{types::ErrorCode::DecodeFailed,
+                                QStringLiteral("Unable to create processed RAW image.")};
+    case RawDecodeErrorCode::UnsupportedLayout:
+        return types::CoreError{types::ErrorCode::DecodeFailed,
+                                QStringLiteral("Processed RAW image format is unsupported.")};
+    case RawDecodeErrorCode::UnsupportedGeometry:
+        return types::CoreError{types::ErrorCode::DecodeFailed,
+                                QStringLiteral("Processed RAW image geometry is invalid.")};
     }
+
+    return types::CoreError{types::ErrorCode::DecodeFailed, QStringLiteral("Unable to decode RAW image.")};
 }
 
 // 목적: embedded thumbnail이 90도 orientation을 pixel 크기에 이미 반영했는지 확인
@@ -176,7 +187,7 @@ using OpenRawFileResult = types::Result<std::unique_ptr<LibRaw>, types::CoreErro
         }
     }
 
-    const RawPreviewOrientation orientation = toRawPreviewOrientation(selectedFlip);
+    const RawPreviewOrientation orientation = rawOrientationFromSourceFlip(selectedFlip);
     const bool quarterTurn = orientation == RawPreviewOrientation::Rotate90CounterClockwise ||
                              orientation == RawPreviewOrientation::Rotate90Clockwise;
 
@@ -287,102 +298,35 @@ RawPreviewImageResult decodeRawPreviewImage(const QString& filePath)
         return RawPreviewImageResult::failure(validatedFile.error());
     }
 
-    OpenRawFileResult openedFile = openRawFile(validatedFile.value());
-
-    if (openedFile.hasError())
+    RawDecodeResult decodedRaster = decodeRawRaster8(validatedFile.value().filesystemAbsoluteFilePath());
+    if (decodedRaster.hasError())
     {
-        return RawPreviewImageResult::failure(openedFile.error());
+        return RawPreviewImageResult::failure(projectRawDecodeError(decodedRaster.error()));
     }
 
-    LibRaw& decoder = *openedFile.value();
-    // Develop pipeline의 As Shot와 sRGB 전제에 맞도록 LibRaw output contract를 명시한다.
-    decoder.imgdata.params.output_bps = 8;
-    decoder.imgdata.params.output_color = 1;
-    decoder.imgdata.params.use_camera_wb = 1;
-    decoder.imgdata.params.gamm[0] = 1.0 / 2.4;
-    decoder.imgdata.params.gamm[1] = 12.92;
-
-    int status = decoder.unpack();
-
-    if (status != LIBRAW_SUCCESS)
-    {
-        return RawPreviewImageResult::failure(makeLibRawError(status, QStringLiteral("Unable to unpack RAW image")));
-    }
-
-    const int decodedWidth = decoder.imgdata.sizes.width;
-    const int decodedHeight = decoder.imgdata.sizes.height;
-    const int sourceFlip = decoder.imgdata.sizes.flip;
-
-    status = decoder.dcraw_process();
-
-    if (status != LIBRAW_SUCCESS)
-    {
-        return RawPreviewImageResult::failure(makeLibRawError(status, QStringLiteral("Unable to process RAW image")));
-    }
-
-    libraw_processed_image_t* processedImage = decoder.dcraw_make_mem_image(&status);
-
-    if (status != LIBRAW_SUCCESS)
-    {
-        if (processedImage != nullptr)
-        {
-            LibRaw::dcraw_clear_mem(processedImage);
-        }
-
-        return RawPreviewImageResult::failure(
-            makeLibRawError(status, QStringLiteral("Unable to create processed RAW image")));
-    }
-
-    if (processedImage == nullptr)
-    {
-        return RawPreviewImageResult::failure(types::CoreError{
-            types::ErrorCode::DecodeFailed,
-            QStringLiteral("Processed RAW image buffer is unavailable."),
-        });
-    }
-
-    if (processedImage->type != LIBRAW_IMAGE_BITMAP)
-    {
-        LibRaw::dcraw_clear_mem(processedImage);
-        return RawPreviewImageResult::failure(types::CoreError{
-            types::ErrorCode::DecodeFailed,
-            QStringLiteral("Processed RAW image format is unsupported."),
-        });
-    }
-
-    RawPreviewOrientation orientation = RawPreviewOrientation::AsDecoded;
-    const bool outputRemainsUnrotated =
-        processedImage->width == decodedWidth && processedImage->height == decodedHeight;
+    const RawDecodeObservation observation = decodedRaster.value().observation();
+    const RawPreviewOrientation pendingOrientation = decodedRaster.value().pendingOrientation();
+    const bool outputRemainsUnrotated = observation.processedWidth == observation.decodedWidth &&
+                                        observation.processedHeight == observation.decodedHeight;
     LOG_DEBUG("raw",
               "RAW decode: flip={}, decoded={}x{}, processed={}x{}, remainsUnrotated={}",
-              sourceFlip,
-              decodedWidth,
-              decodedHeight,
-              processedImage->width,
-              processedImage->height,
+              observation.sourceFlip,
+              observation.decodedWidth,
+              observation.decodedHeight,
+              observation.processedWidth,
+              observation.processedHeight,
               outputRemainsUnrotated);
-    if (outputRemainsUnrotated)
-    {
-        orientation = toRawPreviewOrientation(sourceFlip);
-    }
 
     RawPreviewImage result{
-        QByteArray(reinterpret_cast<const char*>(processedImage->data),
-                   static_cast<qsizetype>(processedImage->data_size)),
-        processedImage->width,
-        processedImage->height,
-        processedImage->colors,
-        processedImage->bits,
-        orientation,
+        std::move(decodedRaster.value()),
         RawDecodeDiagnostics{
             validatedFile.value().absoluteFilePath(),
-            sourceFlip,
-            QSize(decodedWidth, decodedHeight),
-            QSize(processedImage->width, processedImage->height),
-            orientation,
+            observation.sourceFlip,
+            QSize(static_cast<int>(observation.decodedWidth), static_cast<int>(observation.decodedHeight)),
+            QSize(static_cast<int>(observation.processedWidth), static_cast<int>(observation.processedHeight)),
+            pendingOrientation,
         },
     };
-    LibRaw::dcraw_clear_mem(processedImage);
 
     return RawPreviewImageResult::success(std::move(result));
 }

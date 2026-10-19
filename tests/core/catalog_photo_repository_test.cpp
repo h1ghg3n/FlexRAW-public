@@ -287,9 +287,220 @@ TEST_F(CatalogPhotoRepositoryTest, RejectsUnboundedOrInvalidPageRequests)
     const CatalogPhotoQueryResult mismatchedScope = repository.queryPage(request);
     ASSERT_TRUE(mismatchedScope.hasError());
     EXPECT_EQ(types::ErrorCode::InvalidArgument, mismatchedScope.error().code);
+
+    request.cursor.reset();
+    request.exactFolderPath.reset();
+    request.cullingFilter = static_cast<CatalogCullingFilter>(255);
+    const CatalogPhotoQueryResult invalidFilter = repository.queryPage(request);
+    ASSERT_TRUE(invalidFilter.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, invalidFilter.error().code);
+
+    request.cullingFilter = CatalogCullingFilter::All;
+    request.inclusionFilter = static_cast<CatalogInclusionFilter>(255);
+    const CatalogPhotoQueryResult invalidInclusionFilter = repository.queryPage(request);
+    ASSERT_TRUE(invalidInclusionFilter.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, invalidInclusionFilter.error().code);
 }
 
-TEST_F(CatalogPhotoRepositoryTest, UpdatesExistingPhotoByPath)
+TEST_F(CatalogPhotoRepositoryTest, PersistsCullingAndFiltersScopedBidirectionalPages)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    ASSERT_TRUE(repository
+                    .upsert({makeEntry(QStringLiteral("C:/photos/session/alpha.jpg"),
+                                       QStringLiteral("alpha.jpg"),
+                                       types::SupportedFileKind::RasterImage),
+                             makeEntry(QStringLiteral("C:/photos/session/beta.jpg"),
+                                       QStringLiteral("beta.jpg"),
+                                       types::SupportedFileKind::RasterImage),
+                             makeEntry(QStringLiteral("C:/photos/other/gamma.jpg"),
+                                       QStringLiteral("gamma.jpg"),
+                                       types::SupportedFileKind::RasterImage)})
+                    .hasValue());
+    const CatalogPhotoQueryResult allPhotos = repository.queryPage({});
+    ASSERT_TRUE(allPhotos.hasValue());
+    ASSERT_EQ(3, allPhotos.value().photos.size());
+    const types::PhotoId alphaId = allPhotos.value().photos[0].id;
+    const types::PhotoId betaId = allPhotos.value().photos[1].id;
+    EXPECT_EQ(CatalogCullingState::Neutral, allPhotos.value().photos[0].cullingState);
+
+    const CatalogCullingMutationResult updated =
+        repository.setCullingState({betaId, alphaId, betaId}, CatalogCullingState::Pick);
+    ASSERT_TRUE(updated.hasValue());
+    ASSERT_EQ(2, updated.value().size());
+    EXPECT_EQ(alphaId.value, updated.value()[0].value);
+    EXPECT_EQ(betaId.value, updated.value()[1].value);
+
+    CatalogPhotoPageRequest request;
+    request.pageSize = 1;
+    request.exactFolderPath = QStringLiteral("C:/photos/session");
+    request.cullingFilter = CatalogCullingFilter::Pick;
+    const CatalogPhotoQueryResult first = repository.queryPage(request);
+    ASSERT_TRUE(first.hasValue());
+    ASSERT_EQ(1, first.value().photos.size());
+    EXPECT_EQ(QStringLiteral("alpha.jpg"), first.value().photos.front().displayName);
+    EXPECT_EQ(CatalogCullingState::Pick, first.value().photos.front().cullingState);
+    ASSERT_TRUE(first.value().nextCursor.has_value());
+    EXPECT_EQ(CatalogCullingFilter::Pick, first.value().nextCursor->cullingFilter);
+
+    request.cursor = first.value().nextCursor;
+    const CatalogPhotoQueryResult second = repository.queryPage(request);
+    ASSERT_TRUE(second.hasValue());
+    ASSERT_EQ(1, second.value().photos.size());
+    EXPECT_EQ(QStringLiteral("beta.jpg"), second.value().photos.front().displayName);
+    ASSERT_TRUE(second.value().previousCursor.has_value());
+
+    request.direction = CatalogPhotoPageDirection::Backward;
+    request.cursor = second.value().previousCursor;
+    const CatalogPhotoQueryResult firstAgain = repository.queryPage(request);
+    ASSERT_TRUE(firstAgain.hasValue());
+    ASSERT_EQ(1, firstAgain.value().photos.size());
+    EXPECT_EQ(QStringLiteral("alpha.jpg"), firstAgain.value().photos.front().displayName);
+
+    request.direction = CatalogPhotoPageDirection::Forward;
+    request.cursor = first.value().nextCursor;
+    request.cullingFilter = CatalogCullingFilter::Reject;
+    const CatalogPhotoQueryResult mismatchedFilter = repository.queryPage(request);
+    ASSERT_TRUE(mismatchedFilter.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, mismatchedFilter.error().code);
+}
+
+TEST_F(CatalogPhotoRepositoryTest, RollsBackCullingBatchWhenAnyPhotoIsMissing)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    ASSERT_TRUE(repository
+                    .upsert({makeEntry(QStringLiteral("C:/photos/first.jpg"),
+                                       QStringLiteral("first.jpg"),
+                                       types::SupportedFileKind::RasterImage)})
+                    .hasValue());
+    const CatalogPhotoQueryResult photos = repository.queryPage({});
+    ASSERT_TRUE(photos.hasValue());
+    ASSERT_EQ(1, photos.value().photos.size());
+    const types::PhotoId photoId = photos.value().photos.front().id;
+    ASSERT_TRUE(repository.setCullingState({photoId}, CatalogCullingState::Pick).hasValue());
+
+    const CatalogCullingMutationResult failed =
+        repository.setCullingState({photoId, types::PhotoId{999999}}, CatalogCullingState::Reject);
+
+    ASSERT_TRUE(failed.hasError());
+    EXPECT_EQ(types::ErrorCode::NotFound, failed.error().code);
+    const CatalogPhotoRecordResult retained = repository.findById(photoId);
+    ASSERT_TRUE(retained.hasValue());
+    ASSERT_TRUE(retained.value().has_value());
+    EXPECT_EQ(CatalogCullingState::Pick, retained.value()->cullingState);
+    EXPECT_TRUE(repository.setCullingState({}, CatalogCullingState::Neutral).hasError());
+}
+
+TEST_F(CatalogPhotoRepositoryTest, PersistsInclusionAndCombinesItWithCullingAndFolderCounts)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    ASSERT_TRUE(repository
+                    .upsert({makeEntry(QStringLiteral("C:/photos/session/alpha.jpg"),
+                                       QStringLiteral("alpha.jpg"),
+                                       types::SupportedFileKind::RasterImage),
+                             makeEntry(QStringLiteral("C:/photos/session/beta.jpg"),
+                                       QStringLiteral("beta.jpg"),
+                                       types::SupportedFileKind::RasterImage),
+                             makeEntry(QStringLiteral("C:/photos/other/gamma.jpg"),
+                                       QStringLiteral("gamma.jpg"),
+                                       types::SupportedFileKind::RasterImage)})
+                    .hasValue());
+    const CatalogPhotoQueryResult allIncluded = repository.queryPage({});
+    ASSERT_TRUE(allIncluded.hasValue());
+    ASSERT_EQ(3, allIncluded.value().photos.size());
+    const types::PhotoId alphaId = allIncluded.value().photos[0].id;
+    const types::PhotoId betaId = allIncluded.value().photos[1].id;
+    const types::PhotoId gammaId = allIncluded.value().photos[2].id;
+    EXPECT_EQ(CatalogInclusionState::Included, allIncluded.value().photos[0].inclusionState);
+    ASSERT_TRUE(repository.setCullingState({betaId}, CatalogCullingState::Pick).hasValue());
+
+    const CatalogInclusionMutationResult excluded =
+        repository.setInclusionState({gammaId, betaId, gammaId}, CatalogInclusionState::Excluded);
+    ASSERT_TRUE(excluded.hasValue());
+    ASSERT_EQ(2, excluded.value().size());
+    EXPECT_EQ(betaId.value, excluded.value()[0].value);
+    EXPECT_EQ(gammaId.value, excluded.value()[1].value);
+
+    const CatalogPhotoQueryResult defaultPage = repository.queryPage({});
+    ASSERT_TRUE(defaultPage.hasValue());
+    ASSERT_EQ(1, defaultPage.value().photos.size());
+    EXPECT_EQ(alphaId.value, defaultPage.value().photos.front().id.value);
+
+    CatalogPhotoPageRequest excludedPicks;
+    excludedPicks.inclusionFilter = CatalogInclusionFilter::ExcludedOnly;
+    excludedPicks.cullingFilter = CatalogCullingFilter::Pick;
+    const CatalogPhotoQueryResult pickedPage = repository.queryPage(excludedPicks);
+    ASSERT_TRUE(pickedPage.hasValue());
+    ASSERT_EQ(1, pickedPage.value().photos.size());
+    EXPECT_EQ(betaId.value, pickedPage.value().photos.front().id.value);
+    EXPECT_EQ(CatalogInclusionState::Excluded, pickedPage.value().photos.front().inclusionState);
+    EXPECT_EQ(CatalogCullingState::Pick, pickedPage.value().photos.front().cullingState);
+
+    CatalogPhotoPageRequest excludedPage;
+    excludedPage.pageSize = 1;
+    excludedPage.inclusionFilter = CatalogInclusionFilter::ExcludedOnly;
+    const CatalogPhotoQueryResult firstExcluded = repository.queryPage(excludedPage);
+    ASSERT_TRUE(firstExcluded.hasValue());
+    ASSERT_TRUE(firstExcluded.value().nextCursor.has_value());
+    EXPECT_EQ(CatalogInclusionFilter::ExcludedOnly, firstExcluded.value().nextCursor->inclusionFilter);
+    excludedPage.cursor = firstExcluded.value().nextCursor;
+    excludedPage.inclusionFilter = CatalogInclusionFilter::IncludedOnly;
+    const CatalogPhotoQueryResult mismatchedFilter = repository.queryPage(excludedPage);
+    ASSERT_TRUE(mismatchedFilter.hasError());
+    EXPECT_EQ(types::ErrorCode::InvalidArgument, mismatchedFilter.error().code);
+
+    const CatalogFolderQueryResult folders = repository.queryFolders();
+    ASSERT_TRUE(folders.hasValue());
+    ASSERT_EQ(2, folders.value().size());
+    EXPECT_EQ(3, folders.value()[0].photoCount + folders.value()[1].photoCount);
+}
+
+TEST_F(CatalogPhotoRepositoryTest, RollsBackInclusionBatchWhenAnyPhotoIsMissing)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult database = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository repository(*database.value());
+    const QString sourcePath = QStringLiteral("C:/photos/excluded.jpg");
+    ASSERT_TRUE(
+        repository
+            .upsert({makeEntry(sourcePath, QStringLiteral("excluded.jpg"), types::SupportedFileKind::RasterImage)})
+            .hasValue());
+    const CatalogPhotoRecordResult initial = repository.findBySourcePath(sourcePath);
+    ASSERT_TRUE(initial.hasValue());
+    ASSERT_TRUE(initial.value().has_value());
+    const types::PhotoId photoId = initial.value()->id;
+    ASSERT_TRUE(repository.setInclusionState({photoId}, CatalogInclusionState::Excluded).hasValue());
+
+    const CatalogInclusionMutationResult failed =
+        repository.setInclusionState({photoId, types::PhotoId{999999}}, CatalogInclusionState::Included);
+
+    ASSERT_TRUE(failed.hasError());
+    EXPECT_EQ(types::ErrorCode::NotFound, failed.error().code);
+    const CatalogPhotoRecordResult retained = repository.findById(photoId);
+    ASSERT_TRUE(retained.hasValue());
+    ASSERT_TRUE(retained.value().has_value());
+    EXPECT_EQ(CatalogInclusionState::Excluded, retained.value()->inclusionState);
+    EXPECT_TRUE(repository.setInclusionState({}, CatalogInclusionState::Included).hasError());
+}
+
+TEST_F(CatalogPhotoRepositoryTest, UpdatesExistingPhotoByPathWithoutRestoringExclusion)
 {
     QTemporaryDir directory;
     ASSERT_TRUE(directory.isValid());
@@ -301,9 +512,15 @@ TEST_F(CatalogPhotoRepositoryTest, UpdatesExistingPhotoByPath)
 
     ASSERT_TRUE(repository.upsert({makeEntry(path, QStringLiteral("old.jpg"), types::SupportedFileKind::RasterImage)})
                     .hasValue());
+    const CatalogPhotoRecordResult initial = repository.findBySourcePath(path);
+    ASSERT_TRUE(initial.hasValue());
+    ASSERT_TRUE(initial.value().has_value());
+    ASSERT_TRUE(repository.setInclusionState({initial.value()->id}, CatalogInclusionState::Excluded).hasValue());
     const CatalogPhotoStoreResult updated =
         repository.upsert({makeEntry(path, QStringLiteral("renamed.jpg"), types::SupportedFileKind::RasterImage)});
-    const CatalogPhotoQueryResult listed = repository.queryPage(CatalogPhotoPageRequest{});
+    CatalogPhotoPageRequest excludedRequest;
+    excludedRequest.inclusionFilter = CatalogInclusionFilter::ExcludedOnly;
+    const CatalogPhotoQueryResult listed = repository.queryPage(excludedRequest);
 
     ASSERT_TRUE(updated.hasValue());
     EXPECT_EQ(1, updated.value());
@@ -315,6 +532,7 @@ TEST_F(CatalogPhotoRepositoryTest, UpdatesExistingPhotoByPath)
     ASSERT_TRUE(record.hasValue());
     ASSERT_TRUE(record.value().has_value());
     EXPECT_TRUE(types::isValidPhotoId(record.value()->id));
+    EXPECT_EQ(CatalogInclusionState::Excluded, record.value()->inclusionState);
 }
 
 TEST_F(CatalogPhotoRepositoryTest, RejectsIncompleteEntry)
@@ -459,6 +677,7 @@ TEST_F(CatalogPhotoRepositoryTest, RegistersReplacementWithNewIdAndLeavesOrigina
     originalParams.exposureEv = 1.0F;
     ASSERT_TRUE(developRepository.saveParams(originalId, originalParams).hasValue());
     ASSERT_TRUE(developRepository.appendHistory(originalId, originalParams).hasValue());
+    ASSERT_TRUE(repository.setInclusionState({originalId}, CatalogInclusionState::Excluded).hasValue());
     ASSERT_TRUE(repository.recordSourceState(originalId, SourceBindingState::ReplacementDetected).hasValue());
 
     const CatalogPhotoCreateResult registered =
@@ -472,11 +691,13 @@ TEST_F(CatalogPhotoRepositoryTest, RegistersReplacementWithNewIdAndLeavesOrigina
     ASSERT_TRUE(original.value().has_value());
     EXPECT_FALSE(original.value()->source.has_value());
     EXPECT_EQ(SourceBindingState::Unlinked, original.value()->sourceState);
+    EXPECT_EQ(CatalogInclusionState::Excluded, original.value()->inclusionState);
     EXPECT_EQ(originalFingerprint.sha256, original.value()->fingerprint.sha256);
     ASSERT_TRUE(replacement.hasValue());
     ASSERT_TRUE(replacement.value().has_value());
     EXPECT_EQ(registered.value().value, replacement.value()->id.value);
     EXPECT_EQ(SourceBindingState::Available, replacement.value()->sourceState);
+    EXPECT_EQ(CatalogInclusionState::Included, replacement.value()->inclusionState);
     const CatalogDevelopParamsResult preservedParams = developRepository.loadParams(originalId);
     const CatalogDevelopHistoryResult preservedHistory = developRepository.listHistory(originalId);
     const CatalogDevelopParamsResult newParams = developRepository.loadParams(registered.value());

@@ -1,10 +1,12 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
+#include <QTabWidget>
 #include <QTemporaryDir>
 
 #include <gtest/gtest.h>
@@ -63,6 +65,42 @@ TEST(SettingsDialogTest, LoadsAndSavesAcceptedAdjustmentStyle)
 
     EXPECT_EQ(QDialog::Accepted, dialog.result());
     EXPECT_EQ(editor::AdjustmentControlStyle::Classic, EditorSettings(storage).loadAdjustmentControlStyle());
+}
+
+TEST(SettingsDialogTest, PresentsReleaseInformationAndRestoresLastPage)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    QSettings storage(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    QtWorkerProfileSettingsAdapter workerProfiles(storage);
+    QtExportSettingsAdapter exportDefaults(storage);
+    {
+        SettingsDialog dialog(storage, workerProfiles, exportDefaults);
+        QTabWidget* tabs = dialog.findChild<QTabWidget*>(QStringLiteral("settingsTabs"));
+        QLabel* workerSaveBehavior = dialog.findChild<QLabel*>(QStringLiteral("workerProfileSaveBehaviorLabel"));
+        ASSERT_NE(nullptr, tabs);
+        ASSERT_NE(nullptr, workerSaveBehavior);
+        EXPECT_TRUE(workerSaveBehavior->text().contains(QStringLiteral("immediately"), Qt::CaseInsensitive));
+
+        int workerPageIndex = -1;
+        for (int index = 0; index < tabs->count(); ++index)
+        {
+            if (tabs->widget(index)->objectName() == QStringLiteral("workerProfilesPage"))
+            {
+                workerPageIndex = index;
+                break;
+            }
+        }
+        ASSERT_GE(workerPageIndex, 0);
+        tabs->setCurrentIndex(workerPageIndex);
+        dialog.reject();
+    }
+
+    SettingsDialog restoredDialog(storage, workerProfiles, exportDefaults);
+    QTabWidget* restoredTabs = restoredDialog.findChild<QTabWidget*>(QStringLiteral("settingsTabs"));
+    ASSERT_NE(nullptr, restoredTabs);
+    ASSERT_NE(nullptr, restoredTabs->currentWidget());
+    EXPECT_EQ(QStringLiteral("workerProfilesPage"), restoredTabs->currentWidget()->objectName());
 }
 
 TEST(SettingsDialogTest, CreatesWorkerProfileThroughQtFreeClient)

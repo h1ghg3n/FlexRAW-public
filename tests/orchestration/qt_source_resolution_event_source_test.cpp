@@ -106,6 +106,16 @@ TEST(QtSourceResolutionEventSourceTest, PublishesBaselineAcceptedUpdateAndExactC
 
     ASSERT_TRUE(imported.hasValue());
     ASSERT_EQ(1, imported.value().fingerprintRequestIds.size());
+    const core::client::CatalogCullingResult picked =
+        orchestrator.setCatalogCulling({catalogPath.toUtf8().toStdString(),
+                                        core::client::CatalogCullingState::Pick,
+                                        {{imported.value().photoIds.front().value}}});
+    ASSERT_TRUE(picked.hasValue());
+    const core::client::CatalogInclusionResult excluded =
+        orchestrator.setCatalogInclusion({catalogPath.toUtf8().toStdString(),
+                                          core::client::CatalogInclusionState::Excluded,
+                                          {{imported.value().photoIds.front().value}}});
+    ASSERT_TRUE(excluded.hasValue());
     const core::client::SourceRequestId requestId{imported.value().fingerprintRequestIds.front()};
     ASSERT_TRUE(waitForCondition([&events, requestId] { return hasTerminal(events, requestId); }));
     EXPECT_FALSE(reenteredSubscribe);
@@ -125,6 +135,8 @@ TEST(QtSourceResolutionEventSourceTest, PublishesBaselineAcceptedUpdateAndExactC
     EXPECT_EQ(sourcePath.toUtf8().toStdString(), accepted->accepted->sourceLocator);
     ASSERT_TRUE(completed->update.has_value());
     EXPECT_EQ(core::client::CatalogSourceState::Available, completed->update->photo.sourceState);
+    EXPECT_EQ(core::client::CatalogCullingState::Pick, completed->update->photo.cullingState);
+    EXPECT_EQ(core::client::CatalogInclusionState::Excluded, completed->update->photo.inclusionState);
     EXPECT_EQ(core::types::Sha256DigestSize,
               static_cast<qsizetype>(completed->update->photo.fingerprint.sha256.size()));
     EXPECT_EQ(core::client::SourceResolutionTerminalState::Completed, completed->terminal->state);

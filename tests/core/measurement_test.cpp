@@ -1,4 +1,6 @@
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <latch>
 #include <sstream>
 #include <string>
@@ -8,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include "high_water_counter.h"
+#include "image_regression.h"
 #include "measurement_csv.h"
 #include "stage_timer.h"
 
@@ -95,6 +98,44 @@ TEST(MeasurementCsvTest, WritesStableSchemaAndEscapesTextFields)
               "output_ns,pipeline_total_ns,end_to_end_ns\n"
               "2,run-1,cpu-develop,windows-x64,\"sample,\"\"edited\"\".jpg\",6000,4000,1,3,1,,2,1,11,12,13,"
               "14,50,55\n");
+}
+
+TEST(ImageRegressionTest, MeasuresRgbDifferenceAndIgnoresAlpha)
+{
+    const std::vector<std::uint8_t> reference{10, 20, 30, 0, 100, 110, 120, 1};
+    const std::vector<std::uint8_t> candidate{13, 18, 30, 255, 100, 115, 112, 254};
+
+    const std::optional<Rgba8DifferenceMetrics> metrics = measureRgba8Difference(reference, candidate);
+
+    ASSERT_TRUE(metrics.has_value());
+    EXPECT_EQ(metrics->comparedPixelCount, 2U);
+    EXPECT_DOUBLE_EQ(metrics->meanAbsoluteError, 3.0);
+    EXPECT_NEAR(metrics->rootMeanSquareError, std::sqrt(17.0), 0.000001);
+    EXPECT_NEAR(metrics->peakSignalToNoiseRatioDb, 35.826314, 0.000001);
+    EXPECT_EQ(metrics->maximumAbsoluteError, 8U);
+}
+
+TEST(ImageRegressionTest, ReportsInfinitePsnrForIdenticalRgb)
+{
+    const std::vector<std::uint8_t> reference{10, 20, 30, 0};
+    const std::vector<std::uint8_t> candidate{10, 20, 30, 255};
+
+    const std::optional<Rgba8DifferenceMetrics> metrics = measureRgba8Difference(reference, candidate);
+
+    ASSERT_TRUE(metrics.has_value());
+    EXPECT_DOUBLE_EQ(metrics->rootMeanSquareError, 0.0);
+    EXPECT_TRUE(std::isinf(metrics->peakSignalToNoiseRatioDb));
+    EXPECT_EQ(metrics->maximumAbsoluteError, 0U);
+}
+
+TEST(ImageRegressionTest, RejectsEmptyMismatchedOrIncompleteBuffers)
+{
+    EXPECT_FALSE(measureRgba8Difference({}, {}).has_value());
+    EXPECT_FALSE(
+        measureRgba8Difference(std::vector<std::uint8_t>{0, 0, 0, 0}, std::vector<std::uint8_t>{0, 0, 0, 0, 0, 0, 0, 0})
+            .has_value());
+    EXPECT_FALSE(
+        measureRgba8Difference(std::vector<std::uint8_t>{0, 0, 0}, std::vector<std::uint8_t>{0, 0, 0}).has_value());
 }
 
 }  // namespace

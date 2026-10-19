@@ -82,6 +82,38 @@ namespace
     return core::catalog::SourceBindingState::FingerprintPending;
 }
 
+// 목적: Qt-free Catalog 선별 상태를 기존 Qt presentation enum으로 변환
+// 입력: state: client snapshot의 persisted 선별 상태
+// 출력: 같은 의미의 internal Catalog enum
+[[nodiscard]] core::catalog::CatalogCullingState toCullingState(core::client::CatalogCullingState state) noexcept
+{
+    switch (state)
+    {
+    case core::client::CatalogCullingState::Neutral:
+        return core::catalog::CatalogCullingState::Neutral;
+    case core::client::CatalogCullingState::Pick:
+        return core::catalog::CatalogCullingState::Pick;
+    case core::client::CatalogCullingState::Reject:
+        return core::catalog::CatalogCullingState::Reject;
+    }
+    return core::catalog::CatalogCullingState::Neutral;
+}
+
+// 목적: Qt-free Catalog 등록 포함 상태를 기존 Qt presentation enum으로 변환
+// 입력: state: client snapshot의 persisted 등록 포함 상태
+// 출력: 같은 의미의 internal Catalog enum
+[[nodiscard]] core::catalog::CatalogInclusionState toInclusionState(core::client::CatalogInclusionState state) noexcept
+{
+    switch (state)
+    {
+    case core::client::CatalogInclusionState::Included:
+        return core::catalog::CatalogInclusionState::Included;
+    case core::client::CatalogInclusionState::Excluded:
+        return core::catalog::CatalogInclusionState::Excluded;
+    }
+    return core::catalog::CatalogInclusionState::Included;
+}
+
 // 목적: Qt-free fingerprint byte vector를 기존 source identity value로 변환
 // 입력: fingerprint: fixed-width metadata와 optional SHA-256 bytes
 // 출력: 같은 metadata와 owned QByteArray
@@ -118,6 +150,8 @@ core::catalog::CatalogPhotoRecord toCatalogPhotoRecord(const core::client::Catal
         toScanStatus(snapshot.scanStatus),
         toFingerprint(snapshot.fingerprint),
         toSourceState(snapshot.sourceState),
+        toCullingState(snapshot.cullingState),
+        toInclusionState(snapshot.inclusionState),
     };
 }
 

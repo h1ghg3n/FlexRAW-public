@@ -3,6 +3,8 @@
 add_library(flexraw_core_orchestration STATIC)
 
 target_sources(flexraw_core_orchestration PRIVATE
+    compute_permit_pool.cpp
+    compute_permit_pool.h
     catalog_contracts.h
     catalog_orchestrator.cpp
     catalog_orchestrator.h

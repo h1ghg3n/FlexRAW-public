@@ -641,6 +641,149 @@ TEST(CatalogOrchestratorTest, PersistsProjectUseCasesAndProjectScopedPhotoPages)
     EXPECT_EQ(2, retainedPhotos.value().photos.size());
 }
 
+TEST(CatalogOrchestratorTest, AppliesQtFreeCullingBatchAndFiltersProjectPages)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstPath = QDir(directory.path()).filePath(QStringLiteral("first.jpg"));
+    const QString secondPath = QDir(directory.path()).filePath(QStringLiteral("second.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("culling.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(firstPath, QByteArray("first-culling-source")));
+    ASSERT_TRUE(writeSourceFile(secondPath, QByteArray("second-culling-source")));
+    CatalogOrchestrator orchestrator;
+    client::ICatalogCullingClient& cullingClient = orchestrator;
+
+    const client::CatalogCullingResult closed =
+        cullingClient.setCatalogCulling({catalogPath.toUtf8().toStdString(), client::CatalogCullingState::Pick, {{1}}});
+    ASSERT_TRUE(closed.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closed.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogImportResult imported = orchestrator.importFolder(directory.path());
+    ASSERT_TRUE(imported.hasValue());
+    ASSERT_EQ(2, imported.value().photoIds.size());
+    const CatalogProjectResult project = orchestrator.createProject(QStringLiteral("Culling"));
+    ASSERT_TRUE(project.hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(project.value().id, imported.value().photoIds[0]).hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(project.value().id, imported.value().photoIds[1]).hasValue());
+
+    const client::ClientPhotoId firstId{imported.value().photoIds[0].value};
+    const client::ClientPhotoId secondId{imported.value().photoIds[1].value};
+    const client::CatalogCullingResult picked = cullingClient.setCatalogCulling(
+        {catalogPath.toUtf8().toStdString(), client::CatalogCullingState::Pick, {secondId, firstId, secondId}});
+    ASSERT_TRUE(picked.hasValue());
+    ASSERT_EQ(2U, picked.value().photoIds.size());
+    EXPECT_LT(picked.value().photoIds[0].value, picked.value().photoIds[1].value);
+    EXPECT_EQ(client::CatalogCullingState::Pick, picked.value().state);
+
+    client::CatalogPhotoPageRequest request;
+    request.pageSize = 1;
+    request.projectId = client::ClientProjectId{project.value().id.value};
+    request.cullingFilter = client::CatalogCullingFilter::Pick;
+    const client::CatalogPhotoPageResult firstPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(firstPage.hasValue());
+    ASSERT_EQ(1U, firstPage.value().photos.size());
+    EXPECT_EQ(client::CatalogCullingState::Pick, firstPage.value().photos.front().cullingState);
+    ASSERT_TRUE(firstPage.value().nextCursor.has_value());
+    EXPECT_EQ(client::CatalogCullingFilter::Pick, firstPage.value().nextCursor->cullingFilter);
+    request.cursor = firstPage.value().nextCursor;
+    const client::CatalogPhotoPageResult secondPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(secondPage.hasValue());
+    ASSERT_EQ(1U, secondPage.value().photos.size());
+
+    const client::CatalogCullingResult stale = cullingClient.setCatalogCulling(
+        {QDir(directory.path()).filePath(QStringLiteral("other.flexraw-catalog")).toUtf8().toStdString(),
+         client::CatalogCullingState::Reject,
+         {firstId}});
+    ASSERT_TRUE(stale.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, stale.error().code);
+
+    EXPECT_FALSE(orchestrator.closeCatalog().isOpen);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    request.cursor.reset();
+    const client::CatalogPhotoPageResult restored = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(restored.hasValue());
+    ASSERT_EQ(1U, restored.value().photos.size());
+    EXPECT_EQ(client::CatalogCullingState::Pick, restored.value().photos.front().cullingState);
+}
+
+TEST(CatalogOrchestratorTest, ExcludesAndRestoresQtFreeCatalogPhotosWithoutRemovingProjectMembership)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstPath = QDir(directory.path()).filePath(QStringLiteral("first.jpg"));
+    const QString secondPath = QDir(directory.path()).filePath(QStringLiteral("second.jpg"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("inclusion.flexraw-catalog"));
+    ASSERT_TRUE(writeSourceFile(firstPath, QByteArray("first-inclusion-source")));
+    ASSERT_TRUE(writeSourceFile(secondPath, QByteArray("second-inclusion-source")));
+    CatalogOrchestrator orchestrator;
+    client::ICatalogInclusionClient& inclusionClient = orchestrator;
+
+    const client::CatalogInclusionResult closed = inclusionClient.setCatalogInclusion(
+        {catalogPath.toUtf8().toStdString(), client::CatalogInclusionState::Excluded, {{1}}});
+    ASSERT_TRUE(closed.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, closed.error().code);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const CatalogImportResult imported = orchestrator.importFolder(directory.path());
+    ASSERT_TRUE(imported.hasValue());
+    ASSERT_EQ(2, imported.value().photoIds.size());
+    const CatalogProjectResult project = orchestrator.createProject(QStringLiteral("Inclusion"));
+    ASSERT_TRUE(project.hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(project.value().id, imported.value().photoIds[0]).hasValue());
+    ASSERT_TRUE(orchestrator.addPhotoToProject(project.value().id, imported.value().photoIds[1]).hasValue());
+
+    const client::ClientPhotoId firstId{imported.value().photoIds[0].value};
+    const client::ClientPhotoId secondId{imported.value().photoIds[1].value};
+    const client::CatalogInclusionResult excluded = inclusionClient.setCatalogInclusion(
+        {catalogPath.toUtf8().toStdString(), client::CatalogInclusionState::Excluded, {secondId, firstId, secondId}});
+    ASSERT_TRUE(excluded.hasValue());
+    ASSERT_EQ(2U, excluded.value().photoIds.size());
+    EXPECT_LT(excluded.value().photoIds[0].value, excluded.value().photoIds[1].value);
+    EXPECT_EQ(client::CatalogInclusionState::Excluded, excluded.value().state);
+    ASSERT_TRUE(inclusionClient
+                    .setCatalogInclusion(
+                        {catalogPath.toUtf8().toStdString(), client::CatalogInclusionState::Included, {firstId}})
+                    .hasValue());
+
+    client::CatalogPhotoPageRequest request;
+    request.projectId = client::ClientProjectId{project.value().id.value};
+    const client::CatalogPhotoPageResult includedPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(includedPage.hasValue());
+    ASSERT_EQ(1U, includedPage.value().photos.size());
+    EXPECT_EQ(firstId.value, includedPage.value().photos.front().id.value);
+    EXPECT_EQ(client::CatalogInclusionState::Included, includedPage.value().photos.front().inclusionState);
+
+    request.inclusionFilter = client::CatalogInclusionFilter::ExcludedOnly;
+    const client::CatalogPhotoPageResult excludedPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(excludedPage.hasValue());
+    ASSERT_EQ(1U, excludedPage.value().photos.size());
+    EXPECT_EQ(secondId.value, excludedPage.value().photos.front().id.value);
+    EXPECT_EQ(client::CatalogInclusionState::Excluded, excludedPage.value().photos.front().inclusionState);
+
+    const client::CatalogInclusionResult stale = inclusionClient.setCatalogInclusion(
+        {QDir(directory.path()).filePath(QStringLiteral("other.flexraw-catalog")).toUtf8().toStdString(),
+         client::CatalogInclusionState::Included,
+         {secondId}});
+    ASSERT_TRUE(stale.hasError());
+    EXPECT_EQ(client::ClientErrorCode::Conflict, stale.error().code);
+
+    EXPECT_FALSE(orchestrator.closeCatalog().isOpen);
+    ASSERT_TRUE(orchestrator.openCatalog(catalogPath).hasValue());
+    const client::CatalogPhotoPageResult restoredExcludedPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(restoredExcludedPage.hasValue());
+    ASSERT_EQ(1U, restoredExcludedPage.value().photos.size());
+    EXPECT_EQ(secondId.value, restoredExcludedPage.value().photos.front().id.value);
+    ASSERT_TRUE(inclusionClient
+                    .setCatalogInclusion(
+                        {catalogPath.toUtf8().toStdString(), client::CatalogInclusionState::Included, {secondId}})
+                    .hasValue());
+    request.inclusionFilter = client::CatalogInclusionFilter::IncludedOnly;
+    const client::CatalogPhotoPageResult restoredIncludedPage = orchestrator.queryPhotoPage(request);
+    ASSERT_TRUE(restoredIncludedPage.hasValue());
+    EXPECT_EQ(2U, restoredIncludedPage.value().photos.size());
+}
+
 TEST(CatalogOrchestratorTest, ProjectsQtFreeClientCommandsAndUtf8State)
 {
     (void)test::application();

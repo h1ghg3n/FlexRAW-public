@@ -15,6 +15,7 @@ param(
     [switch]$Worker,
     [switch]$Mcp,
     [switch]$Portable,
+    [switch]$Cli,
     [switch]$EnvironmentCheckOnly
 )
 
@@ -157,6 +158,12 @@ if ($Portable -and ($Benchmarks -or $Worker)) {
 if ($Portable -and $Configuration -ne 'Release') {
     throw '-Portable currently supports the Release configuration only.'
 }
+if ($Cli -and ($Benchmarks -or $Worker -or $Mcp -or $Portable)) {
+    throw '-Cli cannot be combined with -Benchmarks, -Worker, -Mcp, or -Portable.'
+}
+if ($Cli -and $Configuration -ne 'Release') {
+    throw '-Cli currently supports the Release configuration only.'
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $tempPath = Join-Path $repoRoot 'build\.tmp\msbuild'
@@ -198,6 +205,9 @@ elseif ($Mcp) {
 elseif ($Portable) {
     "windows-msvc-portable-contract-$configurationKey"
 }
+elseif ($Cli) {
+    "windows-msvc-cli-$configurationKey"
+}
 else {
     "windows-msvc-$configurationKey"
 }
@@ -212,6 +222,9 @@ elseif ($Mcp) {
 }
 elseif ($Portable) {
     "portable-contract-windows-$configurationKey"
+}
+elseif ($Cli) {
+    "cli-windows-$configurationKey"
 }
 else {
     $configurationKey

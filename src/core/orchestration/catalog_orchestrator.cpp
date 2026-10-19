@@ -33,6 +33,8 @@ using OptionalPhotoIdResult = types::Result<std::optional<types::PhotoId>, types
 
 static_assert(client::DefaultCatalogPhotoPageSize == catalog::DefaultCatalogPhotoPageSize);
 static_assert(client::MaximumCatalogPhotoPageSize == catalog::MaximumCatalogPhotoPageSize);
+static_assert(client::MaximumCatalogCullingBatchSize == catalog::MaximumCatalogCullingBatchSize);
+static_assert(client::MaximumCatalogInclusionBatchSize == catalog::MaximumCatalogInclusionBatchSize);
 
 // 목적: QString을 Qt-free client contract용 UTF-8 string으로 변환
 // 입력: value: Orchestration 또는 domain 문자열
@@ -149,6 +151,70 @@ template<typename Receipt>
     return client::CatalogSourceState::FingerprintPending;
 }
 
+// 목적: persisted Catalog 선별 상태를 Qt-free client enum으로 변환
+// 입력: state: repository가 검증한 Neutral·Pick·Reject 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] client::CatalogCullingState toClientCullingState(catalog::CatalogCullingState state) noexcept
+{
+    switch (state)
+    {
+    case catalog::CatalogCullingState::Neutral:
+        return client::CatalogCullingState::Neutral;
+    case catalog::CatalogCullingState::Pick:
+        return client::CatalogCullingState::Pick;
+    case catalog::CatalogCullingState::Reject:
+        return client::CatalogCullingState::Reject;
+    }
+    return client::CatalogCullingState::Neutral;
+}
+
+// 목적: Qt-free mutation target을 domain Catalog 선별 상태로 변환
+// 입력: state: caller가 전달한 client enum
+// 출력: 지원 상태면 domain enum, 알 수 없는 값이면 빈 값
+[[nodiscard]] std::optional<catalog::CatalogCullingState> toCatalogCullingState(client::CatalogCullingState state)
+{
+    switch (state)
+    {
+    case client::CatalogCullingState::Neutral:
+        return catalog::CatalogCullingState::Neutral;
+    case client::CatalogCullingState::Pick:
+        return catalog::CatalogCullingState::Pick;
+    case client::CatalogCullingState::Reject:
+        return catalog::CatalogCullingState::Reject;
+    }
+    return std::nullopt;
+}
+
+// 목적: persisted Catalog 등록 포함 상태를 Qt-free client enum으로 변환
+// 입력: state: repository가 검증한 Included·Excluded 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] client::CatalogInclusionState toClientInclusionState(catalog::CatalogInclusionState state) noexcept
+{
+    switch (state)
+    {
+    case catalog::CatalogInclusionState::Included:
+        return client::CatalogInclusionState::Included;
+    case catalog::CatalogInclusionState::Excluded:
+        return client::CatalogInclusionState::Excluded;
+    }
+    return client::CatalogInclusionState::Included;
+}
+
+// 목적: Qt-free mutation target을 domain Catalog 등록 포함 상태로 변환
+// 입력: state: caller가 전달한 client enum
+// 출력: 지원 상태면 domain enum, 알 수 없는 값이면 빈 값
+[[nodiscard]] std::optional<catalog::CatalogInclusionState> toCatalogInclusionState(client::CatalogInclusionState state)
+{
+    switch (state)
+    {
+    case client::CatalogInclusionState::Included:
+        return catalog::CatalogInclusionState::Included;
+    case client::CatalogInclusionState::Excluded:
+        return catalog::CatalogInclusionState::Excluded;
+    }
+    return std::nullopt;
+}
+
 // 목적: source fingerprint metadata와 optional SHA-256를 Qt-free snapshot으로 변환
 // 입력: fingerprint: Catalog에 저장된 source observation baseline
 // 출력: fixed-width metadata와 byte vector
@@ -183,6 +249,8 @@ template<typename Receipt>
     snapshot.scanStatus = toClientScanStatus(photo.scanStatus);
     snapshot.fingerprint = toClientFingerprint(photo.fingerprint);
     snapshot.sourceState = toClientSourceState(photo.sourceState);
+    snapshot.cullingState = toClientCullingState(photo.cullingState);
+    snapshot.inclusionState = toClientInclusionState(photo.inclusionState);
     return snapshot;
 }
 
@@ -202,6 +270,8 @@ template<typename Receipt>
     {
         snapshot.projectId = client::ClientProjectId{cursor.projectId->value};
     }
+    snapshot.cullingFilter = static_cast<client::CatalogCullingFilter>(cursor.cullingFilter);
+    snapshot.inclusionFilter = static_cast<client::CatalogInclusionFilter>(cursor.inclusionFilter);
     return snapshot;
 }
 
@@ -246,6 +316,8 @@ template<typename Receipt>
         {
             cursor.projectId = catalog::ProjectId{request.cursor->projectId->value};
         }
+        cursor.cullingFilter = static_cast<catalog::CatalogCullingFilter>(request.cursor->cullingFilter);
+        cursor.inclusionFilter = static_cast<catalog::CatalogInclusionFilter>(request.cursor->inclusionFilter);
         internal.cursor = std::move(cursor);
     }
     if (request.exactFolderPath.has_value())
@@ -256,6 +328,8 @@ template<typename Receipt>
     {
         internal.projectId = catalog::ProjectId{request.projectId->value};
     }
+    internal.cullingFilter = static_cast<catalog::CatalogCullingFilter>(request.cullingFilter);
+    internal.inclusionFilter = static_cast<catalog::CatalogInclusionFilter>(request.inclusionFilter);
     return internal;
 }
 
@@ -477,6 +551,121 @@ client::CatalogPhotoPageResult CatalogOrchestrator::queryPhotoPage(const client:
         return client::CatalogPhotoPageResult::failure(toClientError(page.error()));
     }
     return client::CatalogPhotoPageResult::success(toClientPhotoPage(page.value()));
+}
+
+// 목적: expected active Catalog의 stable Photo batch에 선별 상태 적용
+// 입력: command: Catalog path, target state와 중복 가능 Photo identity 목록
+// 출력: 정규화된 identity receipt 또는 validation·session·repository 오류
+client::CatalogCullingResult CatalogOrchestrator::setCatalogCulling(const client::SetCatalogCullingCommand& command)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return client::CatalogCullingResult::failure(toClientError(*error));
+    }
+
+    const std::optional<QString> expectedCatalogPath = decodeClientString(command.expectedCatalogPath);
+    if (!expectedCatalogPath.has_value() || expectedCatalogPath->isEmpty() ||
+        *expectedCatalogPath != expectedCatalogPath->trimmed())
+    {
+        return client::CatalogCullingResult::failure(
+            {client::ClientErrorCode::InvalidArgument,
+             "Expected Catalog path is empty, invalid UTF-8, or contains outer whitespace."});
+    }
+    if (!catalog::catalogPathsReferToSameFile(*expectedCatalogPath, m_database->catalogPath()))
+    {
+        return client::CatalogCullingResult::failure(
+            {client::ClientErrorCode::Conflict, "Active Catalog does not match the culling command baseline."});
+    }
+    if (command.photoIds.empty() || command.photoIds.size() > client::MaximumCatalogCullingBatchSize)
+    {
+        return client::CatalogCullingResult::failure(
+            {client::ClientErrorCode::InvalidArgument, "Catalog culling batch size is invalid."});
+    }
+    const std::optional<catalog::CatalogCullingState> state = toCatalogCullingState(command.state);
+    if (!state.has_value())
+    {
+        return client::CatalogCullingResult::failure(
+            {client::ClientErrorCode::InvalidArgument, "Catalog culling state is invalid."});
+    }
+
+    QVector<types::PhotoId> photoIds;
+    photoIds.reserve(static_cast<qsizetype>(command.photoIds.size()));
+    for (client::ClientPhotoId photoId : command.photoIds)
+    {
+        photoIds.push_back(types::PhotoId{photoId.value});
+    }
+    const catalog::CatalogCullingMutationResult updated = m_photoRepository->setCullingState(photoIds, *state);
+    if (updated.hasError())
+    {
+        return client::CatalogCullingResult::failure(toClientError(updated.error()));
+    }
+
+    client::CatalogCullingReceipt receipt;
+    receipt.state = command.state;
+    receipt.photoIds.reserve(static_cast<std::size_t>(updated.value().size()));
+    for (types::PhotoId photoId : updated.value())
+    {
+        receipt.photoIds.push_back(client::ClientPhotoId{photoId.value});
+    }
+    return client::CatalogCullingResult::success(std::move(receipt));
+}
+
+// 목적: expected active Catalog의 stable Photo batch에 등록 포함 상태 적용
+// 입력: command: Catalog path, target state와 중복 가능 Photo identity 목록
+// 출력: 정규화된 identity receipt 또는 validation·session·repository 오류
+client::CatalogInclusionResult CatalogOrchestrator::setCatalogInclusion(
+    const client::SetCatalogInclusionCommand& command)
+{
+    if (const std::optional<types::CoreError> error = requireOpenCatalog(); error.has_value())
+    {
+        return client::CatalogInclusionResult::failure(toClientError(*error));
+    }
+
+    const std::optional<QString> expectedCatalogPath = decodeClientString(command.expectedCatalogPath);
+    if (!expectedCatalogPath.has_value() || expectedCatalogPath->isEmpty() ||
+        *expectedCatalogPath != expectedCatalogPath->trimmed())
+    {
+        return client::CatalogInclusionResult::failure(
+            {client::ClientErrorCode::InvalidArgument,
+             "Expected Catalog path is empty, invalid UTF-8, or contains outer whitespace."});
+    }
+    if (!catalog::catalogPathsReferToSameFile(*expectedCatalogPath, m_database->catalogPath()))
+    {
+        return client::CatalogInclusionResult::failure(
+            {client::ClientErrorCode::Conflict, "Active Catalog does not match the inclusion command baseline."});
+    }
+    if (command.photoIds.empty() || command.photoIds.size() > client::MaximumCatalogInclusionBatchSize)
+    {
+        return client::CatalogInclusionResult::failure(
+            {client::ClientErrorCode::InvalidArgument, "Catalog inclusion batch size is invalid."});
+    }
+    const std::optional<catalog::CatalogInclusionState> state = toCatalogInclusionState(command.state);
+    if (!state.has_value())
+    {
+        return client::CatalogInclusionResult::failure(
+            {client::ClientErrorCode::InvalidArgument, "Catalog inclusion state is invalid."});
+    }
+
+    QVector<types::PhotoId> photoIds;
+    photoIds.reserve(static_cast<qsizetype>(command.photoIds.size()));
+    for (client::ClientPhotoId photoId : command.photoIds)
+    {
+        photoIds.push_back(types::PhotoId{photoId.value});
+    }
+    const catalog::CatalogInclusionMutationResult updated = m_photoRepository->setInclusionState(photoIds, *state);
+    if (updated.hasError())
+    {
+        return client::CatalogInclusionResult::failure(toClientError(updated.error()));
+    }
+
+    client::CatalogInclusionReceipt receipt;
+    receipt.state = command.state;
+    receipt.photoIds.reserve(static_cast<std::size_t>(updated.value().size()));
+    for (types::PhotoId photoId : updated.value())
+    {
+        receipt.photoIds.push_back(client::ClientPhotoId{photoId.value});
+    }
+    return client::CatalogInclusionResult::success(std::move(receipt));
 }
 
 // 목적: active Catalog에서 linked Photo가 존재하는 distinct Folder snapshot 조회

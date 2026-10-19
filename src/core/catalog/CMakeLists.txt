@@ -3,9 +3,13 @@
 add_library(flexraw_core_catalog STATIC)
 
 target_sources(flexraw_core_catalog PRIVATE
+    catalog_culling.h
+    catalog_inclusion.h
     catalog_entry.h
     catalog_database.cpp
     catalog_database.h
+    catalog_identity.cpp
+    catalog_identity.h
     catalog_develop_repository.cpp
     catalog_develop_repository.h
     catalog_folder_summary.h
@@ -41,10 +45,17 @@ qt_add_resources(flexraw_core_catalog catalog_migrations
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v6__add_develop_revision.sql"
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v7__add_source_parent_path.sql"
           "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v8__create_projects.sql"
+          "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v9__add_photo_culling.sql"
+          "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v10__add_photo_inclusion.sql"
+          "${PROJECT_SOURCE_DIR}/resources/sql/migrations/v11__add_catalog_identity.sql"
 )
 
 target_include_directories(flexraw_core_catalog PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(flexraw_core_catalog PRIVATE
+    FLEXRAW_VERSION_STRING="${FLEXRAW_VERSION_STRING}"
 )
 
 target_link_libraries(flexraw_core_catalog PUBLIC

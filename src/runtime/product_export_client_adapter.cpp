@@ -1,4 +1,4 @@
-#include "qt_export_client_adapter.h"
+#include "product_export_client_adapter.h"
 
 #include <algorithm>
 #include <limits>
@@ -17,7 +17,7 @@
 #include "export_contracts.h"
 #include "export_orchestrator.h"
 
-namespace flexraw::ui::export_
+namespace flexraw::runtime
 {
 namespace
 {
@@ -184,10 +184,10 @@ using ProjectedPlacementResult =
 }
 
 // 목적: profile identity를 현재 endpoint/storage snapshot으로 해석
-// 입력: placement: Local/Remote/Auto와 optional stable profile, profileClient: application settings resource
+// 입력: placement: Local/Remote/Auto와 optional stable profile, profileClient: optional application settings resource
 // 출력: existing placement option 또는 RemoteOnly profile 오류
 [[nodiscard]] ProjectedPlacementResult projectPlacement(const core::client::ExportPlacementOptions& placement,
-                                                        core::client::IWorkerProfileClient& profileClient)
+                                                        core::client::IWorkerProfileClient* profileClient)
 {
     core::orchestration::ExportPlacementOptions projected;
     switch (placement.policy)
@@ -213,7 +213,17 @@ using ProjectedPlacementResult =
             {core::client::ClientErrorCode::InvalidArgument, "Remote export requires a Worker profile identity."});
     }
 
-    const core::client::WorkerProfileListResult profiles = profileClient.listWorkerProfiles();
+    if (profileClient == nullptr)
+    {
+        if (placement.policy == core::client::ExportPlacementPolicy::Auto)
+        {
+            return ProjectedPlacementResult::success(std::move(projected));
+        }
+        return ProjectedPlacementResult::failure(
+            {core::client::ClientErrorCode::Conflict, "Worker profile resolution is unavailable."});
+    }
+
+    const core::client::WorkerProfileListResult profiles = profileClient->listWorkerProfiles();
     if (profiles.hasError())
     {
         if (placement.policy == core::client::ExportPlacementPolicy::Auto)
@@ -331,7 +341,7 @@ using ProjectedPlacementResult =
 
 }  // namespace
 
-struct QtExportClientAdapter::SubscriptionState
+struct ProductExportClientAdapter::SubscriptionState
 {
     // 목적: queued event와 이후 callback 전달을 idempotent하게 차단
     // 입력: 없음
@@ -357,7 +367,7 @@ struct QtExportClientAdapter::SubscriptionState
     core::client::ExportCallback callback;
 };
 
-class QtExportClientAdapter::Subscription final : public core::client::IExportSubscription
+class ProductExportClientAdapter::Subscription final : public core::client::IExportSubscription
 {
 public:
     // 목적: public handle과 shared Export delivery state 연결
@@ -396,44 +406,61 @@ private:
 // 목적: application-scoped Export owner와 Worker profile resource를 Qt-free product surface에 연결
 // 입력: orchestrator: scheduling/terminal authority, workerProfileClient: endpoint resolution source, parent: Qt owner
 // 출력: current Qt delivery context에 bound된 Export adapter
-QtExportClientAdapter::QtExportClientAdapter(core::orchestration::ExportOrchestrator& orchestrator,
-                                             core::client::IWorkerProfileClient& workerProfileClient,
-                                             QObject* parent)
-    : QObject(parent), m_orchestrator(&orchestrator), m_workerProfileClient(&workerProfileClient)
+ProductExportClientAdapter::ProductExportClientAdapter(core::orchestration::ExportOrchestrator& orchestrator,
+                                                       QObject* parent)
+    : ProductExportClientAdapter(orchestrator, nullptr, parent)
+{}
+
+// 목적: Local-only Export owner를 Worker profile 없이 Qt-free product surface에 연결
+// 입력: orchestrator: scheduling/terminal authority, parent: Qt owner
+// 출력: current Qt delivery context에 bound된 Export adapter
+ProductExportClientAdapter::ProductExportClientAdapter(core::orchestration::ExportOrchestrator& orchestrator,
+                                                       core::client::IWorkerProfileClient& workerProfileClient,
+                                                       QObject* parent)
+    : ProductExportClientAdapter(orchestrator, &workerProfileClient, parent)
+{}
+
+// 목적: optional Worker profile resolver를 가진 공통 Export product projection 구성
+// 입력: orchestrator: scheduling authority, workerProfileClient: Local-only이면 nullptr 허용, parent: Qt owner
+// 출력: current Qt delivery context에 bound된 Export adapter
+ProductExportClientAdapter::ProductExportClientAdapter(core::orchestration::ExportOrchestrator& orchestrator,
+                                                       core::client::IWorkerProfileClient* workerProfileClient,
+                                                       QObject* parent)
+    : QObject(parent), m_orchestrator(&orchestrator), m_workerProfileClient(workerProfileClient)
 {
     Q_ASSERT(m_orchestrator->thread() == thread());
     m_snapshot.scheduling = toClientMetrics(m_orchestrator->schedulingMetrics());
     connect(m_orchestrator,
             &core::orchestration::ExportOrchestrator::exportAccepted,
             this,
-            &QtExportClientAdapter::recordAccepted,
+            &ProductExportClientAdapter::recordAccepted,
             Qt::DirectConnection);
     connect(m_orchestrator,
             &core::orchestration::ExportOrchestrator::exportProgressed,
             this,
-            &QtExportClientAdapter::recordProgress,
+            &ProductExportClientAdapter::recordProgress,
             Qt::DirectConnection);
     connect(m_orchestrator,
             &core::orchestration::ExportOrchestrator::exportCompleted,
             this,
-            &QtExportClientAdapter::recordCompleted,
+            &ProductExportClientAdapter::recordCompleted,
             Qt::DirectConnection);
     connect(m_orchestrator,
             &core::orchestration::ExportOrchestrator::exportFailed,
             this,
-            &QtExportClientAdapter::recordFailed,
+            &ProductExportClientAdapter::recordFailed,
             Qt::DirectConnection);
     connect(m_orchestrator,
             &core::orchestration::ExportOrchestrator::exportCancelled,
             this,
-            &QtExportClientAdapter::recordCancelled,
+            &ProductExportClientAdapter::recordCancelled,
             Qt::DirectConnection);
 }
 
 // 목적: queued callback을 차단하고 outliving subscription handle을 inactive 상태로 전환
 // 입력: 없음
 // 출력: adapter destruction 이후 callback 없음
-QtExportClientAdapter::~QtExportClientAdapter()
+ProductExportClientAdapter::~ProductExportClientAdapter()
 {
     m_shuttingDown = true;
     for (const std::weak_ptr<SubscriptionState>& weakState : m_subscriptions)
@@ -449,7 +476,7 @@ QtExportClientAdapter::~QtExportClientAdapter()
 // 목적: Qt-free Export command를 현재 Orchestrator request와 resolved Worker target으로 투영
 // 입력: command: file·item-list·batch request와 placement/profile identity
 // 출력: accepted request receipt 또는 validation·profile·owner 오류
-core::client::ExportSubmissionResult QtExportClientAdapter::submitExport(
+core::client::ExportSubmissionResult ProductExportClientAdapter::submitExport(
     const core::client::SubmitExportCommand& command)
 {
     if (QThread::currentThread() != thread())
@@ -468,7 +495,7 @@ core::client::ExportSubmissionResult QtExportClientAdapter::submitExport(
     {
         return core::client::ExportSubmissionResult::failure(request.error());
     }
-    ProjectedPlacementResult placement = projectPlacement(command.placement, *m_workerProfileClient);
+    ProjectedPlacementResult placement = projectPlacement(command.placement, m_workerProfileClient);
     if (placement.hasError())
     {
         return core::client::ExportSubmissionResult::failure(placement.error());
@@ -485,7 +512,7 @@ core::client::ExportSubmissionResult QtExportClientAdapter::submitExport(
 // 목적: accepted Export request cancellation을 authoritative owner에 전달
 // 입력: requestId: Qt-free Export request identity
 // 출력: 취소 수락 identity 또는 stale·validation 오류
-core::client::ExportCancellationResult QtExportClientAdapter::cancelExport(
+core::client::ExportCancellationResult ProductExportClientAdapter::cancelExport(
     const core::client::ExportRequestId requestId)
 {
     if (requestId.value == 0)
@@ -509,7 +536,7 @@ core::client::ExportCancellationResult QtExportClientAdapter::cancelExport(
 // 목적: 전체 또는 지정 active Export request와 lifetime scheduling metric 조회
 // 입력: requestId: optional active request identity
 // 출력: immutable snapshot 또는 stale·thread 오류
-core::client::ExportSnapshotResult QtExportClientAdapter::exportSnapshot(
+core::client::ExportSnapshotResult ProductExportClientAdapter::exportSnapshot(
     const std::optional<core::client::ExportRequestId> requestId) const
 {
     if (QThread::currentThread() != thread())
@@ -542,7 +569,8 @@ core::client::ExportSnapshotResult QtExportClientAdapter::exportSnapshot(
 // 목적: initial active snapshot과 이후 accepted·progress·terminal lifecycle 구독
 // 입력: callback: immutable Export event consumer
 // 출력: RAII unsubscribe handle 또는 callback·thread 오류
-core::client::ExportSubscriptionResult QtExportClientAdapter::subscribeToExports(core::client::ExportCallback callback)
+core::client::ExportSubscriptionResult ProductExportClientAdapter::subscribeToExports(
+    core::client::ExportCallback callback)
 {
     if (!callback)
     {
@@ -583,7 +611,7 @@ core::client::ExportSubscriptionResult QtExportClientAdapter::subscribeToExports
 // 목적: adapter lifetime에서 0을 사용하지 않는 event ordering sequence 발급
 // 입력: 없음
 // 출력: 다음 Export event sequence
-core::client::ExportEventSequence QtExportClientAdapter::nextEventSequence() noexcept
+core::client::ExportEventSequence ProductExportClientAdapter::nextEventSequence() noexcept
 {
     const std::uint64_t value = m_nextEventSequence;
     m_nextEventSequence = value == std::numeric_limits<std::uint64_t>::max() ? 1 : value + 1;
@@ -593,7 +621,7 @@ core::client::ExportEventSequence QtExportClientAdapter::nextEventSequence() noe
 // 목적: owner가 accepted한 request를 active snapshot과 event로 투영
 // 입력: requestId: authoritative aggregate identity
 // 출력: active request 등록과 accepted event
-void QtExportClientAdapter::recordAccepted(const std::uint64_t requestId)
+void ProductExportClientAdapter::recordAccepted(const std::uint64_t requestId)
 {
     const core::client::ExportRequestId id{requestId};
     if (findActive(id) == nullptr)
@@ -606,7 +634,7 @@ void QtExportClientAdapter::recordAccepted(const std::uint64_t requestId)
 // 목적: owner 누적 progress를 active snapshot과 event로 투영
 // 입력: progress: request identity와 item 누적 상태
 // 출력: matching active request 갱신과 progress event
-void QtExportClientAdapter::recordProgress(const core::orchestration::ExportProgress& progress)
+void ProductExportClientAdapter::recordProgress(const core::orchestration::ExportProgress& progress)
 {
     const core::client::ExportRequestId id{progress.requestId};
     core::client::ActiveExportSnapshot* active = findActive(id);
@@ -634,7 +662,7 @@ void QtExportClientAdapter::recordProgress(const core::orchestration::ExportProg
 // 목적: owner completed report를 Qt-free exact terminal event로 투영
 // 입력: result: item report와 request scheduling metric
 // 출력: active request 제거와 completed event
-void QtExportClientAdapter::recordCompleted(const core::orchestration::ExportResult& result)
+void ProductExportClientAdapter::recordCompleted(const core::orchestration::ExportResult& result)
 {
     const core::client::ExportRequestId id{result.requestId};
     removeActive(id);
@@ -648,7 +676,7 @@ void QtExportClientAdapter::recordCompleted(const core::orchestration::ExportRes
 // 목적: owner request-level failure를 ClientError exact terminal로 투영
 // 입력: issue: request identity와 CoreError
 // 출력: active request 제거와 failed event
-void QtExportClientAdapter::recordFailed(const core::orchestration::ExportIssue& issue)
+void ProductExportClientAdapter::recordFailed(const core::orchestration::ExportIssue& issue)
 {
     const core::client::ExportRequestId id{issue.requestId};
     removeActive(id);
@@ -662,7 +690,7 @@ void QtExportClientAdapter::recordFailed(const core::orchestration::ExportIssue&
 // 목적: owner cancellation을 Qt-free exact terminal event로 투영
 // 입력: requestId: cancelled aggregate identity
 // 출력: active request 제거와 cancelled event
-void QtExportClientAdapter::recordCancelled(const std::uint64_t requestId)
+void ProductExportClientAdapter::recordCancelled(const std::uint64_t requestId)
 {
     const core::client::ExportRequestId id{requestId};
     removeActive(id);
@@ -672,7 +700,7 @@ void QtExportClientAdapter::recordCancelled(const std::uint64_t requestId)
 // 목적: active request vector에서 identity가 일치하는 mutable snapshot 조회
 // 입력: requestId: 찾을 aggregate identity
 // 출력: matching snapshot pointer 또는 nullptr
-core::client::ActiveExportSnapshot* QtExportClientAdapter::findActive(
+core::client::ActiveExportSnapshot* ProductExportClientAdapter::findActive(
     const core::client::ExportRequestId requestId) noexcept
 {
     const auto active =
@@ -683,7 +711,7 @@ core::client::ActiveExportSnapshot* QtExportClientAdapter::findActive(
 // 목적: terminal request를 active snapshot에서 제거
 // 입력: requestId: 제거할 aggregate identity
 // 출력: snapshot에 해당 identity가 남지 않음
-void QtExportClientAdapter::removeActive(const core::client::ExportRequestId requestId)
+void ProductExportClientAdapter::removeActive(const core::client::ExportRequestId requestId)
 {
     std::erase_if(m_snapshot.activeRequests, [requestId](const core::client::ActiveExportSnapshot& active) {
         return active.requestId == requestId;
@@ -693,11 +721,11 @@ void QtExportClientAdapter::removeActive(const core::client::ExportRequestId req
 // 목적: current snapshot과 transition payload를 모든 active subscription에 fan-out
 // 입력: accepted/progress/completed/failed/cancelled: 이번 lifecycle transition payload
 // 출력: subscription별 Qt queued callback 등록
-void QtExportClientAdapter::publishEvent(std::optional<core::client::ExportRequestReceipt> accepted,
-                                         std::optional<core::client::ExportProgress> progress,
-                                         std::optional<core::client::ExportResult> completed,
-                                         std::optional<core::client::ExportIssue> failed,
-                                         std::optional<core::client::ExportCancellation> cancelled)
+void ProductExportClientAdapter::publishEvent(std::optional<core::client::ExportRequestReceipt> accepted,
+                                              std::optional<core::client::ExportProgress> progress,
+                                              std::optional<core::client::ExportResult> completed,
+                                              std::optional<core::client::ExportIssue> failed,
+                                              std::optional<core::client::ExportCancellation> cancelled)
 {
     if (m_shuttingDown)
     {
@@ -732,7 +760,7 @@ void QtExportClientAdapter::publishEvent(std::optional<core::client::ExportReque
 // 목적: 한 subscription에 immutable event를 Qt queued callback으로 등록
 // 입력: state: subscription lifetime, event: 전달할 Export event
 // 출력: 전달 불필요 또는 queue 성공이면 true
-bool QtExportClientAdapter::enqueueEvent(const SubscriptionStatePtr& state, core::client::ExportEvent event)
+bool ProductExportClientAdapter::enqueueEvent(const SubscriptionStatePtr& state, core::client::ExportEvent event)
 {
     if (!state->isActive())
     {
@@ -745,8 +773,8 @@ bool QtExportClientAdapter::enqueueEvent(const SubscriptionStatePtr& state, core
 // 목적: queued immutable event를 active callback 하나에 예외 격리하여 전달
 // 입력: state: subscription lifetime, event: 전달할 Export event
 // 출력: 없음
-void QtExportClientAdapter::deliverEvent(const SubscriptionStatePtr& state,
-                                         const core::client::ExportEvent& event) noexcept
+void ProductExportClientAdapter::deliverEvent(const SubscriptionStatePtr& state,
+                                              const core::client::ExportEvent& event) noexcept
 {
     try
     {
@@ -764,4 +792,4 @@ void QtExportClientAdapter::deliverEvent(const SubscriptionStatePtr& state,
     }
 }
 
-}  // namespace flexraw::ui::export_
+}  // namespace flexraw::runtime

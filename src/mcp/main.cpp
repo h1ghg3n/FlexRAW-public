@@ -11,6 +11,7 @@
 #include "mcp_application_context.h"
 #include "mcp_catalog_tools.h"
 #include "mcp_editor_tools.h"
+#include "mcp_export_tools.h"
 #include "mcp_project_tools.h"
 #include "mcp_server.h"
 #include "mcp_source_resolution_tools.h"
@@ -73,8 +74,22 @@ int runMcpProcess(int argc, char* argv[])
         std::cerr << "Unable to subscribe to Source Resolution events: " << sourceTools.startupDiagnostic() << '\n';
         return 70;
     }
-    flexraw::mcp::McpServer server(
-        catalogTools, projectTools, editorTools, sourceTools, FLEXRAW_VERSION_STRING, std::cin, std::cout, std::cerr);
+    flexraw::mcp::McpExportTools exportTools(
+        context.editorClient(), context.exportClient(), context.exportEventSource(), parser.isSet(allowWriteOption));
+    if (!exportTools.ready())
+    {
+        std::cerr << "Unable to subscribe to Export events: " << exportTools.startupDiagnostic() << '\n';
+        return 70;
+    }
+    flexraw::mcp::McpServer server(catalogTools,
+                                   projectTools,
+                                   editorTools,
+                                   sourceTools,
+                                   exportTools,
+                                   FLEXRAW_VERSION_STRING,
+                                   std::cin,
+                                   std::cout,
+                                   std::cerr);
     return server.run();
 }
 

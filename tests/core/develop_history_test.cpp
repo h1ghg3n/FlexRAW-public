@@ -41,8 +41,10 @@ TEST(DevelopHistoryTest, CoalescesOneContinuousEditIntoSingleUndoStep)
     const QString photoPath = QStringLiteral("C:/photos/one.raw");
     types::DevelopParams firstParams;
     firstParams.exposureEv = 0.4F;
+    firstParams.hsl.channels[1].hue = 0.2F;
     types::DevelopParams finalParams;
     finalParams.exposureEv = 1.2F;
+    finalParams.hsl.channels[1].hue = 0.8F;
 
     (void)history.selectPhoto(photoPath);
     history.beginEdit(photoPath);
@@ -63,6 +65,7 @@ TEST(DevelopHistoryTest, KeepsPhotoHistoriesIndependent)
     const QString secondPhotoPath = QStringLiteral("C:/photos/two.raw");
     types::DevelopParams firstPhotoParams;
     firstPhotoParams.saturation = 0.5F;
+    firstPhotoParams.hsl.channels[3] = {0.2F, 0.3F, -0.4F};
 
     EXPECT_TRUE(history.update(firstPhotoPath, firstPhotoParams));
 

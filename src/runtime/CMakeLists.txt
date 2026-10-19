@@ -3,6 +3,8 @@
 add_library(flexraw_product_runtime STATIC)
 
 target_sources(flexraw_product_runtime PRIVATE
+    product_export_client_adapter.cpp
+    product_export_client_adapter.h
     product_runtime.cpp
     product_runtime.h
 )
@@ -11,6 +13,10 @@ target_include_directories(flexraw_product_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(flexraw_product_runtime PRIVATE
-    flexraw_core_orchestration
+target_link_libraries(flexraw_product_runtime
+    PUBLIC
+        flexraw_core_client
+        Qt6::Core
+    PRIVATE
+        flexraw_core_orchestration
 )

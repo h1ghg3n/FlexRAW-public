@@ -1,6 +1,7 @@
 #pragma once
 
 #include "error.h"
+#include "raw_processing.h"
 #include "result.h"
 
 #include <QByteArray>
@@ -17,12 +18,7 @@ enum class ThumbnailFormat {
     Bitmap,
 };
 
-enum class RawPreviewOrientation {
-    AsDecoded,
-    Rotate180,
-    Rotate90CounterClockwise,
-    Rotate90Clockwise,
-};
+using RawPreviewOrientation = RawOrientation;
 
 struct RawMetadata {
     QString sourcePath;
@@ -56,12 +52,7 @@ struct RawDecodeDiagnostics {
 };
 
 struct RawPreviewImage {
-    QByteArray data;
-    int width{0};
-    int height{0};
-    int channelCount{0};
-    int bitsPerChannel{0};
-    RawPreviewOrientation orientation{RawPreviewOrientation::AsDecoded};
+    RawDecodedRaster8 raster;
     RawDecodeDiagnostics diagnostics;
 };
 

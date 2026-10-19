@@ -124,7 +124,16 @@
         "FLEXRAW_BUILD_UI_TESTS": "OFF",
         "FLEXRAW_BUILD_PORTABLE_TESTS": "ON",
         "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
-        "VCPKG_MANIFEST_FEATURES": "tests"
+        "VCPKG_MANIFEST_FEATURES": "portable-processing;tests"
+      }
+    },
+    {
+      "name": "windows-msvc-cli-release",
+      "inherits": "windows-msvc-portable-contract-release",
+      "displayName": "Windows MSVC Terminal CLI Release",
+      "binaryDir": "${sourceDir}/build/cli/windows-release",
+      "cacheVariables": {
+        "FLEXRAW_BUILD_CLI": "ON"
       }
     },
     {
@@ -179,8 +188,14 @@
         "FLEXRAW_BUILD_UI_TESTS": "OFF",
         "FLEXRAW_BUILD_PORTABLE_TESTS": "ON",
         "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
-        "VCPKG_MANIFEST_FEATURES": "tests"
+        "VCPKG_MANIFEST_FEATURES": "portable-processing;tests"
       }
+    },
+    {
+      "name": "linux-x64-portable-contract-release",
+      "inherits": "linux-wsl-portable-contract-release",
+      "displayName": "Linux x64 Portable Contract Release",
+      "binaryDir": "${sourceDir}/build/portable/linux-x64-release"
     },
     {
       "name": "linux-arm64-portable-contract-release",
@@ -189,6 +204,15 @@
       "binaryDir": "${sourceDir}/build/portable/linux-arm64-release",
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "arm64-linux"
+      }
+    },
+    {
+      "name": "linux-arm64-cli-release",
+      "inherits": "linux-arm64-portable-contract-release",
+      "displayName": "Linux ARM64 Terminal CLI Release",
+      "binaryDir": "${sourceDir}/build/cli/linux-arm64-release",
+      "cacheVariables": {
+        "FLEXRAW_BUILD_CLI": "ON"
       }
     }
   ],
@@ -253,12 +277,24 @@
       "configurePreset": "windows-msvc-portable-contract-release"
     },
     {
+      "name": "cli-windows-release",
+      "configurePreset": "windows-msvc-cli-release"
+    },
+    {
       "name": "portable-contract-wsl-release",
       "configurePreset": "linux-wsl-portable-contract-release"
     },
     {
+      "name": "portable-contract-linux-x64-release",
+      "configurePreset": "linux-x64-portable-contract-release"
+    },
+    {
       "name": "portable-contract-linux-arm64-release",
       "configurePreset": "linux-arm64-portable-contract-release"
+    },
+    {
+      "name": "cli-linux-arm64-release",
+      "configurePreset": "linux-arm64-cli-release"
     }
   ],
   "testPresets": [
@@ -384,6 +420,14 @@
       }
     },
     {
+      "name": "cli-windows-release",
+      "configurePreset": "windows-msvc-cli-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "portable-contract-wsl-release",
       "configurePreset": "linux-wsl-portable-contract-release",
       "output": {
@@ -391,8 +435,22 @@
       }
     },
     {
+      "name": "portable-contract-linux-x64-release",
+      "configurePreset": "linux-x64-portable-contract-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "portable-contract-linux-arm64-release",
       "configurePreset": "linux-arm64-portable-contract-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "cli-linux-arm64-release",
+      "configurePreset": "linux-arm64-cli-release",
       "output": {
         "outputOnFailure": true
       }

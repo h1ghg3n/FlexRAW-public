@@ -4,6 +4,11 @@
 #include <QFile>
 #include <QTemporaryDir>
 
+#include <cstdint>
+#include <optional>
+#include <utility>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 namespace flexraw::core::preview {
@@ -25,6 +30,23 @@ namespace {
     }
 
     return file.write(bitmap) == bitmap.size();
+}
+
+// 목적: standard RAW preview test용 move-only RGB raster 생성
+// 입력: orientation: pixel storage에 아직 적용되지 않은 회전
+// 출력: red/green 2x1 RGB preview 값
+[[nodiscard]] raw::RawPreviewImage makeRawPreviewImage(
+    const raw::RawPreviewOrientation orientation = raw::RawPreviewOrientation::AsDecoded)
+{
+    std::optional<raw::RawDecodedRaster8> raster =
+        raw::RawDecodedRaster8::create(std::vector<std::uint8_t>{255, 0, 0, 0, 255, 0},
+                                       2,
+                                       1,
+                                       6,
+                                       raw::RawRasterLayout::Rgb8,
+                                       orientation,
+                                       raw::RawDecodeObservation{2, 1, 2, 1, 0});
+    return raw::RawPreviewImage{std::move(raster.value()), raw::RawDecodeDiagnostics{}};
 }
 
 TEST(ThumbnailPreview, RejectsInvalidTargetSize)
@@ -87,13 +109,7 @@ TEST(ThumbnailPreview, AppliesEmbeddedOrientationBeforeDownscale)
 
 TEST(ThumbnailPreview, ConvertsStandardRawPreviewIntoOwnedImage)
 {
-    const raw::RawPreviewImage image{
-        QByteArray::fromHex("ff000000ff00"),
-        2,
-        1,
-        3,
-        8,
-    };
+    const raw::RawPreviewImage image = makeRawPreviewImage();
 
     const ThumbnailPreviewResult result = createStandardRawPreview(image, QSize{2, 1});
 
@@ -106,14 +122,7 @@ TEST(ThumbnailPreview, ConvertsStandardRawPreviewIntoOwnedImage)
 
 TEST(ThumbnailPreview, AppliesStandardRawPreviewOrientation)
 {
-    const raw::RawPreviewImage image{
-        QByteArray::fromHex("ff000000ff00"),
-        2,
-        1,
-        3,
-        8,
-        raw::RawPreviewOrientation::Rotate90Clockwise,
-    };
+    const raw::RawPreviewImage image = makeRawPreviewImage(raw::RawPreviewOrientation::Rotate90Clockwise);
 
     const ThumbnailPreviewResult result = createStandardRawPreview(image, QSize{2, 2});
 
@@ -126,14 +135,7 @@ TEST(ThumbnailPreview, AppliesStandardRawPreviewOrientation)
 
 TEST(ThumbnailPreview, AppliesStandardRawPreviewRotation180)
 {
-    const raw::RawPreviewImage image{
-        QByteArray::fromHex("ff000000ff00"),
-        2,
-        1,
-        3,
-        8,
-        raw::RawPreviewOrientation::Rotate180,
-    };
+    const raw::RawPreviewImage image = makeRawPreviewImage(raw::RawPreviewOrientation::Rotate180);
 
     const ThumbnailPreviewResult result = createStandardRawPreview(image, QSize{2, 1});
 

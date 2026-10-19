@@ -29,6 +29,7 @@ constexpr int KnobHeight = 22;
 constexpr int HorizontalMargin = 8;
 constexpr int TrackCenterOverhang = 19;
 constexpr int RateTimerIntervalMs = 16;
+constexpr int SpinCommitDelayMs = 300;
 constexpr double NeutralDeadZoneRatio = 0.04;
 constexpr double LinearRateWeight = 0.25;
 
@@ -499,6 +500,9 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
     m_valueSpinBox->setAlignment(Qt::AlignRight);
     m_valueSpinBox->setButtonSymbols(QAbstractSpinBox::NoButtons);
     m_valueSpinBox->setFixedWidth(64);
+    m_spinCommitTimer = new QTimer(this);
+    m_spinCommitTimer->setSingleShot(true);
+    m_spinCommitTimer->setInterval(SpinCommitDelayMs);
     headerLayout->addWidget(label);
     headerLayout->addStretch();
     headerLayout->addWidget(m_valueSpinBox);
@@ -559,13 +563,19 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
             emit adjustmentStarted();
         }
         applyUserValue(value / m_displayScale, m_valueSpinBox);
+        m_spinCommitTimer->start();
     });
-    connect(m_valueSpinBox, &QDoubleSpinBox::editingFinished, this, [this] {
+    const auto finishSpinAdjustment = [this] {
         if (m_spinAdjustmentInProgress)
         {
             m_spinAdjustmentInProgress = false;
             emit adjustmentFinished();
         }
+    };
+    connect(m_spinCommitTimer, &QTimer::timeout, this, finishSpinAdjustment);
+    connect(m_valueSpinBox, &QDoubleSpinBox::editingFinished, this, [this, finishSpinAdjustment] {
+        m_spinCommitTimer->stop();
+        finishSpinAdjustment();
     });
 }
 

@@ -19,6 +19,8 @@ using CatalogFolderQueryResult = types::Result<QVector<CatalogFolderSummary>, ty
 using CatalogPhotoQueryResult = types::Result<CatalogPhotoPage, types::CoreError>;
 using CatalogPhotoRecordResult = types::Result<std::optional<CatalogPhotoRecord>, types::CoreError>;
 using CatalogPhotoMutationResult = types::Result<std::monostate, types::CoreError>;
+using CatalogCullingMutationResult = types::Result<QVector<types::PhotoId>, types::CoreError>;
+using CatalogInclusionMutationResult = types::Result<QVector<types::PhotoId>, types::CoreError>;
 using CatalogPhotoCreateResult = types::Result<types::PhotoId, types::CoreError>;
 
 class CatalogPhotoRepository final
@@ -38,6 +40,18 @@ public:
     // 입력: request: page 크기, 이동 방향, optional exclusive cursor와 folder scope
     // 출력: 오름차순 record와 이전·다음 cursor 또는 validation·database 오류
     [[nodiscard]] CatalogPhotoQueryResult queryPage(const CatalogPhotoPageRequest& request) const;
+
+    // 목적: stable Photo identity batch에 동일한 Catalog 선별 상태를 원자적으로 적용
+    // 입력: photoIds: 중복 가능 identity 목록, state: 적용할 Neutral·Pick·Reject 상태
+    // 출력: 오름차순으로 정규화된 identity 목록 또는 validation·not-found·database 오류
+    [[nodiscard]] CatalogCullingMutationResult setCullingState(const QVector<types::PhotoId>& photoIds,
+                                                               CatalogCullingState state);
+
+    // 목적: stable Photo identity batch에 동일한 Catalog 등록 포함 상태를 원자적으로 적용
+    // 입력: photoIds: 중복 가능 identity 목록, state: 적용할 Included·Excluded 상태
+    // 출력: 오름차순으로 정규화된 identity 목록 또는 validation·not-found·database 오류
+    [[nodiscard]] CatalogInclusionMutationResult setInclusionState(const QVector<types::PhotoId>& photoIds,
+                                                                   CatalogInclusionState state);
 
     // 목적: linked photo가 존재하는 Catalog Folder path와 photo 수 조회
     // 입력: 없음

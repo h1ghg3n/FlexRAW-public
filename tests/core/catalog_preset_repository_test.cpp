@@ -54,6 +54,7 @@ TEST_F(CatalogPresetRepositoryTest, SavesUpdatesListsAndRemovesPreset)
     definition.category = QStringLiteral("  Portraits ");
     definition.params.exposureEv = 0.75F;
     definition.params.vibrance = 0.35F;
+    definition.params.hsl.channels[4] = {0.4F, -0.3F, 0.2F};
 
     const CatalogPresetStoreResult saved = repository.save(definition);
 

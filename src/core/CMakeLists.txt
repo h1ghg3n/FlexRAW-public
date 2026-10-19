@@ -6,18 +6,27 @@
 
 # Product Contract는 Qt와 processing dependency 없이 독립적으로 구성한다.
 add_subdirectory(client)
+add_subdirectory(types)
+add_subdirectory(image)
+
+if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER OR FLEXRAW_BUILD_MCP OR FLEXRAW_BUILD_CLI OR
+   (FLEXRAW_BUILD_TESTS AND FLEXRAW_BUILD_PORTABLE_TESTS))
+    find_package(lcms2 CONFIG REQUIRED)
+    find_package(libraw CONFIG REQUIRED)
+endif()
+
+if(FLEXRAW_BUILD_CLI OR (FLEXRAW_BUILD_TESTS AND FLEXRAW_BUILD_PORTABLE_TESTS))
+    find_package(PNG REQUIRED)
+endif()
 
 if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER OR FLEXRAW_BUILD_MCP)
     # 공통 의존성 (sub 모듈에서 직접 find_package 하지 않고 부모에서 한 번만)
-    find_package(libraw CONFIG REQUIRED)
-    find_package(lcms2 CONFIG REQUIRED)
     find_package(exiv2 CONFIG REQUIRED)
     find_package(spdlog CONFIG REQUIRED)
     find_package(Qt6 REQUIRED COMPONENTS Core Gui)
 
 # 기반 모듈 (다른 모듈이 의존)
     add_subdirectory(measurement)
-    add_subdirectory(types)
     add_subdirectory(util)
 
     # Worker/Desktop과 현재 bundled Orchestration을 사용하는 MCP가 공유하는 resolved render dependency
@@ -44,6 +53,7 @@ if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER OR FLEXRAW_BUILD_MCP)
             flexraw_core_measurement
             flexraw_core_types
             flexraw_core_client
+            flexraw_core_image
             flexraw_core_util
             flexraw_core_catalog
             flexraw_core_raw
@@ -57,4 +67,11 @@ if(FLEXRAW_BUILD_DESKTOP OR FLEXRAW_BUILD_WORKER OR FLEXRAW_BUILD_MCP)
             flexraw_core_orchestration
         )
     endif()
+elseif(FLEXRAW_BUILD_CLI OR (FLEXRAW_BUILD_TESTS AND FLEXRAW_BUILD_PORTABLE_TESTS))
+    # Portable lane과 Terminal CLI는 Qt package 없이 neutral processing target을 실제 build한다.
+    add_subdirectory(raw)
+    add_subdirectory(develop)
+    add_subdirectory(color)
+    add_subdirectory(export)
+    add_subdirectory(render)
 endif()

@@ -13,8 +13,9 @@ class QSpinBox;
 
 namespace flexraw::core::develop
 {
+struct ClippingSummary;
 struct ImageHistogram;
-}
+}  // namespace flexraw::core::develop
 
 namespace flexraw::ui::editor
 {
@@ -53,9 +54,14 @@ public:
     // 출력: histogram widget repaint 예약
     void setHistogram(const core::develop::ImageHistogram& histogram);
 
+    // 목적: 현재 preview의 shadow/highlight clipping을 histogram indicator에 표시
+    // 입력: clipping: shadow/highlight/전체 preview pixel 수
+    // 출력: histogram clipping indicator 갱신
+    void setClippingSummary(const core::develop::ClippingSummary& clipping);
+
     // 목적: 새 preview를 기다리는 동안 이전 histogram 표시를 제거
     // 입력: 없음
-    // 출력: histogram widget repaint 예약
+    // 출력: histogram과 clipping indicator 초기화
     void clearHistogram();
 
     // 목적: navigation 또는 외부 state 전환 전에 진행 중인 adjustment transaction 종료

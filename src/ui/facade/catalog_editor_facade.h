@@ -2,7 +2,9 @@
 
 #include <QObject>
 
+#include "catalog_culling_client.h"
 #include "catalog_folder_client.h"
+#include "catalog_inclusion_client.h"
 #include "catalog_photo_client.h"
 #include "catalog_project_client.h"
 #include "catalog_session_client.h"
@@ -30,7 +32,9 @@ class QtFolderImportEventAdapter;
 class QtPreviewPresentationEventAdapter;
 
 class CatalogEditorFacade final : public QObject,
+                                  public core::client::ICatalogCullingClient,
                                   public core::client::ICatalogFolderClient,
+                                  public core::client::ICatalogInclusionClient,
                                   public core::client::ICatalogProjectClient,
                                   public core::client::ICatalogPhotoClient,
                                   public core::client::ICatalogSessionClient,
@@ -41,6 +45,7 @@ class CatalogEditorFacade final : public QObject,
                                   public core::client::ICatalogThumbnailClient,
                                   public core::client::ICatalogThumbnailEventSource,
                                   public core::client::IPreviewPresentationClient,
+                                  public core::client::IPreviewComparisonClient,
                                   public core::client::IPreviewPresentationEventSource,
                                   public core::client::ISourceResolutionClient,
                                   public core::client::ISourceResolutionEventSource
@@ -93,6 +98,12 @@ public:
     // 출력: 취소된 identity 또는 stale·validation 오류
     [[nodiscard]] core::client::PreviewRequestCancelResult cancelPreviewRequest(
         core::client::PreviewRequestId requestId) override;
+
+    // 목적: 기본 Develop 비교 command를 Editor session owner에 전달
+    // 입력: command: 비교 활성화 여부
+    // 출력: 적용된 상태와 accepted request ID 또는 owner 오류
+    [[nodiscard]] core::client::PreviewComparisonResult setPreviewComparison(
+        const core::client::SetPreviewComparisonCommand& command) override;
 
     // 목적: Qt GUI delivery context에서 initial Preview snapshot과 이후 lifecycle 구독
     // 입력: callback: immutable frame·analysis·warning·terminal consumer
@@ -223,6 +234,18 @@ public:
     // 출력: stable order photo snapshot과 양방향 cursor 또는 구조화된 client 오류
     [[nodiscard]] core::client::CatalogPhotoPageResult queryPhotoPage(
         const core::client::CatalogPhotoPageRequest& request) const override;
+
+    // 목적: Qt-free 선별 command를 active Catalog use case로 전달
+    // 입력: command: expected Catalog path, target state와 stable Photo identity batch
+    // 출력: 정규화된 identity receipt 또는 구조화된 client 오류
+    [[nodiscard]] core::client::CatalogCullingResult setCatalogCulling(
+        const core::client::SetCatalogCullingCommand& command) override;
+
+    // 목적: Qt-free 등록 포함 command를 active Catalog use case로 전달
+    // 입력: command: expected Catalog path, target state와 stable Photo identity batch
+    // 출력: 정규화된 identity receipt 또는 구조화된 client 오류
+    [[nodiscard]] core::client::CatalogInclusionResult setCatalogInclusion(
+        const core::client::SetCatalogInclusionCommand& command) override;
 
     // 목적: active Catalog navigation에 사용할 distinct Folder snapshot 조회
     // 입력: 없음

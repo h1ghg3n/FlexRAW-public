@@ -11,6 +11,8 @@
 #include <QString>
 #include <QVBoxLayout>
 
+#include "settings_page_header.h"
+
 namespace flexraw::ui::settings
 {
 
@@ -85,12 +87,27 @@ ExportDefaultsPage::ExportDefaultsPage(core::client::IExportDefaultsClient& expo
     m_statusLabel->setObjectName(QStringLiteral("exportDefaultsStatusLabel"));
     m_statusLabel->setWordWrap(true);
     auto* layout = new QVBoxLayout(this);
+    layout->addWidget(
+        new SettingsPageHeader(tr("Export"), tr("Set the defaults used when a new raster Export is prepared."), this));
     layout->addWidget(rasterGroup);
     layout->addWidget(executionGroup);
     layout->addWidget(m_statusLabel);
     layout->addStretch(1);
 
+    connect(m_formatComboBox, &QComboBox::currentIndexChanged, this, &ExportDefaultsPage::updateFormatControls);
     loadDefaults();
+    updateFormatControls();
+}
+
+// 목적: 선택 format에 실제 적용되는 encoding control만 활성화
+// 입력: 없음
+// 출력: JPEG/PNG/TIFF 전용 option의 enabled state 갱신
+void ExportDefaultsPage::updateFormatControls()
+{
+    const auto format = static_cast<core::client::ExportRasterFormat>(m_formatComboBox->currentData().toInt());
+    m_jpegQualitySpinBox->setEnabled(format == core::client::ExportRasterFormat::Jpeg);
+    m_pngCompressionSpinBox->setEnabled(format == core::client::ExportRasterFormat::Png);
+    m_tiffCompressionComboBox->setEnabled(format == core::client::ExportRasterFormat::Tiff);
 }
 
 // 목적: 현재 widget 값을 application-wide Export 기본값으로 저장

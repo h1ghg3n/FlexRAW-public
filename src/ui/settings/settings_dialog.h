@@ -27,11 +27,11 @@ class SettingsDialog final : public QDialog
     Q_OBJECT
 
 public:
-    // 목적: 현재 UI preference를 편집하는 최소 Settings window 초기화
+    // 목적: application preference와 product default를 편집하는 Settings window 초기화
     // 입력: settings: application preference 저장소, workerProfileClient: Worker CRUD,
     //       exportDefaultsClient: application Export 기본값 계약, workerHealthClient/eventSource: optional health,
     //       catalogStartupSettingsClient: optional General settings capability, parent: Qt 부모 widget
-    // 출력: available General capability, View, Workers와 Export tab을 포함한 dialog
+    // 출력: 상태 복원, 저장 의미 안내와 General/View/Workers/Export page를 포함한 dialog
     explicit SettingsDialog(QSettings& settings,
                             core::client::IWorkerProfileClient& workerProfileClient,
                             core::client::IExportDefaultsClient& exportDefaultsClient,

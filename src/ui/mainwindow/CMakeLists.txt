@@ -3,6 +3,8 @@
 add_library(flexraw_ui_mainwindow STATIC)
 
 target_sources(flexraw_ui_mainwindow PRIVATE
+    export_source_projection.cpp
+    export_source_projection.h
     mainwindow.cpp
     mainwindow.h
     qt_activity_adapter.cpp

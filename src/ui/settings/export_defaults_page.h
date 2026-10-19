@@ -36,6 +36,11 @@ public:
     void refreshWorkerProfiles();
 
 private:
+    // 목적: 선택 format에 실제 적용되는 encoding control만 활성화
+    // 입력: 없음
+    // 출력: JPEG/PNG/TIFF 전용 option의 enabled state 갱신
+    void updateFormatControls();
+
     // 목적: 저장된 Export 기본값 snapshot을 widget에 복원
     // 입력: 없음
     // 출력: 성공 시 저장 가능한 controls와 preferred identity 초기화

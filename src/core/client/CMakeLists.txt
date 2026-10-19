@@ -9,6 +9,8 @@ set_target_properties(flexraw_core_client PROPERTIES
 
 target_sources(flexraw_core_client PRIVATE
     activity_client.h
+    catalog_culling_client.h
+    catalog_inclusion_client.h
     catalog_folder_client.h
     catalog_photo_client.h
     catalog_project_client.h
@@ -38,3 +40,5 @@ target_include_directories(flexraw_core_client PUBLIC
 if(MSVC)
     target_compile_options(flexraw_core_client PRIVATE /utf-8)
 endif()
+
+target_link_libraries(flexraw_core_client PUBLIC flexraw_core_types_neutral)

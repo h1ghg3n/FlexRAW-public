@@ -6,7 +6,9 @@
 #include <gtest/gtest.h>
 
 #include "activity_client.h"
+#include "catalog_culling_client.h"
 #include "catalog_folder_client.h"
+#include "catalog_inclusion_client.h"
 #include "catalog_photo_client.h"
 #include "catalog_project_client.h"
 #include "catalog_session_client.h"
@@ -55,7 +57,9 @@ private:
 };
 
 static_assert(std::is_abstract_v<IActivityClient>);
+static_assert(std::is_abstract_v<ICatalogCullingClient>);
 static_assert(std::is_abstract_v<ICatalogFolderClient>);
+static_assert(std::is_abstract_v<ICatalogInclusionClient>);
 static_assert(std::is_abstract_v<ICatalogPhotoClient>);
 static_assert(std::is_abstract_v<ICatalogProjectClient>);
 static_assert(std::is_abstract_v<ICatalogSessionClient>);
@@ -69,6 +73,7 @@ static_assert(std::is_abstract_v<IExportDefaultsClient>);
 static_assert(std::is_abstract_v<IExportEventSource>);
 static_assert(std::is_abstract_v<IFolderImportClient>);
 static_assert(std::is_abstract_v<IFolderImportEventSource>);
+static_assert(std::is_abstract_v<IPreviewComparisonClient>);
 static_assert(std::is_abstract_v<IPreviewPresentationClient>);
 static_assert(std::is_abstract_v<IPreviewPresentationEventSource>);
 static_assert(std::is_abstract_v<ISourceResolutionClient>);
@@ -85,8 +90,45 @@ TEST(ClientSurfaceContractTest, PreservesFixedWidthIdentityAndBoundedPageDefault
 
     EXPECT_EQ(100, DefaultCatalogPhotoPageSize);
     EXPECT_EQ(200, MaximumCatalogPhotoPageSize);
+    EXPECT_EQ(200U, MaximumCatalogCullingBatchSize);
+    EXPECT_EQ(200U, MaximumCatalogInclusionBatchSize);
+    EXPECT_EQ(CatalogInclusionFilter::IncludedOnly, CatalogPhotoPageRequest{}.inclusionFilter);
     EXPECT_EQ(ClientPhotoId{42}, ClientPhotoId{42});
     EXPECT_NE(ClientProjectId{3}, ClientProjectId{4});
+}
+
+TEST(ClientSurfaceContractTest, KeepsCullingMutationSeparateFromBoundedReadFilter)
+{
+    CatalogPhotoPageRequest request;
+    request.cullingFilter = CatalogCullingFilter::Pick;
+    CatalogPhotoPageCursor cursor;
+    cursor.cullingFilter = CatalogCullingFilter::Pick;
+    request.cursor = cursor;
+    SetCatalogCullingCommand command;
+    command.expectedCatalogPath = "library.flexraw-catalog";
+    command.state = CatalogCullingState::Reject;
+    command.photoIds = {ClientPhotoId{7}, ClientPhotoId{3}, ClientPhotoId{7}};
+
+    EXPECT_EQ(CatalogCullingFilter::Pick, request.cursor->cullingFilter);
+    EXPECT_EQ(CatalogCullingState::Reject, command.state);
+    EXPECT_EQ(3U, command.photoIds.size());
+}
+
+TEST(ClientSurfaceContractTest, KeepsInclusionMutationSeparateFromBoundedReadFilter)
+{
+    CatalogPhotoPageRequest request;
+    request.inclusionFilter = CatalogInclusionFilter::ExcludedOnly;
+    CatalogPhotoPageCursor cursor;
+    cursor.inclusionFilter = CatalogInclusionFilter::ExcludedOnly;
+    request.cursor = cursor;
+    SetCatalogInclusionCommand command;
+    command.expectedCatalogPath = "library.flexraw-catalog";
+    command.state = CatalogInclusionState::Excluded;
+    command.photoIds = {ClientPhotoId{7}, ClientPhotoId{3}, ClientPhotoId{7}};
+
+    EXPECT_EQ(CatalogInclusionFilter::ExcludedOnly, request.cursor->inclusionFilter);
+    EXPECT_EQ(CatalogInclusionState::Excluded, command.state);
+    EXPECT_EQ(3U, command.photoIds.size());
 }
 
 TEST(ClientSurfaceContractTest, PreservesSuccessAndTypedFailureWithoutFrameworkTypes)
@@ -111,6 +153,52 @@ TEST(ClientSurfaceContractTest, SubscriptionHandleMakesUnsubscribeIdempotent)
     EXPECT_FALSE(subscription->isActive());
     subscription->unsubscribe();
     EXPECT_FALSE(subscription->isActive());
+}
+
+TEST(ClientSurfaceContractTest, KeepsDefaultDevelopComparisonSeparateFromCurrentPreview)
+{
+    const std::optional<DisplayFrame> frame = DisplayFrame::create(1, 1, 4, 7, {1, 2, 3, 255});
+    ASSERT_TRUE(frame.has_value());
+
+    PreviewPresentationSnapshot snapshot{};
+    snapshot.selectedPhotoId = ClientPhotoId{17};
+    snapshot.developRevision = SessionDevelopRevision{8};
+    snapshot.previewSequence = PreviewSequence{7};
+    snapshot.activeRequestId = PreviewRequestId{21};
+    snapshot.comparison.enabled = true;
+    snapshot.comparison.activeRequestId = PreviewRequestId{22};
+    snapshot.comparison.baselineFrame = PreviewComparisonFrameSnapshot{
+        PreviewRequestId{22}, ClientPhotoId{17}, SessionDevelopRevision{6}, PreviewFrameTier::Standard, *frame};
+
+    ASSERT_TRUE(snapshot.comparison.baselineFrame.has_value());
+    EXPECT_NE(snapshot.activeRequestId, snapshot.comparison.activeRequestId);
+    EXPECT_EQ(SessionDevelopRevision{6}, snapshot.comparison.baselineFrame->capturedDevelopRevision);
+    EXPECT_EQ(SessionDevelopRevision{8}, snapshot.developRevision);
+    EXPECT_EQ(4U, snapshot.comparison.baselineFrame->frame.bytes().size());
+
+    PreviewPresentationEvent event{};
+    event.snapshot = snapshot;
+    event.comparison = PreviewComparisonTransition{false,
+                                                   true,
+                                                   std::nullopt,
+                                                   PreviewTerminal{PreviewRequestId{22},
+                                                                   ClientPhotoId{17},
+                                                                   SessionDevelopRevision{6},
+                                                                   PreviewSequence{5},
+                                                                   PreviewTerminalState::Completed,
+                                                                   std::nullopt}};
+    ASSERT_TRUE(event.comparison.has_value());
+    ASSERT_TRUE(event.comparison->terminal.has_value());
+    EXPECT_EQ(PreviewRequestId{22}, event.comparison->terminal->requestId);
+    EXPECT_FALSE(event.terminal.has_value());
+    EXPECT_FALSE(event.frameUpdated);
+
+    const PreviewComparisonResult disabled = PreviewComparisonResult::success(PreviewComparisonCommandState{});
+    const PreviewComparisonResult rejected =
+        PreviewComparisonResult::failure({ClientErrorCode::Conflict, "No selected Preview source."});
+    EXPECT_FALSE(disabled.value().enabled);
+    ASSERT_TRUE(rejected.hasError());
+    EXPECT_EQ(ClientErrorCode::Conflict, rejected.error().code);
 }
 
 }  // namespace
