@@ -8,10 +8,14 @@
 
 #include <gtest/gtest.h>
 
+#include "catalog_culling_client.h"
+#include "catalog_inclusion_client.h"
 #include "catalog_orchestrator.h"
 #include "catalog_photo_client.h"
 #include "editor_client.h"
 #include "editor_orchestrator.h"
+#include "export_orchestrator.h"
+#include "export_pipeline.h"
 #include "preview_pipeline.h"
 #include "product_runtime.h"
 #include "source_resolution_client.h"
@@ -33,6 +37,22 @@ public:
     {
         return core::orchestration::PreviewPipelineResult::failure(
             {core::types::ErrorCode::Cancelled, QStringLiteral("Product Runtime test does not render previews.")});
+    }
+};
+
+class DormantExportPipeline final : public core::orchestration::IExportPipeline
+{
+public:
+    // 목적: Product Runtime ownership test에서 실행될 필요가 없는 Export를 명시적으로 종료
+    // 입력: request/cancellationToken/progress: interface 일치를 위한 미사용 Export context
+    // 출력: test 전용 Cancelled 오류
+    [[nodiscard]] core::orchestration::ExportPipelineResult execute(
+        const core::orchestration::ExportRequest&,
+        const core::types::CancellationToken&,
+        const core::orchestration::ExportProgressCallback&) const override
+    {
+        return core::orchestration::ExportPipelineResult::failure(
+            {core::types::ErrorCode::Cancelled, QStringLiteral("Product Runtime test does not export files.")});
     }
 };
 
@@ -61,8 +81,15 @@ TEST(ProductRuntimeTest, SharesCatalogEditorAndSourceEventAuthorityWithBoundedLi
     core::client::SourceResolutionSubscriptionHandle subscription;
 
     {
-        ProductRuntime runtime(std::make_unique<DormantPreviewPipeline>());
+        ProductRuntime runtime(
+            std::make_unique<DormantPreviewPipeline>(),
+            std::make_unique<core::orchestration::ExportOrchestrator>(std::make_unique<DormantExportPipeline>(), 1));
         ASSERT_TRUE(runtime.catalogOrchestrator().openCatalog(catalogPath).hasValue());
+        EXPECT_EQ(runtime.exportOrchestrator().schedulingMetrics().submitted, 0U);
+        EXPECT_EQ(&runtime.catalogCullingClient(),
+                  static_cast<core::client::ICatalogCullingClient*>(&runtime.catalogOrchestrator()));
+        EXPECT_EQ(&runtime.catalogInclusionClient(),
+                  static_cast<core::client::ICatalogInclusionClient*>(&runtime.catalogOrchestrator()));
 
         core::client::ICatalogPhotoClient& catalogPhotoClient = runtime.catalogOrchestrator();
         const core::client::CatalogPhotoPageResult page =

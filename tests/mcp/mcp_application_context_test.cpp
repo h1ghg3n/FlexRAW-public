@@ -4,8 +4,10 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QVector>
@@ -272,6 +274,136 @@ TEST(McpApplicationContextTest, StandaloneProcessSelectsAndEditsWithoutPersistin
         ASSERT_TRUE(state.hasValue());
         EXPECT_FALSE(state.value().has_value());
     }
+}
+
+TEST(McpApplicationContextTest, StandaloneProcessExportsSelectedPhotoToLocalJpegArtifact)
+{
+    ensureCoreApplication();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("export.flexraw-catalog"));
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("export-source.jpg"));
+    const QString outputPath = QDir(directory.path()).filePath(QStringLiteral("export-result.jpg"));
+    {
+        QFile source(sourcePath);
+        ASSERT_TRUE(source.open(QIODevice::WriteOnly));
+        const QByteArray jpeg = QByteArray::fromBase64(
+            "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMU"
+            "FRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+            "FBQUFBQUFBT/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+            "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+            "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi"
+            "4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC"
+            "AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVm"
+            "Z2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
+            "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD7V/Z2+C3w91v9n74ZajqPgTwzf6heeF9MuLm7utHt5JZ5XtImd3dkJZmJJJJySSTRRRXy"
+            "OL/3ip/if5nwmO/3qr/il+bP/9k=");
+        ASSERT_EQ(source.write(jpeg), jpeg.size());
+    }
+
+    core::types::PhotoId photoId;
+    {
+        core::catalog::CatalogDatabaseOpenResult database = core::catalog::CatalogDatabase::open(catalogPath);
+        ASSERT_TRUE(database.hasValue()) << database.error().message.toStdString();
+        core::catalog::CatalogPhotoRepository repository(*database.value());
+        const QVector<core::catalog::CatalogEntry> entries{
+            {core::types::FileDescriptor{sourcePath,
+                                         QStringLiteral("jpg"),
+                                         QStringLiteral("export-source.jpg"),
+                                         core::types::SupportedFileKind::RasterImage},
+             core::types::FileScanStatus::Ready}};
+        ASSERT_TRUE(repository.upsert(entries).hasValue());
+        const core::catalog::CatalogPhotoQueryResult photos =
+            repository.queryPage(core::catalog::CatalogPhotoPageRequest{});
+        ASSERT_TRUE(photos.hasValue());
+        ASSERT_EQ(photos.value().photos.size(), 1);
+        photoId = photos.value().photos.front().id;
+    }
+
+    const QString executable = QString::fromUtf8(FLEXRAW_MCP_EXECUTABLE_PATH);
+    QProcess process;
+    process.setProgram(executable);
+    QProcessEnvironment childEnvironment = QProcessEnvironment::systemEnvironment();
+    childEnvironment.insert(QStringLiteral("PATH"), QFileInfo(executable).absolutePath());
+    process.setProcessEnvironment(childEnvironment);
+    process.setArguments({QStringLiteral("--catalog"), catalogPath, QStringLiteral("--allow-write")});
+    process.start();
+    ASSERT_TRUE(process.waitForStarted(5'000));
+    const QByteArray startup =
+        QStringLiteral("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":"
+                       "\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n"
+                       "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"
+                       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":"
+                       "\"editor_select_photo\",\"arguments\":{\"photo_id\":\"%1\"}}}\n")
+            .arg(photoId.value)
+            .toUtf8();
+    ASSERT_EQ(process.write(startup), startup.size());
+    ASSERT_TRUE(process.waitForBytesWritten(2'000));
+
+    QByteArray output;
+    bool sourceReady = false;
+    int requestId = 3;
+    for (int attempt = 0; attempt < 50 && !sourceReady; ++attempt)
+    {
+        const QByteArray poll =
+            QStringLiteral("{\"jsonrpc\":\"2.0\",\"id\":%1,\"method\":\"tools/call\",\"params\":{\"name\":"
+                           "\"source_resolution_events\",\"arguments\":{\"after_sequence\":\"0\"}}}\n")
+                .arg(requestId++)
+                .toUtf8();
+        ASSERT_EQ(process.write(poll), poll.size());
+        ASSERT_TRUE(process.waitForBytesWritten(2'000));
+        if (process.waitForReadyRead(1'000))
+        {
+            output.append(process.readAllStandardOutput());
+        }
+        sourceReady = output.contains("\"state\":\"completed\"");
+    }
+    ASSERT_TRUE(sourceReady);
+
+    const QByteArray submit =
+        QStringLiteral("{\"jsonrpc\":\"2.0\",\"id\":%1,\"method\":\"tools/call\",\"params\":{\"name\":"
+                       "\"export_selected_photo_local\",\"arguments\":{\"output_locator\":%2,\"jpeg_quality\":86}}}\n")
+            .arg(requestId++)
+            .arg(QString::fromUtf8(QJsonDocument(QJsonArray{outputPath}).toJson(QJsonDocument::Compact))
+                     .mid(1)
+                     .chopped(1))
+            .toUtf8();
+    ASSERT_EQ(process.write(submit), submit.size());
+    ASSERT_TRUE(process.waitForBytesWritten(2'000));
+
+    bool exportCompleted = false;
+    for (int attempt = 0; attempt < 200 && !exportCompleted; ++attempt)
+    {
+        const QByteArray poll =
+            QStringLiteral("{\"jsonrpc\":\"2.0\",\"id\":%1,\"method\":\"tools/call\",\"params\":{\"name\":"
+                           "\"export_events\",\"arguments\":{\"after_sequence\":\"0\"}}}\n")
+                .arg(requestId++)
+                .toUtf8();
+        ASSERT_EQ(process.write(poll), poll.size());
+        ASSERT_TRUE(process.waitForBytesWritten(2'000));
+        if (process.waitForReadyRead(1'000))
+        {
+            output.append(process.readAllStandardOutput());
+        }
+        exportCompleted = output.contains("\"completed\":{") && output.contains("export-result.jpg");
+        if (!exportCompleted)
+        {
+            QThread::msleep(25);
+        }
+    }
+    process.closeWriteChannel();
+    ASSERT_TRUE(process.waitForFinished(10'000));
+    output.append(process.readAllStandardOutput());
+    const QByteArray diagnostics = process.readAllStandardError();
+
+    EXPECT_TRUE(exportCompleted) << output.constData();
+    EXPECT_EQ(process.exitStatus(), QProcess::NormalExit);
+    EXPECT_EQ(process.exitCode(), 0);
+    EXPECT_TRUE(diagnostics.isEmpty()) << diagnostics.constData();
+    ASSERT_TRUE(QFileInfo::exists(outputPath));
+    QFile artifact(outputPath);
+    ASSERT_TRUE(artifact.open(QIODevice::ReadOnly));
+    EXPECT_EQ(artifact.read(2).toHex(), QByteArray("ffd8"));
 }
 
 TEST(McpApplicationContextTest, StandaloneProcessPublishesCompletedSourceLifecycleThroughBoundedPolling)

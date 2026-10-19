@@ -3,7 +3,9 @@
 #include <QImage>
 #include <QImageReader>
 
+#include <cstdint>
 #include <limits>
+#include <span>
 #include <utility>
 
 namespace flexraw::core::preview {
@@ -180,13 +182,14 @@ ThumbnailPreviewResult createThumbnailPreview(const raw::RawThumbnail& thumbnail
 // 출력: QImage 값 또는 구조화된 오류
 ThumbnailPreviewResult createStandardRawPreview(const raw::RawPreviewImage& image, const QSize& targetSize)
 {
+    const std::span<const std::uint8_t> bytes = image.raster.bytes();
     const raw::RawThumbnail bitmap{
-        QByteArray::fromRawData(image.data.constData(), image.data.size()),
+        QByteArray::fromRawData(reinterpret_cast<const char*>(bytes.data()), static_cast<qsizetype>(bytes.size())),
         raw::ThumbnailFormat::Bitmap,
-        image.width,
-        image.height,
-        image.channelCount,
-        image.bitsPerChannel,
+        static_cast<int>(image.raster.width()),
+        static_cast<int>(image.raster.height()),
+        static_cast<int>(image.raster.channelCount()),
+        8,
     };
 
     const ThumbnailPreviewResult preview = createThumbnailPreview(bitmap, targetSize);
@@ -194,7 +197,8 @@ ThumbnailPreviewResult createStandardRawPreview(const raw::RawPreviewImage& imag
         return preview;
     }
 
-    return ThumbnailPreviewResult::success(raw::applyRawPreviewOrientation(preview.value(), image.orientation));
+    return ThumbnailPreviewResult::success(
+        raw::applyRawPreviewOrientation(preview.value(), image.raster.pendingOrientation()));
 }
 
 // 목적: RAW 파일의 embedded thumbnail을 추출해 UI용 QImage preview 생성

@@ -8,7 +8,7 @@
 
 #include "catalog_orchestrator.h"
 #include "client_error_projection.h"
-#include "develop.h"
+#include "develop_validation_adapter.h"
 #include "editor_client_projection.h"
 #include "preview_orchestrator.h"
 
@@ -110,6 +110,7 @@ EditorOrchestrator::EditorOrchestrator(PreviewOrchestrator& previewOrchestrator,
     connect(&m_previewDebounceTimer, &QTimer::timeout, this, &EditorOrchestrator::submitPreview);
     connect(&m_previewResizeDebounceTimer, &QTimer::timeout, this, &EditorOrchestrator::submitPreview);
     connect(&m_interactiveThrottleTimer, &QTimer::timeout, this, &EditorOrchestrator::submitPendingInteractivePreview);
+    connectPreviewComparisonSignals();
     connect(m_previewOrchestrator, &PreviewOrchestrator::previewUpdated, this, [this](const PreviewResult& result) {
         if (isCurrentPreview(result))
         {
@@ -166,6 +167,50 @@ EditorOrchestrator::EditorOrchestrator(PreviewOrchestrator& previewOrchestrator,
             &EditorOrchestrator::handleSourceBindingUpdated);
 }
 
+// 목적: Preview worker 결과를 일반 Preview와 기본 Develop 비교 owner로 분리
+// 입력: 없음
+// 출력: 비교 frame·warning·terminal signal 연결
+void EditorOrchestrator::connectPreviewComparisonSignals()
+{
+    connect(m_previewOrchestrator, &PreviewOrchestrator::previewUpdated, this, [this](const PreviewResult& result) {
+        if (isCurrentComparison(result))
+        {
+            emit previewComparisonUpdated(result);
+        }
+    });
+    connect(m_previewOrchestrator, &PreviewOrchestrator::previewWarning, this, [this](const PreviewIssue& issue) {
+        if (m_comparisonRequestId != 0 && issue.requestId == m_comparisonRequestId)
+        {
+            emit previewComparisonWarning(issue);
+        }
+    });
+    connect(m_previewOrchestrator, &PreviewOrchestrator::previewCompleted, this, [this](types::RequestId requestId) {
+        if (m_comparisonRequestId != 0 && requestId == m_comparisonRequestId)
+        {
+            m_comparisonRequestId = 0;
+            emit previewComparisonCompleted(requestId);
+        }
+    });
+    connect(m_previewOrchestrator, &PreviewOrchestrator::previewFailed, this, [this](const PreviewIssue& issue) {
+        if (m_comparisonRequestId != 0 && issue.requestId == m_comparisonRequestId)
+        {
+            m_comparisonRequestId = 0;
+            m_comparisonEnabled = false;
+            emit previewComparisonFailed(issue);
+            emit previewComparisonStateChanged();
+        }
+    });
+    connect(m_previewOrchestrator, &PreviewOrchestrator::previewCancelled, this, [this](types::RequestId requestId) {
+        if (m_comparisonRequestId != 0 && requestId == m_comparisonRequestId)
+        {
+            m_comparisonRequestId = 0;
+            m_comparisonEnabled = false;
+            emit previewComparisonCancelled(requestId);
+            emit previewComparisonStateChanged();
+        }
+    });
+}
+
 // 목적: editor session의 debounce와 active preview를 수명 종료 전에 취소
 // 입력: 없음
 // 출력: session-owned request가 남지 않음
@@ -175,6 +220,7 @@ EditorOrchestrator::~EditorOrchestrator()
     m_previewResizeDebounceTimer.stop();
     m_interactiveThrottleTimer.stop();
     cancelActivePreview();
+    clearPreviewComparison();
 }
 
 // 목적: 현재 Editor session의 immutable Qt-free state 조회
@@ -220,6 +266,65 @@ client::PreviewRequestCancelResult EditorOrchestrator::cancelPreviewRequest(clie
             {client::ClientErrorCode::NotFound, "Preview request is no longer active."});
     }
     return client::PreviewRequestCancelResult::success(requestId);
+}
+
+// 목적: 현재 Editor selection의 기본 Develop Preview 비교를 시작하거나 해제
+// 입력: command: 비교 활성화 여부
+// 출력: 비교 상태와 accepted request identity 또는 validation/submit 오류
+client::PreviewComparisonResult EditorOrchestrator::setPreviewComparison(
+    const client::SetPreviewComparisonCommand& command)
+{
+    if (!command.enabled)
+    {
+        clearPreviewComparison();
+        return client::PreviewComparisonResult::success(previewComparisonState());
+    }
+    if (m_comparisonEnabled)
+    {
+        return client::PreviewComparisonResult::success(previewComparisonState());
+    }
+    if (!m_currentCatalogPhotoId.has_value() || !m_sourceProcessingAllowed || m_currentSource.path.isEmpty() ||
+        !hasPreviewTarget(m_previewTargetSize))
+    {
+        return client::PreviewComparisonResult::failure(
+            {client::ClientErrorCode::Conflict, "Comparison requires a selected source and Preview viewport."});
+    }
+
+    const EditorState currentState = state();
+    const PreviewRequest request{currentState.photo,
+                                 currentState.source,
+                                 m_previewTargetSize,
+                                 types::DevelopParams{},
+                                 m_previewSequence,
+                                 PreviewProgression::FinalOnly,
+                                 PreviewRenderMode::Final};
+    const PreviewSubmissionResult submitted = m_previewOrchestrator->submitPreview(request);
+    if (submitted.hasError())
+    {
+        return client::PreviewComparisonResult::failure(toClientError(submitted.error()));
+    }
+
+    m_comparisonRequestId = submitted.value();
+    m_comparisonCapturedRevision = currentState.photo.developRevision;
+    m_comparisonCapturedSequence = m_previewSequence;
+    m_comparisonSessionKey = currentHistoryKey();
+    m_comparisonSourcePath = m_currentSource.path;
+    m_comparisonTargetSize = m_previewTargetSize;
+    m_comparisonEnabled = true;
+    emit previewComparisonStateChanged();
+    emit previewComparisonStarted(m_comparisonRequestId);
+    return client::PreviewComparisonResult::success(previewComparisonState());
+}
+
+// 목적: delivery adapter가 현재 authoritative 비교 활성 상태와 request ID 조회
+// 입력: 없음
+// 출력: frame 복제를 포함하지 않는 비교 command state
+client::PreviewComparisonCommandState EditorOrchestrator::previewComparisonState() const noexcept
+{
+    return {m_comparisonEnabled,
+            m_comparisonRequestId != 0
+                ? std::optional<client::PreviewRequestId>{client::PreviewRequestId{m_comparisonRequestId}}
+                : std::nullopt};
 }
 
 // 목적: Preview presentation adapter가 현재 target 크기를 owner context에서 조회
@@ -506,6 +611,7 @@ EditorStateResult EditorOrchestrator::selectCatalogPhoto(types::PhotoId photoId,
     m_previewDebounceTimer.stop();
     m_previewResizeDebounceTimer.stop();
     cancelActivePreview();
+    clearPreviewComparison();
     m_currentCatalogPhotoId = photoId;
     m_currentCatalogIdentity = m_catalogOrchestrator->state().catalogPath;
     m_currentSourceState = resolved.value().photo.sourceState;
@@ -568,6 +674,12 @@ EditorStateResult EditorOrchestrator::saveCurrentPhoto()
 
     m_sessionBaselines.insert(photoKey, saved.value().developParams);
     m_persistedRevisions.insert(photoKey, saved.value().persistedRevision);
+    if (m_currentSource.path != makeSourceDescriptor(saved.value().photo).path ||
+        m_sourceProcessingAllowed != saved.value().sourceProcessingAllowed ||
+        m_currentSourceState != saved.value().photo.sourceState)
+    {
+        clearPreviewComparison();
+    }
     m_sourceProcessingAllowed = saved.value().sourceProcessingAllowed;
     m_currentSourceState = saved.value().photo.sourceState;
     m_currentSource = makeSourceDescriptor(saved.value().photo);
@@ -587,6 +699,7 @@ void EditorOrchestrator::clearSelection()
     m_previewDebounceTimer.stop();
     m_previewResizeDebounceTimer.stop();
     cancelActivePreview();
+    clearPreviewComparison();
     if (!photoKey.isEmpty())
     {
         m_developHistory.discardPhoto(photoKey);
@@ -652,6 +765,7 @@ bool EditorOrchestrator::updatePreviewTargetSize(const QSize& targetSize)
     }
 
     m_previewTargetSize = targetSize;
+    clearPreviewComparison();
     if (m_currentSource.path.isEmpty() || !m_sourceProcessingAllowed)
     {
         emit previewPresentationStateChanged();
@@ -926,6 +1040,44 @@ bool EditorOrchestrator::isCurrentPreview(const PreviewResult& result) const
            result.previewSequence == m_previewSequence;
 }
 
+// 목적: 늦은 비교 frame이 아직 같은 session·source·viewport의 요청인지 확인
+// 입력: result: worker가 완료한 비교 Preview frame
+// 출력: 현재 비교 요청과 모든 캡처 identity가 일치하면 true
+bool EditorOrchestrator::isCurrentComparison(const PreviewResult& result) const
+{
+    const EditorState currentState = state();
+    return m_comparisonEnabled && m_comparisonRequestId != 0 && result.requestId == m_comparisonRequestId &&
+           currentState.hasSelection && result.photo.photoId.value == currentState.photo.photoId.value &&
+           result.photo.transientKey == currentState.photo.transientKey &&
+           result.photo.developRevision == m_comparisonCapturedRevision &&
+           result.previewSequence == m_comparisonCapturedSequence && m_comparisonSessionKey == currentHistoryKey() &&
+           result.sourcePath == m_comparisonSourcePath && m_currentSource.path == m_comparisonSourcePath &&
+           m_previewTargetSize == m_comparisonTargetSize && m_sourceProcessingAllowed;
+}
+
+// 목적: 현재 비교 요청을 취소하고 보유한 identity와 활성 상태 정리
+// 입력: 없음
+// 출력: accepted 요청이 있었으면 Cancelled terminal과 상태 변경 signal
+void EditorOrchestrator::clearPreviewComparison()
+{
+    if (!m_comparisonEnabled && m_comparisonRequestId == 0)
+    {
+        return;
+    }
+    const types::RequestId requestId = m_comparisonRequestId;
+    m_comparisonRequestId = 0;
+    m_comparisonEnabled = false;
+    m_comparisonSessionKey.clear();
+    m_comparisonSourcePath.clear();
+    m_comparisonTargetSize = {};
+    if (requestId != 0)
+    {
+        (void)m_previewOrchestrator->cancelPreview(requestId);
+        emit previewComparisonCancelled(requestId);
+    }
+    emit previewComparisonStateChanged();
+}
+
 // 목적: 현재 선택 PhotoId의 background source binding transition을 editor state에 반영
 // 입력: update: 완료된 fingerprint request와 갱신된 catalog photo
 // 출력: processing availability와 필요 시 progressive preview 갱신
@@ -937,6 +1089,7 @@ void EditorOrchestrator::handleSourceBindingUpdated(const CatalogSourceUpdate& u
         return;
     }
 
+    clearPreviewComparison();
     const bool wasProcessingAllowed = m_sourceProcessingAllowed;
     m_currentSource = makeSourceDescriptor(update.photo);
     m_currentSourceState = update.photo.sourceState;

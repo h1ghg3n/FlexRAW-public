@@ -102,6 +102,39 @@ TEST(ExportDefaultsPageTest, CancelLeavesPersistedDefaultsUnchanged)
     EXPECT_EQ(before.value(), after.value());
 }
 
+TEST(ExportDefaultsPageTest, EnablesOnlyOptionsUsedBySelectedFormat)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    QSettings storage(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    QtWorkerProfileSettingsAdapter workerProfiles(storage);
+    QtExportSettingsAdapter exportDefaults(storage);
+    SettingsDialog dialog(storage, workerProfiles, exportDefaults);
+    auto* format = dialog.findChild<QComboBox*>(QStringLiteral("exportDefaultsFormatComboBox"));
+    auto* jpegQuality = dialog.findChild<QSpinBox*>(QStringLiteral("exportDefaultsJpegQualitySpinBox"));
+    auto* pngCompression = dialog.findChild<QSpinBox*>(QStringLiteral("exportDefaultsPngCompressionSpinBox"));
+    auto* tiffCompression = dialog.findChild<QComboBox*>(QStringLiteral("exportDefaultsTiffCompressionComboBox"));
+    ASSERT_NE(nullptr, format);
+    ASSERT_NE(nullptr, jpegQuality);
+    ASSERT_NE(nullptr, pngCompression);
+    ASSERT_NE(nullptr, tiffCompression);
+
+    format->setCurrentIndex(format->findData(static_cast<int>(core::client::ExportRasterFormat::Jpeg)));
+    EXPECT_TRUE(jpegQuality->isEnabled());
+    EXPECT_FALSE(pngCompression->isEnabled());
+    EXPECT_FALSE(tiffCompression->isEnabled());
+
+    format->setCurrentIndex(format->findData(static_cast<int>(core::client::ExportRasterFormat::Png)));
+    EXPECT_FALSE(jpegQuality->isEnabled());
+    EXPECT_TRUE(pngCompression->isEnabled());
+    EXPECT_FALSE(tiffCompression->isEnabled());
+
+    format->setCurrentIndex(format->findData(static_cast<int>(core::client::ExportRasterFormat::Tiff)));
+    EXPECT_FALSE(jpegQuality->isEnabled());
+    EXPECT_FALSE(pngCompression->isEnabled());
+    EXPECT_TRUE(tiffCompression->isEnabled());
+}
+
 TEST(ExportDefaultsPageTest, RefreshesPreferredWorkerAfterProfileMutation)
 {
     QTemporaryDir directory;

@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "catalog_culling_client.h"
+#include "catalog_inclusion_client.h"
 #include "client_error.h"
 #include "client_identity.h"
 #include "client_result.h"
@@ -68,6 +70,8 @@ struct CatalogPhotoSnapshot
     CatalogScanStatus scanStatus{CatalogScanStatus::Pending};
     CatalogSourceFingerprint fingerprint;
     CatalogSourceState sourceState{CatalogSourceState::FingerprintPending};
+    CatalogCullingState cullingState{CatalogCullingState::Neutral};
+    CatalogInclusionState inclusionState{CatalogInclusionState::Included};
 
     bool operator==(const CatalogPhotoSnapshot&) const = default;
 };
@@ -78,6 +82,8 @@ struct CatalogPhotoPageCursor
     ClientPhotoId photoId;
     std::optional<std::string> exactFolderPath;
     std::optional<ClientProjectId> projectId;
+    CatalogCullingFilter cullingFilter{CatalogCullingFilter::All};
+    CatalogInclusionFilter inclusionFilter{CatalogInclusionFilter::IncludedOnly};
 
     bool operator==(const CatalogPhotoPageCursor&) const = default;
 };
@@ -89,6 +95,8 @@ struct CatalogPhotoPageRequest
     std::optional<CatalogPhotoPageCursor> cursor;
     std::optional<std::string> exactFolderPath;
     std::optional<ClientProjectId> projectId;
+    CatalogCullingFilter cullingFilter{CatalogCullingFilter::All};
+    CatalogInclusionFilter inclusionFilter{CatalogInclusionFilter::IncludedOnly};
 };
 
 struct CatalogPhotoPage

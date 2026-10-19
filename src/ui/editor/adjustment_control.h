@@ -221,6 +221,7 @@ private:
     QSlider* m_classicSlider{nullptr};
     RelativeAdjustmentControl* m_relativeControl{nullptr};
     QDoubleSpinBox* m_valueSpinBox{nullptr};
+    QTimer* m_spinCommitTimer{nullptr};
     QWidget* m_classicPage{nullptr};
     QWidget* m_relativePage{nullptr};
     AdjustmentControlStyle m_controlStyle{AdjustmentControlStyle::Classic};

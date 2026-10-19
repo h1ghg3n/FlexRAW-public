@@ -176,6 +176,7 @@ QtPreviewPresentationEventAdapter::QtPreviewPresentationEventAdapter(
 {
     Q_ASSERT(m_editorOrchestrator->thread() == thread());
     synchronizeOwnerState();
+    connectComparisonSignals();
     connect(m_editorOrchestrator,
             &core::orchestration::EditorOrchestrator::previewPresentationStateChanged,
             this,
@@ -210,6 +211,49 @@ QtPreviewPresentationEventAdapter::QtPreviewPresentationEventAdapter(
             &core::orchestration::EditorOrchestrator::previewCancelled,
             this,
             &QtPreviewPresentationEventAdapter::recordCancelled,
+            Qt::DirectConnection);
+}
+
+// 목적: Core owner의 별도 비교 lifecycle signal을 delivery adapter에 연결
+// 입력: 없음
+// 출력: 동일 Qt thread의 direct signal 연결
+void QtPreviewPresentationEventAdapter::connectComparisonSignals()
+{
+    using Owner = core::orchestration::EditorOrchestrator;
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonStateChanged,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonStateChanged,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonStarted,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonStarted,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonUpdated,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonFrame,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonWarning,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonWarning,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonCompleted,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonCompleted,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonFailed,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonFailed,
+            Qt::DirectConnection);
+    connect(m_editorOrchestrator,
+            &Owner::previewComparisonCancelled,
+            this,
+            &QtPreviewPresentationEventAdapter::recordComparisonCancelled,
             Qt::DirectConnection);
 }
 
@@ -306,6 +350,7 @@ void QtPreviewPresentationEventAdapter::synchronizeOwnerState()
             : std::nullopt;
     const std::uint64_t activeRequestId = m_editorOrchestrator->activePreviewRequestId();
     m_snapshot.activeRequestId = toOptionalRequestId(activeRequestId);
+    synchronizeComparisonState(targetSize);
 
     if (m_snapshot.currentFrame.has_value() &&
         (!m_snapshot.selectedPhotoId.has_value() || m_snapshot.currentFrame->photoId != *m_snapshot.selectedPhotoId ||
@@ -317,6 +362,24 @@ void QtPreviewPresentationEventAdapter::synchronizeOwnerState()
     if (!m_snapshot.activeRequestId.has_value())
     {
         m_activeRequest.reset();
+    }
+}
+
+// 목적: 현재 사진·viewport와 Core 비교 상태에 맞춰 비교 frame을 보존 또는 폐기
+// 입력: targetSize: owner의 최신 render viewport
+// 출력: 비교 snapshot과 frame validity 동기화
+void QtPreviewPresentationEventAdapter::synchronizeComparisonState(const QSize& targetSize)
+{
+    const core::client::PreviewComparisonCommandState owner = m_editorOrchestrator->previewComparisonState();
+    m_snapshot.comparison.enabled = owner.enabled;
+    m_snapshot.comparison.activeRequestId = owner.activeRequestId;
+    const auto& frame = m_snapshot.comparison.baselineFrame;
+    if (!owner.enabled || !m_snapshot.selectedPhotoId.has_value() ||
+        (frame.has_value() &&
+         (frame->photoId != *m_snapshot.selectedPhotoId || m_comparisonViewport != std::optional<QSize>{targetSize})))
+    {
+        m_snapshot.comparison.baselineFrame.reset();
+        m_comparisonViewport.reset();
     }
 }
 
@@ -389,6 +452,151 @@ void QtPreviewPresentationEventAdapter::recordFrame(const core::orchestration::P
     m_snapshot.activeRequestId = frame.requestId;
     m_snapshot.currentFrame = std::move(frame);
     publishEvent(false, true, std::nullopt, std::nullopt);
+}
+
+// 목적: 비교 활성화 또는 무효화를 독립 transition으로 발행
+// 입력: 없음
+// 출력: 비교 상태가 반영된 event
+void QtPreviewPresentationEventAdapter::recordComparisonStateChanged()
+{
+    synchronizeOwnerState();
+    publishEvent(false, false, std::nullopt, std::nullopt, core::client::PreviewComparisonTransition{});
+}
+
+// 목적: accepted 비교 요청의 캡처 identity를 보관
+// 입력: requestId: Core owner가 발급한 identity
+// 출력: 비교 시작 event
+void QtPreviewPresentationEventAdapter::recordComparisonStarted(std::uint64_t requestId)
+{
+    synchronizeOwnerState();
+    if (requestId == 0 || m_snapshot.comparison.activeRequestId != core::client::PreviewRequestId{requestId})
+    {
+        return;
+    }
+    m_activeComparison = ActiveRequestContext{
+        {requestId}, m_snapshot.selectedPhotoId, m_snapshot.developRevision, m_snapshot.previewSequence};
+    core::client::PreviewComparisonTransition transition;
+    transition.requestStarted = true;
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
+}
+
+// 목적: 기본 Develop frame을 일반 Preview와 별도 snapshot에 투영
+// 입력: result: owner가 검증한 비교 frame
+// 출력: 비교 frame event 또는 projection warning
+void QtPreviewPresentationEventAdapter::recordComparisonFrame(const core::orchestration::PreviewResult& result)
+{
+    synchronizeOwnerState();
+    if (!m_activeComparison.has_value() || m_activeComparison->requestId.value != result.requestId ||
+        !m_snapshot.comparison.enabled || m_snapshot.selectedPhotoId != m_activeComparison->photoId)
+    {
+        return;
+    }
+    const std::optional<core::client::DisplayFrame> displayFrame = toDisplayFrame(result.image, result.previewSequence);
+    core::client::PreviewComparisonTransition transition;
+    if (!displayFrame.has_value())
+    {
+        transition.warning = core::client::PreviewWarning{
+            m_activeComparison->requestId,
+            m_activeComparison->photoId,
+            m_activeComparison->developRevision,
+            m_activeComparison->previewSequence,
+            {core::client::ClientErrorCode::Unknown, "Unable to project the comparison Preview image."}};
+        publishEvent(false, false, std::nullopt, std::nullopt, transition);
+        return;
+    }
+    m_comparisonViewport = m_editorOrchestrator->previewTargetSize();
+    m_snapshot.comparison.baselineFrame = core::client::PreviewComparisonFrameSnapshot{{result.requestId},
+                                                                                       {result.photo.photoId.value},
+                                                                                       {result.photo.developRevision},
+                                                                                       toClientTier(result.tier),
+                                                                                       *displayFrame};
+    transition.frameUpdated = true;
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
+}
+
+// 목적: 비교 pipeline 경고를 일반 Preview 경고와 분리
+// 입력: issue: accepted 비교 request context
+// 출력: 비교 warning event
+void QtPreviewPresentationEventAdapter::recordComparisonWarning(const core::orchestration::PreviewIssue& issue)
+{
+    if (!m_activeComparison.has_value() || m_activeComparison->requestId.value != issue.requestId)
+    {
+        return;
+    }
+    synchronizeOwnerState();
+    core::client::PreviewComparisonTransition transition;
+    transition.warning = core::client::PreviewWarning{m_activeComparison->requestId,
+                                                      m_activeComparison->photoId,
+                                                      m_activeComparison->developRevision,
+                                                      m_activeComparison->previewSequence,
+                                                      core::orchestration::toClientError(issue.error)};
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
+}
+
+// 목적: accepted 비교 정상 완료를 exact terminal로 투영
+// 입력: requestId: 완료된 비교 request identity
+// 출력: 비교 Completed terminal event
+void QtPreviewPresentationEventAdapter::recordComparisonCompleted(std::uint64_t requestId)
+{
+    if (!m_activeComparison.has_value() || m_activeComparison->requestId.value != requestId)
+    {
+        return;
+    }
+    const ActiveRequestContext context = *m_activeComparison;
+    synchronizeOwnerState();
+    m_activeComparison.reset();
+    core::client::PreviewComparisonTransition transition;
+    transition.terminal = core::client::PreviewTerminal{context.requestId,
+                                                        context.photoId,
+                                                        context.developRevision,
+                                                        context.previewSequence,
+                                                        core::client::PreviewTerminalState::Completed,
+                                                        std::nullopt};
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
+}
+
+// 목적: 비교 실패를 일반 Preview frame에 영향 없이 투영
+// 입력: issue: 비교 request와 typed error
+// 출력: 비교 Failed terminal event
+void QtPreviewPresentationEventAdapter::recordComparisonFailed(const core::orchestration::PreviewIssue& issue)
+{
+    if (!m_activeComparison.has_value() || m_activeComparison->requestId.value != issue.requestId)
+    {
+        return;
+    }
+    const ActiveRequestContext context = *m_activeComparison;
+    synchronizeOwnerState();
+    m_activeComparison.reset();
+    core::client::PreviewComparisonTransition transition;
+    transition.terminal = core::client::PreviewTerminal{context.requestId,
+                                                        context.photoId,
+                                                        context.developRevision,
+                                                        context.previewSequence,
+                                                        core::client::PreviewTerminalState::Failed,
+                                                        core::orchestration::toClientError(issue.error)};
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
+}
+
+// 목적: 비교 취소를 일반 Preview와 분리해 전달
+// 입력: requestId: 취소된 비교 request identity
+// 출력: 비교 Cancelled terminal event
+void QtPreviewPresentationEventAdapter::recordComparisonCancelled(std::uint64_t requestId)
+{
+    if (!m_activeComparison.has_value() || m_activeComparison->requestId.value != requestId)
+    {
+        return;
+    }
+    const ActiveRequestContext context = *m_activeComparison;
+    synchronizeOwnerState();
+    m_activeComparison.reset();
+    core::client::PreviewComparisonTransition transition;
+    transition.terminal = core::client::PreviewTerminal{context.requestId,
+                                                        context.photoId,
+                                                        context.developRevision,
+                                                        context.previewSequence,
+                                                        core::client::PreviewTerminalState::Cancelled,
+                                                        std::nullopt};
+    publishEvent(false, false, std::nullopt, std::nullopt, transition);
 }
 
 // 목적: owner의 비치명적 Preview issue를 client warning으로 투영
@@ -482,10 +690,12 @@ void QtPreviewPresentationEventAdapter::recordCancelled(std::uint64_t requestId)
 // 목적: current snapshot과 optional warning/terminal을 모든 active subscription에 fan-out
 // 입력: requestStarted/frameUpdated: transition 종류, warning/terminal: 이번 transition payload
 // 출력: subscription별 Qt queued callback 등록
-void QtPreviewPresentationEventAdapter::publishEvent(bool requestStarted,
-                                                     bool frameUpdated,
-                                                     std::optional<core::client::PreviewWarning> warning,
-                                                     std::optional<core::client::PreviewTerminal> terminal)
+void QtPreviewPresentationEventAdapter::publishEvent(
+    bool requestStarted,
+    bool frameUpdated,
+    std::optional<core::client::PreviewWarning> warning,
+    std::optional<core::client::PreviewTerminal> terminal,
+    std::optional<core::client::PreviewComparisonTransition> comparison)
 {
     if (m_shuttingDown)
     {
@@ -499,6 +709,7 @@ void QtPreviewPresentationEventAdapter::publishEvent(bool requestStarted,
         frameUpdated,
         std::move(warning),
         std::move(terminal),
+        std::move(comparison),
     };
     auto subscription = m_subscriptions.begin();
     while (subscription != m_subscriptions.end())

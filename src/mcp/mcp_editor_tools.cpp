@@ -69,7 +69,15 @@ constexpr auto EditorSetExposureToolName = "editor_set_exposure";
 // 출력: 현재 parameter field와 white balance mode를 가진 JSON object
 [[nodiscard]] QJsonObject developParamsToJson(const core::client::EditorDevelopParams& params)
 {
+    QJsonArray hsl;
+    for (const auto& channel : params.hsl.channels)
+    {
+        hsl.append(QJsonObject{{QStringLiteral("hue"), channel.hue},
+                               {QStringLiteral("saturation"), channel.saturation},
+                               {QStringLiteral("luminance"), channel.luminance}});
+    }
     return QJsonObject{
+        {QStringLiteral("hsl"), hsl},
         {QStringLiteral("exposure_ev"), params.exposureEv},
         {QStringLiteral("contrast"), params.contrast},
         {QStringLiteral("highlights"), params.highlights},

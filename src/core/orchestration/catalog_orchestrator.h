@@ -7,7 +7,9 @@
 #include <QThreadPool>
 
 #include "catalog_contracts.h"
+#include "catalog_culling_client.h"
 #include "catalog_folder_client.h"
+#include "catalog_inclusion_client.h"
 #include "catalog_photo_client.h"
 #include "catalog_project_client.h"
 #include "folder_import_client.h"
@@ -29,7 +31,9 @@ namespace flexraw::core::orchestration
 {
 
 class CatalogOrchestrator final : public QObject,
+                                  public client::ICatalogCullingClient,
                                   public client::ICatalogFolderClient,
+                                  public client::ICatalogInclusionClient,
                                   public client::ICatalogProjectClient,
                                   public client::ICatalogPhotoClient,
                                   public client::IFolderImportClient,
@@ -73,6 +77,18 @@ public:
     // 출력: stable order photo snapshot과 양방향 cursor 또는 구조화된 client 오류
     [[nodiscard]] client::CatalogPhotoPageResult queryPhotoPage(
         const client::CatalogPhotoPageRequest& request) const override;
+
+    // 목적: expected active Catalog의 stable Photo batch에 선별 상태 적용
+    // 입력: command: Catalog path, target state와 중복 가능 Photo identity 목록
+    // 출력: 정규화된 identity receipt 또는 validation·session·repository 오류
+    [[nodiscard]] client::CatalogCullingResult setCatalogCulling(
+        const client::SetCatalogCullingCommand& command) override;
+
+    // 목적: expected active Catalog의 stable Photo batch에 등록 포함 상태 적용
+    // 입력: command: Catalog path, target state와 중복 가능 Photo identity 목록
+    // 출력: 정규화된 identity receipt 또는 validation·session·repository 오류
+    [[nodiscard]] client::CatalogInclusionResult setCatalogInclusion(
+        const client::SetCatalogInclusionCommand& command) override;
 
     // 목적: active Catalog에서 linked Photo가 존재하는 distinct Folder snapshot 조회
     // 입력: 없음

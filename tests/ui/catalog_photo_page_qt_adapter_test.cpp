@@ -23,6 +23,8 @@ TEST(CatalogPhotoPageQtAdapterTest, PreservesUtf8SourceIdentityAndFingerprintSta
     snapshot.scanStatus = core::client::CatalogScanStatus::Ready;
     snapshot.fingerprint = {1234, 5678, {0, 127, 128, 255}};
     snapshot.sourceState = core::client::CatalogSourceState::ReplacementDetected;
+    snapshot.cullingState = core::client::CatalogCullingState::Pick;
+    snapshot.inclusionState = core::client::CatalogInclusionState::Excluded;
 
     const core::catalog::CatalogPhotoRecord photo = toCatalogPhotoRecord(snapshot);
 
@@ -38,6 +40,8 @@ TEST(CatalogPhotoPageQtAdapterTest, PreservesUtf8SourceIdentityAndFingerprintSta
     EXPECT_EQ(128, static_cast<std::uint8_t>(photo.fingerprint.sha256[2]));
     EXPECT_EQ(255, static_cast<std::uint8_t>(photo.fingerprint.sha256[3]));
     EXPECT_EQ(core::catalog::SourceBindingState::ReplacementDetected, photo.sourceState);
+    EXPECT_EQ(core::catalog::CatalogCullingState::Pick, photo.cullingState);
+    EXPECT_EQ(core::catalog::CatalogInclusionState::Excluded, photo.inclusionState);
 }
 
 TEST(CatalogPhotoPageQtAdapterTest, PreservesStableOrderAndAbsentSource)

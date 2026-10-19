@@ -22,6 +22,8 @@
 #include <gtest/gtest.h>
 
 #include "catalog_database.h"
+#include "catalog_develop_repository.h"
+#include "catalog_photo_repository.h"
 #include "export_orchestrator.h"
 #include "export_pipeline.h"
 #include "test_application.h"
@@ -74,6 +76,24 @@ namespace
     QImage image(QSize(2, 2), QImage::Format_RGB32);
     image.fill(Qt::darkGreen);
     return image.save(path);
+}
+
+// 목적: Export preparation test용 file을 Catalog Photo로 등록하고 stable identity 조회
+// 입력: repository: 열린 Catalog의 photo repository, sourcePath: 등록할 source, kind: file 분류
+// 출력: 등록된 PhotoId 또는 실패 시 invalid identity
+[[nodiscard]] types::PhotoId storeCatalogPhoto(catalog::CatalogPhotoRepository& repository,
+                                               const QString& sourcePath,
+                                               const types::SupportedFileKind kind)
+{
+    const catalog::CatalogEntry entry{
+        {sourcePath, QFileInfo(sourcePath).suffix().toLower(), QFileInfo(sourcePath).fileName(), kind},
+        types::FileScanStatus::Ready};
+    if (repository.upsert({entry}).hasError())
+    {
+        return {};
+    }
+    const catalog::CatalogPhotoRecordResult record = repository.findBySourcePath(sourcePath);
+    return record.hasValue() && record.value().has_value() ? record.value()->id : types::PhotoId{};
 }
 
 // 목적: fake pipeline 성공 report 생성
@@ -386,6 +406,109 @@ TEST(FileExportPipelineTest, UsesDefaultDevelopForUnregisteredFolderSelectionWhe
     EXPECT_TRUE(prepared.value().items.constFirst().request.catalogPath.isEmpty());
     ASSERT_TRUE(prepared.value().items.constFirst().request.developParams.has_value());
     EXPECT_EQ(types::DevelopParams{}, *prepared.value().items.constFirst().request.developParams);
+}
+
+TEST(FileExportPipelineTest, UsesDefaultDevelopForUnregisteredRasterSelectionWhenAllowed)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    ASSERT_TRUE(catalog::CatalogDatabase::open(catalogPath).hasValue());
+    ExportFileRequest item{
+        {QDir(directory.path()).filePath(QStringLiteral("unregistered.png")),
+         QStringLiteral("png"),
+         QStringLiteral("unregistered.png"),
+         types::SupportedFileKind::RasterImage},
+        QDir(directory.path()).filePath(QStringLiteral("unregistered-export.png")),
+        catalogPath,
+        std::nullopt,
+        {},
+        true,
+    };
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(ExportItemListRequest{{item}}, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasValue());
+    ASSERT_EQ(1, prepared.value().items.size());
+    EXPECT_TRUE(prepared.value().items.constFirst().request.catalogPath.isEmpty());
+    ASSERT_TRUE(prepared.value().items.constFirst().request.developParams.has_value());
+    EXPECT_EQ(types::DevelopParams{}, *prepared.value().items.constFirst().request.developParams);
+}
+
+TEST(FileExportPipelineTest, SnapshotsPersistedDevelopForRegisteredRasterSelection)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("registered.png"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    ASSERT_TRUE(writeRasterSource(sourcePath));
+    catalog::CatalogDatabaseOpenResult database = catalog::CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    catalog::CatalogPhotoRepository photoRepository(*database.value());
+    catalog::CatalogDevelopRepository developRepository(*database.value());
+    const types::PhotoId photoId =
+        storeCatalogPhoto(photoRepository, sourcePath, types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(types::isValidPhotoId(photoId));
+    types::DevelopParams persisted;
+    persisted.exposureEv = 0.75F;
+    persisted.hsl.channels[2] = {0.2F, -0.3F, 0.4F};
+    ASSERT_TRUE(developRepository.saveState(photoId, persisted, 0).hasValue());
+    ExportFileRequest item = std::get<ExportFileRequest>(makeFileRequest(sourcePath));
+    item.catalogPath = catalogPath;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(ExportItemListRequest{{item}}, cancellation.token());
+    types::DevelopParams updated = persisted;
+    updated.exposureEv = 1.5F;
+    updated.hsl.channels[2].hue = -0.7F;
+    ASSERT_TRUE(developRepository.saveState(photoId, updated, 1).hasValue());
+
+    ASSERT_TRUE(prepared.hasValue());
+    ASSERT_EQ(1, prepared.value().items.size());
+    EXPECT_TRUE(prepared.value().items.constFirst().request.catalogPath.isEmpty());
+    ASSERT_TRUE(prepared.value().items.constFirst().request.developParams.has_value());
+    EXPECT_EQ(persisted, *prepared.value().items.constFirst().request.developParams);
+}
+
+TEST(FileExportPipelineTest, PrefersExplicitRasterDevelopOverPersistedState)
+{
+    (void)test::application();
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("registered.png"));
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("managed.flexraw-catalog"));
+    ASSERT_TRUE(writeRasterSource(sourcePath));
+    catalog::CatalogDatabaseOpenResult database = catalog::CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(database.hasValue());
+    catalog::CatalogPhotoRepository photoRepository(*database.value());
+    catalog::CatalogDevelopRepository developRepository(*database.value());
+    const types::PhotoId photoId =
+        storeCatalogPhoto(photoRepository, sourcePath, types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(types::isValidPhotoId(photoId));
+    types::DevelopParams persisted;
+    persisted.exposureEv = 0.75F;
+    persisted.hsl.channels[2] = {0.2F, -0.3F, 0.4F};
+    ASSERT_TRUE(developRepository.saveState(photoId, persisted, 0).hasValue());
+    types::DevelopParams explicitParams;
+    explicitParams.exposureEv = -0.5F;
+    explicitParams.hsl.channels[2].hue = -0.5F;
+    ExportFileRequest item = std::get<ExportFileRequest>(makeFileRequest(sourcePath));
+    item.catalogPath = catalogPath;
+    item.developParams = explicitParams;
+    FileExportPipeline pipeline(::flexraw::test::testPathIdentityService());
+    types::CancellationSource cancellation;
+
+    const ExportPreparationResult prepared = pipeline.prepare(ExportItemListRequest{{item}}, cancellation.token());
+
+    ASSERT_TRUE(prepared.hasValue());
+    ASSERT_EQ(1, prepared.value().items.size());
+    ASSERT_TRUE(prepared.value().items.constFirst().request.developParams.has_value());
+    EXPECT_EQ(explicitParams, *prepared.value().items.constFirst().request.developParams);
 }
 
 TEST(FileExportPipelineTest, RejectsItemOutputThatTargetsAnotherItemSource)

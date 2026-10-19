@@ -5,7 +5,9 @@
 #include <QString>
 #include <QVector>
 
+#include "catalog_culling.h"
 #include "catalog_entry.h"
+#include "catalog_inclusion.h"
 #include "catalog_project.h"
 
 namespace flexraw::core::catalog
@@ -26,6 +28,8 @@ struct CatalogPhotoPageCursor
     types::PhotoId photoId;
     std::optional<QString> exactFolderPath;
     std::optional<ProjectId> projectId;
+    CatalogCullingFilter cullingFilter{CatalogCullingFilter::All};
+    CatalogInclusionFilter inclusionFilter{CatalogInclusionFilter::IncludedOnly};
 };
 
 struct CatalogPhotoPageRequest
@@ -35,6 +39,8 @@ struct CatalogPhotoPageRequest
     std::optional<CatalogPhotoPageCursor> cursor;
     std::optional<QString> exactFolderPath;
     std::optional<ProjectId> projectId;
+    CatalogCullingFilter cullingFilter{CatalogCullingFilter::All};
+    CatalogInclusionFilter inclusionFilter{CatalogInclusionFilter::IncludedOnly};
 };
 
 struct CatalogPhotoPage

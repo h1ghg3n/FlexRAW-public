@@ -26,7 +26,8 @@
 
 #include "catalog_database.h"
 #include "catalog_develop_repository.h"
-#include "develop.h"
+#include "develop_qt_adapter.h"
+#include "develop_validation_adapter.h"
 #include "export.h"
 #include "folder_scanner.h"
 #include "path_identity_service.h"
@@ -272,7 +273,7 @@ constexpr int DefaultMaximumBatchWorkers = 4;
 
     if (request.developParams.has_value())
     {
-        const develop::DevelopImageResult developed = develop::applyDevelop(sourceImage, *request.developParams);
+        const develop::DevelopImageResult developed = develop::qt_adapter::apply(sourceImage, *request.developParams);
         if (developed.hasError())
         {
             return makeFailedItem(request.source.path, request.outputPath, developed.error());
@@ -308,7 +309,7 @@ constexpr int DefaultMaximumBatchWorkers = 4;
                              QFileInfo(request.outputPath).absoluteFilePath());
 }
 
-// 목적: caller override 또는 catalog에서 RAW develop state 확정
+// 목적: caller override 또는 catalog에서 file source의 develop state 확정
 // 입력: sourcePath: catalog photo path, overrideParams: caller snapshot, repository: optional catalog repository
 // 출력: 검증된 develop state 또는 catalog/parameter 오류
 [[nodiscard]] types::Result<types::DevelopParams, types::CoreError> resolveDevelopParams(
@@ -337,7 +338,7 @@ constexpr int DefaultMaximumBatchWorkers = 4;
         storedParams.value().value_or(types::DevelopParams{}));
 }
 
-// 목적: 단일 RAW request의 catalog open과 develop-state 조회를 pipeline instance 안에서 직렬화
+// 목적: 단일 file request의 catalog open과 develop-state 조회를 pipeline instance 안에서 직렬화
 // 입력: request: catalog path와 optional caller override, catalogAccessMutex: shared catalog access lock
 // 출력: 검증된 develop state 또는 catalog/parameter 오류
 [[nodiscard]] types::Result<types::DevelopParams, types::CoreError> resolveFileDevelopParams(
@@ -392,7 +393,7 @@ constexpr int DefaultMaximumBatchWorkers = 4;
         return ExportPreparationResult::failure(makeError(
             types::ErrorCode::Conflict, QStringLiteral("Export source and output paths refer to the same file.")));
     }
-    if (request.source.kind == types::SupportedFileKind::Raw)
+    if (request.source.kind == types::SupportedFileKind::Raw || !request.catalogPath.isEmpty())
     {
         const types::Result<types::DevelopParams, types::CoreError> params =
             resolveFileDevelopParams(request, catalogAccessMutex);

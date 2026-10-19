@@ -11,17 +11,11 @@
 #include "operation_types.h"
 #include "result.h"
 
-namespace flexraw::core::raw
-{
-struct RawPreviewImage;
-}
-
 namespace flexraw::core::export_
 {
 
 using RasterExportResult = types::Result<std::monostate, types::CoreError>;
 using RasterExportPathResult = types::Result<QString, types::CoreError>;
-using RasterSourceImageResult = types::Result<QImage, types::CoreError>;
 
 // 목적: raster export format, encoding과 color option의 value contract 검증
 // 입력: options: 검증할 raster export option
@@ -37,11 +31,6 @@ using RasterSourceImageResult = types::Result<QImage, types::CoreError>;
 // 입력: firstPath/secondPath: 비교할 source 또는 output 경로
 // 출력: 같은 경로, symbolic link 또는 hard link 대상이면 true
 [[nodiscard]] bool exportPathsReferToSameFile(const QString& firstPath, const QString& secondPath);
-
-// 목적: LibRaw decode bitmap을 raster export용 독립 sRGB QImage로 변환
-// 입력: rawImage: LibRaw가 반환한 bitmap과 남은 orientation
-// 출력: color tag와 orientation이 적용된 image 또는 bitmap 구조 오류
-[[nodiscard]] RasterSourceImageResult prepareRawForRasterExport(const raw::RawPreviewImage& rawImage);
 
 // 목적: 출력 준비가 끝난 image를 지정한 raster format으로 원자적으로 저장
 // 입력: image/outputPath/options: 출력값, metadataSourcePath: EXIF 원본, cancellationToken: optional 중단 상태

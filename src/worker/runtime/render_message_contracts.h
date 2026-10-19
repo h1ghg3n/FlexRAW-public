@@ -18,6 +18,7 @@ namespace flexraw::worker::runtime
 
 inline constexpr std::uint16_t RenderPayloadMajorVersion = 1;
 inline constexpr std::uint16_t RenderPayloadMinorVersion = 0;
+inline constexpr std::uint16_t HslRenderRequestMinorVersion = 1;
 inline constexpr std::uint32_t MaximumWirePathBytes = 4096;
 inline constexpr std::uint32_t MaximumWireMessageBytes = 64 * 1024;
 

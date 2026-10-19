@@ -163,6 +163,12 @@ private:
 class RecordingItemListPipeline final : public core::orchestration::IExportPipeline
 {
 public:
+    // 목적: optional source 하나를 domain failure로 반환하는 item-list test pipeline 생성
+    // 입력: failedSourcePath: 실패시킬 source path 또는 성공-only test용 빈 값
+    // 출력: source별 request와 mixed terminal을 기록하는 pipeline
+    explicit RecordingItemListPipeline(QString failedSourcePath = {}) : m_failedSourcePath(std::move(failedSourcePath))
+    {}
+
     // 목적: 명시적 item-list request를 Orchestrator scheduling용 prepared item으로 변환
     // 입력: request: ExportItemListRequest, cancellationToken: test에서 미사용
     // 출력: 전달 순서를 보존한 PreparedExport 또는 잘못된 request 오류
@@ -190,8 +196,18 @@ public:
     [[nodiscard]] core::orchestration::ExportItemResult executeItem(
         const core::orchestration::PreparedExportItem& item, const core::types::CancellationToken&) const override
     {
-        QMutexLocker lock(&m_mutex);
-        m_requests.push_back(item.request);
+        {
+            QMutexLocker lock(&m_mutex);
+            m_requests.push_back(item.request);
+        }
+        if (item.request.source.path == m_failedSourcePath)
+        {
+            return {item.request.source.path,
+                    item.request.outputPath,
+                    false,
+                    {core::types::ErrorCode::PermissionDenied, QStringLiteral("Sensitive pipeline diagnostic.")},
+                    core::orchestration::ExportItemFailureKind::Eligibility};
+        }
         return {item.request.source.path, item.request.outputPath, true, {}};
     }
 
@@ -217,6 +233,7 @@ public:
     }
 
 private:
+    QString m_failedSourcePath;
     mutable QMutex m_mutex;
     mutable QVector<core::orchestration::ExportFileRequest> m_requests;
 };
@@ -394,6 +411,7 @@ TEST(ExportDialogTest, ShowsSelectedPhotosAsOutputRowsAndSubmitsOneItemList)
     ASSERT_NE(nullptr, exportButton);
     ASSERT_NE(nullptr, statusLabel);
     ASSERT_EQ(2, outputTable->rowCount());
+    ASSERT_EQ(3, outputTable->columnCount());
     EXPECT_EQ(QStringLiteral("first.arw"), outputTable->item(0, 0)->text());
     EXPECT_EQ(QStringLiteral("second.arw"), outputTable->item(1, 0)->text());
 
@@ -411,6 +429,130 @@ TEST(ExportDialogTest, ShowsSelectedPhotosAsOutputRowsAndSubmitsOneItemList)
     EXPECT_EQ(QFileInfo(firstOutput).absoluteFilePath(), requests.at(0).outputPath);
     EXPECT_EQ(QFileInfo(secondOutput).absoluteFilePath(), requests.at(1).outputPath);
     EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("2 files"), Qt::CaseInsensitive));
+    EXPECT_TRUE(outputTable->item(0, 2)->text().contains(QStringLiteral("succeeded"), Qt::CaseInsensitive));
+    EXPECT_TRUE(outputTable->item(1, 2)->text().contains(QStringLiteral("succeeded"), Qt::CaseInsensitive));
+}
+
+TEST(ExportDialogTest, ShowsSkippedSelectionCountAndReason)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("available.arw"));
+    QSettings settings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    core::orchestration::ExportOrchestrator orchestrator(std::make_unique<RecordingExportPipeline>());
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    QVector<ExportDialogSource> sources{{makeEditorState(sourcePath).source, {}, core::types::DevelopParams{}}};
+    ExportDialog dialog(exportAdapter, exportAdapter, std::move(sources), workerProfiles, exportDefaults, nullptr, 2);
+
+    QLabel* sourceLabel = dialog.findChild<QLabel*>(QStringLiteral("exportSourceLabel"));
+
+    ASSERT_NE(nullptr, sourceLabel);
+    EXPECT_TRUE(sourceLabel->text().contains(QStringLiteral("2")));
+    EXPECT_TRUE(sourceLabel->text().contains(QStringLiteral("skipped"), Qt::CaseInsensitive));
+    EXPECT_TRUE(sourceLabel->text().contains(QStringLiteral("unavailable"), Qt::CaseInsensitive));
+}
+
+TEST(ExportDialogTest, ShowsMixedItemResultsOnMatchingRowsWithoutTechnicalDetails)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstSource = QDir(directory.path()).filePath(QStringLiteral("first.arw"));
+    const QString secondSource = QDir(directory.path()).filePath(QStringLiteral("second.arw"));
+    const QString firstOutput = QDir(directory.path()).filePath(QStringLiteral("first-result.jpg"));
+    const QString secondOutput = QDir(directory.path()).filePath(QStringLiteral("second-result.jpg"));
+    QSettings settings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    auto pipeline = std::make_unique<RecordingItemListPipeline>(secondSource);
+    core::orchestration::ExportOrchestrator orchestrator(std::move(pipeline));
+    QVector<ExportDialogSource> sources{
+        {makeEditorState(firstSource).source, {}, core::types::DevelopParams{}},
+        {makeEditorState(secondSource).source, {}, core::types::DevelopParams{}},
+    };
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, std::move(sources), workerProfiles, exportDefaults);
+    QTableWidget* outputTable = dialog.findChild<QTableWidget*>(QStringLiteral("exportOutputTable"));
+    QLineEdit* firstOutputEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
+    QLineEdit* secondOutputEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit2"));
+    QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
+    QLabel* statusLabel = dialog.findChild<QLabel*>(QStringLiteral("exportStatusLabel"));
+    ASSERT_NE(nullptr, outputTable);
+    ASSERT_NE(nullptr, firstOutputEdit);
+    ASSERT_NE(nullptr, secondOutputEdit);
+    ASSERT_NE(nullptr, exportButton);
+    ASSERT_NE(nullptr, statusLabel);
+    firstOutputEdit->setText(firstOutput);
+    secondOutputEdit->setText(secondOutput);
+
+    exportButton->click();
+
+    ASSERT_TRUE(
+        waitForCondition([&] { return statusLabel->text().contains(QStringLiteral("failed"), Qt::CaseInsensitive); }));
+    const QString succeededText = outputTable->item(0, 2)->text();
+    const QString failedText = outputTable->item(1, 2)->text();
+    EXPECT_TRUE(succeededText.contains(QStringLiteral("succeeded"), Qt::CaseInsensitive));
+    EXPECT_TRUE(failedText.contains(QStringLiteral("failed"), Qt::CaseInsensitive));
+    EXPECT_TRUE(failedText.contains(QStringLiteral("eligible"), Qt::CaseInsensitive));
+    EXPECT_FALSE(failedText.contains(QStringLiteral("Sensitive pipeline diagnostic.")));
+}
+
+TEST(ExportDialogTest, LocalizesSingleOutputPathValidationWithoutCoreMessage)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString sourcePath = QDir(directory.path()).filePath(QStringLiteral("current.arw"));
+    const QString invalidOutput = QDir(directory.path()).filePath(QStringLiteral("missing-folder/single-output.jpg"));
+    QSettings settings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    core::orchestration::ExportOrchestrator orchestrator(std::make_unique<RecordingExportPipeline>());
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, makeEditorState(sourcePath), workerProfiles, exportDefaults);
+    QLineEdit* outputPathEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
+    QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
+    QLabel* statusLabel = dialog.findChild<QLabel*>(QStringLiteral("exportStatusLabel"));
+    ASSERT_NE(nullptr, outputPathEdit);
+    ASSERT_NE(nullptr, exportButton);
+    ASSERT_NE(nullptr, statusLabel);
+    outputPathEdit->setText(invalidOutput);
+
+    exportButton->click();
+
+    EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("output folder does not exist"), Qt::CaseInsensitive));
+    EXPECT_FALSE(statusLabel->text().contains(QStringLiteral("Raster export parent directory")));
+}
+
+TEST(ExportDialogTest, LocalizesItemListOutputPathValidationWithoutCoreMessage)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString firstSource = QDir(directory.path()).filePath(QStringLiteral("first.arw"));
+    const QString secondSource = QDir(directory.path()).filePath(QStringLiteral("second.arw"));
+    const QString invalidOutput = QDir(directory.path()).filePath(QStringLiteral("missing-folder/first-output.jpg"));
+    QSettings settings(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    core::orchestration::ExportOrchestrator orchestrator(std::make_unique<RecordingItemListPipeline>());
+    QVector<ExportDialogSource> sources{
+        {makeEditorState(firstSource).source, {}, core::types::DevelopParams{}},
+        {makeEditorState(secondSource).source, {}, core::types::DevelopParams{}},
+    };
+    settings::QtWorkerProfileSettingsAdapter workerProfiles(settings);
+    settings::QtExportSettingsAdapter exportDefaults(settings);
+    QtExportClientAdapter exportAdapter(orchestrator, workerProfiles);
+    ExportDialog dialog(exportAdapter, exportAdapter, std::move(sources), workerProfiles, exportDefaults);
+    QLineEdit* firstOutputEdit = dialog.findChild<QLineEdit*>(QStringLiteral("exportOutputPathEdit"));
+    QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
+    QLabel* statusLabel = dialog.findChild<QLabel*>(QStringLiteral("exportStatusLabel"));
+    ASSERT_NE(nullptr, firstOutputEdit);
+    ASSERT_NE(nullptr, exportButton);
+    ASSERT_NE(nullptr, statusLabel);
+    firstOutputEdit->setText(invalidOutput);
+
+    exportButton->click();
+
+    EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("output folder does not exist"), Qt::CaseInsensitive));
+    EXPECT_FALSE(statusLabel->text().contains(QStringLiteral("Raster export parent directory")));
 }
 
 TEST(ExportDialogTest, SwitchesFormatSpecificControlsAndOutputExtension)
@@ -471,10 +613,12 @@ TEST(ExportDialogTest, CancelsActiveRequestAndAllowsRetry)
     QPushButton* exportButton = dialog.findChild<QPushButton*>(QStringLiteral("exportStartButton"));
     QPushButton* cancelButton = dialog.findChild<QPushButton*>(QStringLiteral("exportCancelButton"));
     QLabel* statusLabel = dialog.findChild<QLabel*>(QStringLiteral("exportStatusLabel"));
+    QTableWidget* outputTable = dialog.findChild<QTableWidget*>(QStringLiteral("exportOutputTable"));
     ASSERT_NE(nullptr, outputPathEdit);
     ASSERT_NE(nullptr, exportButton);
     ASSERT_NE(nullptr, cancelButton);
     ASSERT_NE(nullptr, statusLabel);
+    ASSERT_NE(nullptr, outputTable);
     outputPathEdit->setText(outputPath);
 
     exportButton->click();
@@ -488,6 +632,7 @@ TEST(ExportDialogTest, CancelsActiveRequestAndAllowsRetry)
     ASSERT_TRUE(waitForCondition(
         [&] { return statusLabel->text().contains(QStringLiteral("cancelled"), Qt::CaseInsensitive); }));
     EXPECT_TRUE(statusLabel->text().contains(QStringLiteral("cancelled"), Qt::CaseInsensitive));
+    EXPECT_TRUE(outputTable->item(0, 2)->text().contains(QStringLiteral("cancelled"), Qt::CaseInsensitive));
     EXPECT_TRUE(exportButton->isEnabled());
     EXPECT_EQ(QStringLiteral("Close"), cancelButton->text());
 }

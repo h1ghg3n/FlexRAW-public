@@ -494,10 +494,33 @@ TEST(CatalogEditorFacadeTest, ForwardsCatalogCommands)
     ASSERT_TRUE(photos.hasValue());
     ASSERT_EQ(1, photos.value().photos.size());
     EXPECT_EQ(imported.value().photoIds.front().value, photos.value().photos.front().id.value);
+    core::client::ICatalogCullingClient& cullingClient = facade;
+    const core::client::ClientPhotoId photoId{imported.value().photoIds.front().value};
+    const core::client::CatalogCullingResult picked = cullingClient.setCatalogCulling(
+        {catalogPath.toUtf8().toStdString(), core::client::CatalogCullingState::Pick, {photoId}});
+    ASSERT_TRUE(picked.hasValue());
+    core::client::CatalogPhotoPageRequest pickedRequest;
+    pickedRequest.cullingFilter = core::client::CatalogCullingFilter::Pick;
+    const core::client::CatalogPhotoPageResult pickedPhotos = facade.queryPhotoPage(pickedRequest);
+    ASSERT_TRUE(pickedPhotos.hasValue());
+    ASSERT_EQ(1U, pickedPhotos.value().photos.size());
+    EXPECT_EQ(core::client::CatalogCullingState::Pick, pickedPhotos.value().photos.front().cullingState);
+    core::client::ICatalogInclusionClient& inclusionClient = facade;
+    const core::client::CatalogInclusionResult excluded = inclusionClient.setCatalogInclusion(
+        {catalogPath.toUtf8().toStdString(), core::client::CatalogInclusionState::Excluded, {photoId}});
+    ASSERT_TRUE(excluded.hasValue());
+    core::client::CatalogPhotoPageRequest excludedRequest;
+    excludedRequest.inclusionFilter = core::client::CatalogInclusionFilter::ExcludedOnly;
+    const core::client::CatalogPhotoPageResult excludedPhotos = facade.queryPhotoPage(excludedRequest);
+    ASSERT_TRUE(excludedPhotos.hasValue());
+    ASSERT_EQ(1U, excludedPhotos.value().photos.size());
+    EXPECT_EQ(core::client::CatalogInclusionState::Excluded, excludedPhotos.value().photos.front().inclusionState);
+    const core::client::CatalogInclusionResult restored = inclusionClient.setCatalogInclusion(
+        {catalogPath.toUtf8().toStdString(), core::client::CatalogInclusionState::Included, {photoId}});
+    ASSERT_TRUE(restored.hasValue());
     core::client::ICatalogProjectClient& projectClient = facade;
     const core::client::CatalogProjectResult project = projectClient.createProject({"Portfolio"});
     ASSERT_TRUE(project.hasValue());
-    const core::client::ClientPhotoId photoId{imported.value().photoIds.front().value};
     ASSERT_TRUE(projectClient.addPhotoToProject({project.value().id, photoId}).hasValue());
     ASSERT_TRUE(projectClient.renameProject({project.value().id, "Selected"}).hasValue());
     const core::client::CatalogProjectListResult projects = projectClient.listProjects();

@@ -8,7 +8,9 @@
 #include <QDir>
 #include <QFileInfo>
 
-#include "develop.h"
+#include "compute_permit_pool.h"
+#include "develop_processing.h"
+#include "develop_qt_adapter.h"
 #include "log.h"
 #include "preview_cache.h"
 #include "thumbnail_preview.h"
@@ -90,6 +92,16 @@ constexpr int InteractivePreviewScaleDivisor = 2;
     return sourceImage.scaled(interactiveSize, Qt::IgnoreAspectRatio, Qt::FastTransformation);
 }
 
+// 목적: Preview Develop이 실제 사용할 수 있는 bounded compute permit 수 계산
+// 입력: imageHeight/params — processing geometry와 활성화된 neighborhood 보정, pool — capacity authority
+// 출력: 불필요한 permit을 점유하지 않는 1 이상의 희망 permit 수
+[[nodiscard]] int desiredDevelopPermits(int imageHeight,
+                                        const types::DevelopParams& params,
+                                        const ComputePermitPool& pool)
+{
+    return std::min(pool.snapshot().capacity, develop::maximumUsefulDevelopCpuPermits(imageHeight, params));
+}
+
 // 목적: cooperative cancellation로 중단된 내부 pipeline 결과 생성
 // 입력: 없음
 // 출력: worker가 terminal failure로 publish하지 않을 Cancelled 오류
@@ -111,9 +123,11 @@ public:
     };
 
     // 목적: file cache와 worker-local source cache 초기화
-    // 입력: cacheRoot: preview cache root directory
+    // 입력: cacheRoot: preview cache root directory, computePermitPool: Develop 계산 capacity authority
     // 출력: 초기화된 implementation 객체
-    explicit Impl(QString cacheRoot) : cache(std::move(cacheRoot)) {}
+    Impl(QString cacheRoot, ComputePermitPool& computePermitPool)
+        : cache(std::move(cacheRoot)), computePermitPool(computePermitPool)
+    {}
 
     // 목적: tier별 마지막 source가 현재 cache key와 일치하면 반환
     // 입력: tier: preview 품질 단계, key: 현재 source version key
@@ -140,14 +154,17 @@ public:
     }
 
     preview::PreviewCache cache;
+    ComputePermitPool& computePermitPool;
     std::optional<CachedSource> thumbnailSource;
     std::optional<CachedSource> standardSource;
 };
 
 // 목적: file-backed preview cache를 사용하는 production pipeline 초기화
-// 입력: cacheRoot: preview cache root directory
+// 입력: cacheRoot: preview cache root directory, computePermitPool: Develop 계산 capacity authority
 // 출력: 초기화된 pipeline 객체
-FilePreviewPipeline::FilePreviewPipeline(QString cacheRoot) : m_impl(std::make_unique<Impl>(std::move(cacheRoot))) {}
+FilePreviewPipeline::FilePreviewPipeline(QString cacheRoot, ComputePermitPool& computePermitPool)
+    : m_impl(std::make_unique<Impl>(std::move(cacheRoot), computePermitPool))
+{}
 
 // 목적: pipeline implementation resource 정리
 // 입력: 없음
@@ -243,7 +260,17 @@ PreviewPipelineResult FilePreviewPipeline::render(const PreviewRequest& request,
 
     const QImage developSource = prepareDevelopSource(sourceImage, request.renderMode);
     const Clock::time_point developStartedAt = Clock::now();
-    const develop::DevelopImageResult developed = develop::applyDevelop(developSource, request.params);
+    const int desiredPermits = desiredDevelopPermits(developSource.height(), request.params, m_impl->computePermitPool);
+    std::optional<ComputePermitLease> computePermit =
+        m_impl->computePermitPool.acquireUpTo(desiredPermits, 1, cancellationToken);
+    if (!computePermit.has_value())
+    {
+        return makeCancelledResult();
+    }
+
+    const develop::DevelopImageResult developed =
+        develop::qt_adapter::apply(developSource, request.params, computePermit->permitCount());
+    computePermit.reset();
     stats.developMs = elapsedMilliseconds(developStartedAt);
 
     if (cancellationToken.isCancellationRequested())

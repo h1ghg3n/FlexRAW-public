@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -21,6 +22,16 @@ class ISystemMemoryProbe;
 namespace flexraw::core::orchestration
 {
 
+struct ExportLocalAdmissionObservation
+{
+    std::optional<std::uint64_t> availableMemoryBytes;
+    int configuredSlots{0};
+    int cpuSlots{-1};
+    int memorySlots{-1};
+    int effectiveSlots{0};
+    int localInFlight{0};
+};
+
 struct ExportSchedulingConfiguration
 {
     int localSlotLimit{2};
@@ -33,6 +44,7 @@ struct ExportSchedulingConfiguration
     std::chrono::milliseconds serverBusyCooldown{2000};
     std::chrono::milliseconds resourceBusyCooldown{3000};
     std::chrono::milliseconds connectionFailedCooldown{5000};
+    std::function<void(const ExportLocalAdmissionObservation&)> localAdmissionObserver;
 };
 
 class ExportOrchestrator final : public QObject

@@ -74,6 +74,54 @@ protected:
     }
 };
 
+TEST_F(CatalogDevelopRepositoryTest, RejectsMalformedHslWithoutReplacingPersistedState)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString path = QDir(directory.path()).filePath(QStringLiteral("hsl.flexraw-catalog"));
+    auto database = CatalogDatabase::open(path);
+    ASSERT_TRUE(database.hasValue());
+    CatalogPhotoRepository photos(*database.value());
+    const auto photoId = storePhoto(photos, QStringLiteral("C:/photos/hsl.raw"));
+    ASSERT_TRUE(types::isValidPhotoId(photoId));
+    CatalogDevelopRepository repository(*database.value());
+    types::DevelopParams original;
+    original.hsl.channels[6].hue = 0.75F;
+    ASSERT_TRUE(repository.saveParams(photoId, original).hasValue());
+    auto invalid = original;
+    invalid.hsl.channels[6].hue = 1.01F;
+    EXPECT_TRUE(repository.saveParams(photoId, invalid).hasError());
+    auto loaded = repository.loadParams(photoId);
+    ASSERT_TRUE(loaded.hasValue());
+    ASSERT_TRUE(loaded.value().has_value());
+    EXPECT_EQ(*loaded.value(), original);
+
+    const QString connectionName = QStringLiteral("hsl_corrupt_json");
+    {
+        auto connection = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+        connection.setDatabaseName(path);
+        ASSERT_TRUE(connection.open());
+        for (const QString& hsl : {QStringLiteral("null"),
+                                   QStringLiteral("[]"),
+                                   QStringLiteral("{}"),
+                                   QStringLiteral("[{}, {}, {}, {}, {}, {}, {}, {}]")})
+        {
+            const QString json =
+                QStringLiteral(
+                    R"({"exposureEv":0,"contrast":0,"highlights":0,"shadows":0,"whites":0,"blacks":0,"saturation":0,"vibrance":0,"hsl":%1})")
+                    .arg(hsl);
+            QSqlQuery query(connection);
+            query.prepare(QStringLiteral("UPDATE develop_params SET params_json = :json WHERE photo_id = :id"));
+            query.bindValue(QStringLiteral(":json"), json);
+            query.bindValue(QStringLiteral(":id"), photoId.value);
+            ASSERT_TRUE(query.exec());
+            EXPECT_TRUE(repository.loadParams(photoId).hasError()) << hsl.toStdString();
+        }
+        connection.close();
+    }
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
 TEST_F(CatalogDevelopRepositoryTest, StoresAndLoadsCurrentDevelopParams)
 {
     QTemporaryDir directory;
@@ -88,6 +136,8 @@ TEST_F(CatalogDevelopRepositoryTest, StoresAndLoadsCurrentDevelopParams)
     CatalogDevelopRepository repository(*database.value());
     types::DevelopParams params;
     params.exposureEv = 1.25F;
+    params.hsl.channels[0] = {0.4F, -0.2F, 0.7F};
+    params.hsl.channels[7] = {-0.3F, 0.5F, -0.6F};
     params.contrast = -0.3F;
     params.vibrance = 0.6F;
     params.whiteBalanceMode = types::WhiteBalanceMode::Custom;
@@ -212,6 +262,7 @@ TEST_F(CatalogDevelopRepositoryTest, LoadsLegacyDevelopParamsAsAsShotWhiteBalanc
 
     ASSERT_TRUE(loaded.hasValue());
     ASSERT_TRUE(loaded.value().has_value());
+    EXPECT_EQ(loaded.value()->hsl, types::HslParams{});
     EXPECT_EQ(types::WhiteBalanceMode::AsShot, loaded.value()->whiteBalanceMode);
     EXPECT_FLOAT_EQ(6500.0F, loaded.value()->whiteBalanceTemperatureKelvin);
     EXPECT_FLOAT_EQ(0.0F, loaded.value()->whiteBalanceTint);

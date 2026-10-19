@@ -19,7 +19,7 @@ public:
 
     // 목적: local physical memory headroom과 active ledger를 함께 확인해 claim admission
     // 입력: request: process-local lease identity와 예상 peak resource claim
-    // 출력: reserve를 유지할 수 있으면 local active lease, 아니면 Busy/Unavailable decision
+    // 출력: snapshot과 active claim의 보수적 headroom에 맞으면 lease, 아니면 Busy/Unavailable
     [[nodiscard]] ResourceAdmissionDecision acquire(const ResourceLeaseRequest& request) override;
 
     // 목적: local lease가 아직 active인지 확인하고 non-expiring lease 반환

@@ -10,6 +10,10 @@ namespace flexraw::core::orchestration::test
 // 출력: test process lifetime 동안 유지되는 QCoreApplication 참조
 inline QCoreApplication& application()
 {
+    if (QCoreApplication::instance() != nullptr)
+    {
+        return *QCoreApplication::instance();
+    }
     static int argumentCount = 1;
     static char applicationName[] = "flexraw_orchestration_tests";
     static char* arguments[] = {applicationName, nullptr};

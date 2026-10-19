@@ -1,4 +1,5 @@
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -304,6 +305,36 @@ private:
     mutable QSemaphore m_started;
 };
 
+class DrainingRenderJobRunner final : public runtime::IRenderJobRunner
+{
+public:
+    // 목적: token 취소와 실제 runner drain을 독립적으로 제어
+    // 입력: request/token: 결과와 취소 상태
+    // 출력: drain gate 이후 성공 또는 지정된 실패
+    runtime::RenderJobExecutionResult execute(const core::render::ResolvedRenderRequest& request,
+                                              const core::types::CancellationToken& token) const override
+    {
+        started.release();
+        if (!allowReturn.tryAcquire(1, 3000))
+        {
+            throw std::runtime_error("drain test gate timed out");
+        }
+        if (fail || token.isCancellationRequested())
+        {
+            return runtime::RenderJobExecutionResult::success(core::render::ResolvedRenderPipelineResult::failure(
+                {{token.isCancellationRequested() ? core::types::ErrorCode::Cancelled : core::types::ErrorCode::Unknown,
+                  QStringLiteral("test failure")},
+                 {}}));
+        }
+        return runtime::RenderJobExecutionResult::success(
+            core::render::ResolvedRenderPipelineResult::success({{request.outputPath, 1}, {}}));
+    }
+
+    bool fail{false};
+    mutable QSemaphore started;
+    mutable QSemaphore allowReturn;
+};
+
 class RecordingResourceAdmission final : public IRenderResourceAdmission
 {
 public:
@@ -400,6 +431,87 @@ TEST(LocalMemoryAdmissionTest, KeepsActiveClaimInLocalLedgerUntilReleased)
     EXPECT_TRUE(admission.acquire(makeLeaseRequest("second", 200)).status == ResourceAdmissionStatus::Busy);
     EXPECT_TRUE(admission.release(*first.lease).released);
     EXPECT_TRUE(admission.acquire(makeLeaseRequest("second", 200)).granted());
+}
+
+TEST(LocalMemoryAdmissionTest, AccountsForUnmaterializedClaimsAgainstObservedHeadroom)
+{
+    FakeSystemMemoryProbe probe;
+    probe.m_snapshot = platform::SystemMemorySnapshot{8192 * MiB, 1536 * MiB};
+    LocalMemoryAdmission admission(probe, 512);
+    const auto first = admission.acquire(makeLeaseRequest("first", 640));
+    ASSERT_TRUE(first.granted());
+    EXPECT_EQ(ResourceAdmissionStatus::Busy, admission.acquire(makeLeaseRequest("second", 640)).status);
+    const auto boundary = admission.acquire(makeLeaseRequest("boundary", 384));
+    ASSERT_TRUE(boundary.granted());
+    EXPECT_EQ(ResourceAdmissionStatus::Busy, admission.acquire(makeLeaseRequest("excess", 1)).status);
+    EXPECT_TRUE(admission.release(*first.lease).released);
+    EXPECT_TRUE(admission.release(*first.lease).released);
+    EXPECT_TRUE(admission.release({"unknown", {}}).released);
+    EXPECT_TRUE(admission.release(*boundary.lease).released);
+    const auto recovered = admission.acquire(makeLeaseRequest("recovered", 1024));
+    ASSERT_TRUE(recovered.granted());
+    EXPECT_TRUE(admission.release(*recovered.lease).released);
+}
+
+TEST(LocalMemoryAdmissionTest, SaturatesWhenAvailableMemoryDropsBelowActiveCommitment)
+{
+    FakeSystemMemoryProbe probe;
+    probe.m_snapshot = platform::SystemMemorySnapshot{8192 * MiB, 1536 * MiB};
+    LocalMemoryAdmission admission(probe, 512);
+    const auto first = admission.acquire(makeLeaseRequest("first", 640));
+    ASSERT_TRUE(first.granted());
+    probe.m_snapshot->availableBytes = 1024 * MiB;
+    EXPECT_EQ(ResourceAdmissionStatus::Busy, admission.acquire(makeLeaseRequest("second", 1)).status);
+    EXPECT_TRUE(admission.release(*first.lease).released);
+    EXPECT_TRUE(admission.acquire(makeLeaseRequest("recovered", 512)).granted());
+}
+
+TEST(LocalMemoryAdmissionTest, ActiveIdempotentAcquireDoesNotReserveTwice)
+{
+    FakeSystemMemoryProbe probe;
+    probe.m_snapshot = platform::SystemMemorySnapshot{8192 * MiB, 1536 * MiB};
+    LocalMemoryAdmission admission(probe, 512);
+    const auto request = makeLeaseRequest("same", 640);
+    const auto first = admission.acquire(request);
+    ASSERT_TRUE(first.granted());
+    EXPECT_TRUE(admission.acquire(request).granted());
+    const auto remaining = admission.acquire(makeLeaseRequest("remaining", 384));
+    EXPECT_TRUE(remaining.granted());
+    EXPECT_TRUE(admission.release(*first.lease).released);
+    if (remaining.granted())
+    {
+        EXPECT_TRUE(admission.release(*remaining.lease).released);
+    }
+}
+
+TEST(LocalMemoryAdmissionTest, SerializesCompetingClaimsBeforeEitherAllocation)
+{
+    FakeSystemMemoryProbe probe;
+    probe.m_snapshot = platform::SystemMemorySnapshot{8192 * MiB, 1536 * MiB};
+    LocalMemoryAdmission admission(probe, 512);
+    std::barrier start(3);
+    ResourceAdmissionDecision first;
+    ResourceAdmissionDecision second;
+    {
+        std::jthread a([&] {
+            start.arrive_and_wait();
+            first = admission.acquire(makeLeaseRequest("a", 640));
+        });
+        std::jthread b([&] {
+            start.arrive_and_wait();
+            second = admission.acquire(makeLeaseRequest("b", 640));
+        });
+        start.arrive_and_wait();
+    }
+    EXPECT_EQ(1, static_cast<int>(first.granted()) + static_cast<int>(second.granted()));
+    if (first.granted())
+    {
+        EXPECT_TRUE(admission.release(*first.lease).released);
+    }
+    if (second.granted())
+    {
+        EXPECT_TRUE(admission.release(*second.lease).released);
+    }
 }
 
 TEST(LocalMemoryAdmissionTest, RejectsReusedRequestIdWithDifferentClaim)
@@ -573,6 +685,49 @@ TEST(AdmissionRenderJobRunnerTest, ReleasesLeaseWhenDelegateThrows)
 
     EXPECT_THROW(static_cast<void>(runner.execute(makeRenderRequest(), cancellation.token())), std::runtime_error);
     EXPECT_EQ(1, admission.m_releaseCount.load(std::memory_order_relaxed));
+}
+
+TEST(AdmissionRenderJobRunnerTest, KeepsLeaseUntilSuccessFailureOrCancellationActuallyDrains)
+{
+    for (int scenario = 0; scenario < 3; ++scenario)
+    {
+        SCOPED_TRACE(scenario);
+        RecordingResourceAdmission admission;
+        admission.m_acquireDecision = {ResourceAdmissionStatus::Granted, RenderResourceLease{"lease"}, {}, {}};
+        DrainingRenderJobRunner delegate;
+        delegate.fail = scenario == 1;
+        AdmissionRenderJobRunner runner(delegate, admission, {});
+        core::types::CancellationSource cancellation;
+        std::optional<runtime::RenderJobExecutionResult> result;
+        std::jthread worker([&] { result = runner.execute(makeRenderRequest(), cancellation.token()); });
+        const bool started = delegate.started.tryAcquire(1, 3000);
+        if (scenario == 2)
+        {
+            cancellation.requestCancellation();
+        }
+        EXPECT_EQ(0, admission.m_releaseCount.load());
+        delegate.allowReturn.release();
+        worker.join();
+        ASSERT_TRUE(started);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_FALSE(result->hasError());
+        EXPECT_EQ(scenario != 0, result->value().hasError());
+        EXPECT_EQ(1, admission.m_releaseCount.load());
+    }
+}
+
+TEST(AdmissionRenderJobRunnerTest, AlreadyCancelledRequestNeverAcquiresLease)
+{
+    RecordingResourceAdmission admission;
+    ImmediateRenderJobRunner delegate;
+    AdmissionRenderJobRunner runner(delegate, admission, {});
+    core::types::CancellationSource cancellation;
+    cancellation.requestCancellation();
+    const auto result = runner.execute(makeRenderRequest(), cancellation.token());
+    EXPECT_FALSE(result.hasError());
+    EXPECT_EQ(0, admission.m_acquireCount.load());
+    EXPECT_EQ(0, admission.m_releaseCount.load());
+    EXPECT_EQ(0, delegate.executeCount());
 }
 
 TEST(ResourceAdmissionIntegrationTest, UsesRealRouterAdapterFromSchedulerWorkerThread)

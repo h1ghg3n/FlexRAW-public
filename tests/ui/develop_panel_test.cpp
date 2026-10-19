@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QGroupBox>
+#include <QLabel>
 #include <QObject>
 #include <QScrollArea>
 #include <QSlider>
@@ -10,12 +11,61 @@
 #include <gtest/gtest.h>
 
 #include "adjustment_control.h"
+#include "clipping.h"
 #include "develop_panel.h"
 
 namespace flexraw::ui::editor
 {
 namespace
 {
+
+TEST(DevelopPanelTest, ShowsClippingPercentagesBesideHistogramAndClearsTogether)
+{
+    DevelopPanel panel;
+    QLabel* shadow = panel.findChild<QLabel*>(QStringLiteral("shadowClippingIndicator"));
+    QLabel* highlight = panel.findChild<QLabel*>(QStringLiteral("highlightClippingIndicator"));
+    ASSERT_NE(nullptr, shadow);
+    ASSERT_NE(nullptr, highlight);
+    EXPECT_EQ(QObject::tr("S —"), shadow->text());
+    EXPECT_EQ(QObject::tr("H —"), highlight->text());
+    EXPECT_FALSE(shadow->property("clippingActive").toBool());
+    EXPECT_FALSE(highlight->property("clippingActive").toBool());
+
+    panel.setClippingSummary({0, 0, 10000});
+    EXPECT_EQ(QObject::tr("S 0.0%"), shadow->text());
+    EXPECT_EQ(QObject::tr("H 0.0%"), highlight->text());
+    EXPECT_FALSE(shadow->property("clippingActive").toBool());
+    EXPECT_FALSE(highlight->property("clippingActive").toBool());
+
+    QSlider* exposureSlider = panel.findChild<QSlider*>(QStringLiteral("exposureSlider"));
+    ASSERT_NE(nullptr, exposureSlider);
+    exposureSlider->setValue(100);
+    EXPECT_EQ(QObject::tr("S …"), shadow->text());
+    EXPECT_EQ(QObject::tr("H …"), highlight->text());
+    EXPECT_FALSE(shadow->property("clippingActive").toBool());
+    EXPECT_FALSE(highlight->property("clippingActive").toBool());
+
+    panel.setClippingSummary({1, 1250, 10000});
+
+    EXPECT_EQ(QObject::tr("S <0.1%"), shadow->text());
+    EXPECT_EQ(QObject::tr("H 12.5%"), highlight->text());
+    EXPECT_TRUE(shadow->property("clippingActive").toBool());
+    EXPECT_TRUE(highlight->property("clippingActive").toBool());
+    EXPECT_TRUE(shadow->styleSheet().contains(QStringLiteral("#3874d6")));
+    EXPECT_TRUE(highlight->styleSheet().contains(QStringLiteral("#e14943")));
+    EXPECT_TRUE(highlight->styleSheet().contains(QStringLiteral("color: white")));
+    EXPECT_TRUE(shadow->toolTip().contains(QStringLiteral("1")));
+    EXPECT_TRUE(highlight->toolTip().contains(QStringLiteral("1250")));
+
+    panel.clearHistogram();
+
+    EXPECT_EQ(QObject::tr("S —"), shadow->text());
+    EXPECT_EQ(QObject::tr("H —"), highlight->text());
+    EXPECT_FALSE(shadow->property("clippingActive").toBool());
+    EXPECT_FALSE(highlight->property("clippingActive").toBool());
+    EXPECT_TRUE(shadow->styleSheet().isEmpty());
+    EXPECT_TRUE(highlight->styleSheet().isEmpty());
+}
 
 TEST(DevelopPanelTest, EmitsParamsChangedForSliderInput)
 {

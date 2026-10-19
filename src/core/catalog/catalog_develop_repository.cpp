@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSqlError>
@@ -35,14 +36,83 @@ namespace
     return {types::ErrorCode::Conflict, std::move(message)};
 }
 
+// 목적: HSL recipe의 모든 저장값이 finite normalized 범위인지 검사
+// 입력: params — 저장하거나 복원할 HSL 값
+// 출력: 모든 값이 [-1, 1]이면 true
+[[nodiscard]] bool isValidHsl(const types::HslParams& params)
+{
+    for (const auto& channel : params.channels)
+    {
+        for (const float value : {channel.hue, channel.saturation, channel.luminance})
+        {
+            if (!std::isfinite(value) || value < -1.0F || value > 1.0F)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// 목적: 고정 channel 순서의 HSL recipe를 JSON array로 저장
+// 입력: params — validated HSL recipe
+// 출력: hue/saturation/luminance object 8개
+[[nodiscard]] QJsonArray serializeHsl(const types::HslParams& params)
+{
+    QJsonArray channels;
+    for (const auto& channel : params.channels)
+    {
+        channels.append(QJsonObject{{QStringLiteral("hue"), channel.hue},
+                                    {QStringLiteral("saturation"), channel.saturation},
+                                    {QStringLiteral("luminance"), channel.luminance}});
+    }
+    return channels;
+}
+
+// 목적: HSL JSON을 전체 검증한 뒤 recipe에 반영
+// 입력: value — 선택적 HSL array, params — 성공 시 반영할 값
+// 출력: 누락된 legacy 값 또는 유효한 8개 channel이면 true
+[[nodiscard]] bool deserializeHsl(const QJsonValue& value, types::HslParams& params)
+{
+    if (value.isUndefined())
+    {
+        return true;
+    }
+    if (!value.isArray() || value.toArray().size() != static_cast<qsizetype>(params.channels.size()))
+    {
+        return false;
+    }
+    const QJsonArray channels = value.toArray();
+    types::HslParams decoded;
+    for (std::size_t index = 0; index < decoded.channels.size(); ++index)
+    {
+        const QJsonObject channel = channels.at(static_cast<qsizetype>(index)).toObject();
+        if (channel.size() != 3 || !channel.value(QStringLiteral("hue")).isDouble() ||
+            !channel.value(QStringLiteral("saturation")).isDouble() ||
+            !channel.value(QStringLiteral("luminance")).isDouble())
+        {
+            return false;
+        }
+        decoded.channels[index] = {static_cast<float>(channel.value(QStringLiteral("hue")).toDouble()),
+                                   static_cast<float>(channel.value(QStringLiteral("saturation")).toDouble()),
+                                   static_cast<float>(channel.value(QStringLiteral("luminance")).toDouble())};
+    }
+    if (!isValidHsl(decoded))
+    {
+        return false;
+    }
+    params = decoded;
+    return true;
+}
+
 // 목적: 저장 가능한 develop parameter 범위와 유한값 여부 확인
 // 입력: params: 검증할 develop parameter 값
 // 출력: 모든 parameter가 처리 가능한 범위면 true
 [[nodiscard]] bool isValidDevelopParams(const types::DevelopParams& params)
 {
-    return std::isfinite(params.exposureEv) && std::isfinite(params.contrast) && std::isfinite(params.highlights) &&
-           std::isfinite(params.shadows) && std::isfinite(params.whites) && std::isfinite(params.blacks) &&
-           std::isfinite(params.saturation) && std::isfinite(params.vibrance) &&
+    return isValidHsl(params.hsl) && std::isfinite(params.exposureEv) && std::isfinite(params.contrast) &&
+           std::isfinite(params.highlights) && std::isfinite(params.shadows) && std::isfinite(params.whites) &&
+           std::isfinite(params.blacks) && std::isfinite(params.saturation) && std::isfinite(params.vibrance) &&
            std::isfinite(params.whiteBalanceTemperatureKelvin) && std::isfinite(params.whiteBalanceTint) &&
            std::isfinite(params.clarity) && std::isfinite(params.dehaze) && std::isfinite(params.sharpeningAmount) &&
            std::isfinite(params.sharpeningRadius) && std::isfinite(params.sharpeningDetail) &&
@@ -89,6 +159,7 @@ namespace
         {QStringLiteral("blacks"), params.blacks},
         {QStringLiteral("saturation"), params.saturation},
         {QStringLiteral("vibrance"), params.vibrance},
+        {QStringLiteral("hsl"), serializeHsl(params.hsl)},
         {QStringLiteral("whiteBalanceMode"),
          params.whiteBalanceMode == types::WhiteBalanceMode::AsShot ? QStringLiteral("asShot")
                                                                     : QStringLiteral("custom")},
@@ -151,6 +222,11 @@ namespace
     }
 
     types::DevelopParams params;
+    if (!deserializeHsl(object.value(QStringLiteral("hsl")), params.hsl))
+    {
+        return types::Result<types::DevelopParams, types::CoreError>::failure(
+            makeDatabaseError(QStringLiteral("Catalog HSL parameter JSON is invalid.")));
+    }
     params.exposureEv = static_cast<float>(object.value(QStringLiteral("exposureEv")).toDouble());
     params.contrast = static_cast<float>(object.value(QStringLiteral("contrast")).toDouble());
     params.highlights = static_cast<float>(object.value(QStringLiteral("highlights")).toDouble());

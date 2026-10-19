@@ -10,6 +10,19 @@ namespace flexraw::core::orchestration
 namespace
 {
 
+TEST(EditorClientProjectionTest, PreservesEveryHslChannelAcrossClientBoundary)
+{
+    types::DevelopParams params;
+    for (std::size_t index = 0; index < params.hsl.channels.size(); ++index)
+    {
+        const float value = static_cast<float>(index + 1) / 8.0F;
+        params.hsl.channels[index] = {value, -value, value * 0.5F};
+    }
+    const auto snapshot = toClientDevelopParams(params);
+    EXPECT_EQ(snapshot.hsl, params.hsl);
+    EXPECT_EQ(fromClientDevelopParams(snapshot), params);
+}
+
 TEST(EditorClientProjectionTest, RoundTripsEverySourceBindingState)
 {
     constexpr std::array mappings{

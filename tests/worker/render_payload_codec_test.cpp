@@ -86,6 +86,33 @@ TEST(RenderPayloadCodecTest, RoundTripsRenderRequestWithUnicodePaths)
     expectOutputOptionsEqual(original.outputOptions, decoded.value().outputOptions);
 }
 
+TEST(RenderPayloadCodecTest, RoundTripsHslExtensionAndRejectsTruncationOrDowngrade)
+{
+    auto payload = makeRequestPayload();
+    payload.developParams.hsl.channels[0] = {0.5F, -0.25F, 0.75F};
+    payload.developParams.hsl.channels[7] = {-0.5F, 0.25F, -0.75F};
+    const auto encoded = encodeRenderRequestPayload(payload);
+    ASSERT_TRUE(encoded.hasValue());
+    EXPECT_EQ(encoded.value().first(4), QByteArray::fromHex("00010001"));
+    const auto decoded = decodeRenderRequestPayload(encoded.value());
+    ASSERT_TRUE(decoded.hasValue());
+    EXPECT_EQ(decoded.value().developParams, payload.developParams);
+    for (qsizetype missing = 1; missing <= 96; ++missing)
+    {
+        EXPECT_TRUE(decodeRenderRequestPayload(encoded.value().chopped(missing)).hasError());
+    }
+    auto downgraded = encoded.value();
+    downgraded[3] = 0;
+    const auto result = decodeRenderRequestPayload(downgraded);
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(result.error().code, PayloadErrorCode::TrailingBytes);
+    auto invalid = encoded.value();
+    invalid.replace(invalid.size() - 4, 4, QByteArray::fromHex("7fc00000"));
+    const auto invalidResult = decodeRenderRequestPayload(invalid);
+    ASSERT_TRUE(invalidResult.hasError());
+    EXPECT_EQ(invalidResult.error().code, PayloadErrorCode::InvalidDevelopParams);
+}
+
 TEST(RenderPayloadCodecTest, WritesStablePayloadVersionPrefix)
 {
     const EncodePayloadResult encoded = encodeRenderRequestPayload(makeRequestPayload());

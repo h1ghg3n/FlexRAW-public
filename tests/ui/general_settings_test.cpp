@@ -1,6 +1,7 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
@@ -119,6 +120,24 @@ TEST(GeneralSettingsPageTest, CancelKeepsStartupPolicyUnchanged)
     const core::client::CatalogStartupSettingsResult restored = startupSettings.catalogStartupSettings();
     ASSERT_TRUE(restored.hasValue());
     EXPECT_EQ(core::client::CatalogStartupBehavior::ReopenLastActive, restored.value().behavior);
+}
+
+TEST(GeneralSettingsPageTest, ShowsApplicationAndQtRuntimeVersions)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    QSettings storage(QDir(directory.path()).filePath(QStringLiteral("settings.ini")), QSettings::IniFormat);
+    QtCatalogStartupSettingsAdapter startupSettings(storage);
+    QtWorkerProfileSettingsAdapter workerProfiles(storage);
+    QtExportSettingsAdapter exportDefaults(storage);
+    SettingsDialog dialog(storage, workerProfiles, exportDefaults, nullptr, nullptr, &startupSettings);
+    QLabel* applicationVersion = dialog.findChild<QLabel*>(QStringLiteral("applicationVersionLabel"));
+    QLabel* qtVersion = dialog.findChild<QLabel*>(QStringLiteral("qtRuntimeVersionLabel"));
+
+    ASSERT_NE(nullptr, applicationVersion);
+    ASSERT_NE(nullptr, qtVersion);
+    EXPECT_FALSE(applicationVersion->text().isEmpty());
+    EXPECT_FALSE(qtVersion->text().isEmpty());
 }
 
 }  // namespace

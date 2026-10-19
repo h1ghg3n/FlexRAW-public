@@ -132,6 +132,7 @@ client::EditorDevelopParams toClientDevelopParams(const types::DevelopParams& pa
     snapshot.blacks = params.blacks;
     snapshot.saturation = params.saturation;
     snapshot.vibrance = params.vibrance;
+    snapshot.hsl = params.hsl;
     snapshot.whiteBalanceMode = params.whiteBalanceMode == types::WhiteBalanceMode::Custom
                                     ? client::EditorWhiteBalanceMode::Custom
                                     : client::EditorWhiteBalanceMode::AsShot;
@@ -171,6 +172,7 @@ types::DevelopParams fromClientDevelopParams(const client::EditorDevelopParams& 
     value.blacks = params.blacks;
     value.saturation = params.saturation;
     value.vibrance = params.vibrance;
+    value.hsl = params.hsl;
     value.whiteBalanceMode = params.whiteBalanceMode == client::EditorWhiteBalanceMode::Custom
                                  ? types::WhiteBalanceMode::Custom
                                  : types::WhiteBalanceMode::AsShot;

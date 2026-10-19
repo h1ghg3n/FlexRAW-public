@@ -10,13 +10,21 @@ namespace flexraw::core::client
 class ICatalogPhotoClient;
 class ICatalogProjectClient;
 class IEditorClient;
+class IExportClient;
+class IExportEventSource;
 class ISourceResolutionClient;
 class ISourceResolutionEventSource;
 }  // namespace flexraw::core::client
 
 namespace flexraw::runtime
 {
+class ProductExportClientAdapter;
 class ProductRuntime;
+}  // namespace flexraw::runtime
+
+namespace flexraw::platform
+{
+class IPathIdentityService;
 }
 
 namespace flexraw::app::mcp
@@ -68,8 +76,20 @@ public:
     // 출력: context lifetime 동안 유효한 ordered event source 참조
     [[nodiscard]] core::client::ISourceResolutionEventSource& sourceResolutionEventSource() noexcept;
 
+    // 목적: MCP Export command adapter가 사용할 frontend-neutral client 반환
+    // 입력: 없음
+    // 출력: context lifetime 동안 유효한 Local-only Export client 참조
+    [[nodiscard]] core::client::IExportClient& exportClient() noexcept;
+
+    // 목적: MCP async delivery adapter가 구독할 frontend-neutral Export event source 반환
+    // 입력: 없음
+    // 출력: context lifetime 동안 유효한 ordered Export event source 참조
+    [[nodiscard]] core::client::IExportEventSource& exportEventSource() noexcept;
+
 private:
+    std::unique_ptr<platform::IPathIdentityService> m_pathIdentityService;
     std::unique_ptr<runtime::ProductRuntime> m_productRuntime;
+    std::unique_ptr<runtime::ProductExportClientAdapter> m_exportClientAdapter;
 };
 
 }  // namespace flexraw::app::mcp

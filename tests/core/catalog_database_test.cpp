@@ -1,9 +1,12 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QUuid>
 
@@ -16,6 +19,8 @@ namespace flexraw::core::catalog
 {
 namespace
 {
+
+constexpr int FlexRawCatalogApplicationId = 0x464C5852;
 
 // 목적: Qt SQL test에 필요한 단일 QCoreApplication instance 보장
 // 입력: 없음
@@ -212,6 +217,68 @@ void ensureCoreApplication()
     return created;
 }
 
+// 목적: Catalog test fixture에 추가 schema 또는 metadata SQL을 순서대로 적용
+// 입력: catalogPath: 수정할 SQLite file 경로, statements: 실행할 SQL 목록
+// 출력: 모든 SQL 실행 성공 여부
+[[nodiscard]] bool executeCatalogStatements(const QString& catalogPath, const QStringList& statements)
+{
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setDatabaseName(catalogPath);
+    if (!database.open())
+    {
+        return false;
+    }
+
+    bool succeeded = true;
+    {
+        QSqlQuery query(database);
+        for (const QString& statement : statements)
+        {
+            if (!query.exec(statement))
+            {
+                succeeded = false;
+                break;
+            }
+        }
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+    return succeeded;
+}
+
+// 목적: test Catalog 또는 migration backup에서 단일 영속 Catalog UUID 조회
+// 입력: catalogPath: 조회할 SQLite file 경로
+// 출력: canonical UUID text 또는 조회 실패 시 빈 문자열
+[[nodiscard]] QString readCatalogUuidFromFile(const QString& catalogPath)
+{
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(catalogPath);
+    QString catalogUuid;
+    if (database.open())
+    {
+        QSqlQuery query(database);
+        if (query.exec(QStringLiteral("SELECT catalog_uuid FROM flexraw_catalog_metadata WHERE id = 1")) &&
+            query.next())
+        {
+            catalogUuid = query.value(0).toString();
+            if (query.next())
+            {
+                catalogUuid.clear();
+            }
+        }
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+    return catalogUuid;
+}
+
 class CatalogDatabaseTest : public testing::Test
 {
 protected:
@@ -236,7 +303,8 @@ TEST_F(CatalogDatabaseTest, CreatesInitialSchemaForNewCatalog)
     EXPECT_TRUE(QFileInfo::exists(catalogPath));
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v0-to-v11.bak")));
 }
 
 TEST_F(CatalogDatabaseTest, ReopensExistingCatalogWithoutReapplyingSchema)
@@ -254,7 +322,279 @@ TEST_F(CatalogDatabaseTest, ReopensExistingCatalogWithoutReapplyingSchema)
     ASSERT_TRUE(secondOpen.hasValue());
     const CatalogSchemaVersionResult version = secondOpen.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
+}
+
+TEST_F(CatalogDatabaseTest, PersistsCanonicalCatalogIdentityAcrossReopen)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult firstOpen = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(firstOpen.hasValue());
+    firstOpen.value().reset();
+    const QString firstUuid = readCatalogUuidFromFile(catalogPath);
+    ASSERT_EQ(36, firstUuid.size());
+    EXPECT_EQ(firstUuid, firstUuid.toLower());
+
+    CatalogDatabaseOpenResult secondOpen = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(secondOpen.hasValue());
+    secondOpen.value().reset();
+
+    EXPECT_EQ(firstUuid, readCatalogUuidFromFile(catalogPath));
+}
+
+TEST_F(CatalogDatabaseTest, SerializesCatalogStartupWithoutHoldingSessionLock)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    QLockFile competingLock(catalogPath + QStringLiteral(".migration.lock"));
+    competingLock.setStaleLockTime(0);
+    ASSERT_TRUE(competingLock.tryLock(0));
+
+    const CatalogDatabaseOpenResult blocked = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(blocked.hasError());
+    EXPECT_EQ(types::ErrorCode::Conflict, blocked.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath));
+    competingLock.unlock();
+
+    CatalogDatabaseOpenResult opened = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(opened.hasValue());
+    QLockFile sessionIndependentLock(catalogPath + QStringLiteral(".migration.lock"));
+    sessionIndependentLock.setStaleLockTime(0);
+    EXPECT_TRUE(sessionIndependentLock.tryLock(0));
+}
+
+TEST_F(CatalogDatabaseTest, StampsNewCatalogWithFlexRawApplicationId)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(result.hasValue());
+    result.value().reset();
+
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(catalogPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        ASSERT_TRUE(query.exec(QStringLiteral("PRAGMA application_id")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(FlexRawCatalogApplicationId, query.value(0).toInt());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+TEST_F(CatalogDatabaseTest, RejectsExistingSqliteWithoutCatalogSchemaWithoutMutatingIt)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("other.sqlite"));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("CREATE TABLE external_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"),
+         QStringLiteral("INSERT INTO external_data (id, value) VALUES (1, 'preserved')")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(catalogPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        EXPECT_FALSE(database.tables().contains(QStringLiteral("schema_version")));
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT value FROM external_data WHERE id = 1")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(QStringLiteral("preserved"), query.value(0).toString());
+        ASSERT_TRUE(query.exec(QStringLiteral("PRAGMA application_id")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(0, query.value(0).toInt());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+TEST_F(CatalogDatabaseTest, RejectsAmbiguousSchemaVersionRows)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionOneCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(catalogPath, {QStringLiteral("INSERT INTO schema_version VALUES (1)")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v1-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsVersionedCatalogMissingRequiredSourceTable)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionOneCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(catalogPath, {QStringLiteral("UPDATE schema_version SET version = 2")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v2-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsCatalogMissingRequiredUniqueKey)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionOneCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("UPDATE schema_version SET version = 2"),
+         QStringLiteral("CREATE TABLE photos ("
+                        "id INTEGER PRIMARY KEY, path TEXT NOT NULL, extension TEXT NOT NULL, "
+                        "display_name TEXT NOT NULL, kind INTEGER NOT NULL, scan_status INTEGER NOT NULL, "
+                        "file_mtime_ms INTEGER NOT NULL, imported_at_ms INTEGER NOT NULL)")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v2-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsCatalogMissingRequiredForeignKey)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionTwoCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("UPDATE schema_version SET version = 3"),
+         QStringLiteral("CREATE TABLE develop_params (photo_id INTEGER PRIMARY KEY, params_json TEXT NOT NULL, "
+                        "updated_at_ms INTEGER NOT NULL)"),
+         QStringLiteral("CREATE TABLE develop_history (id INTEGER PRIMARY KEY, photo_id INTEGER NOT NULL, "
+                        "step_id INTEGER NOT NULL, params_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL, "
+                        "UNIQUE(photo_id, step_id))")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v3-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsAdditionalUniqueConstraintOnManagedTable)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath, {QStringLiteral("CREATE UNIQUE INDEX external_photo_name_unique ON photos(display_name)")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v4-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsAdditionalColumnOnManagedTable)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(
+        executeCatalogStatements(catalogPath, {QStringLiteral("ALTER TABLE photos ADD COLUMN external_note TEXT")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v4-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsForeignApplicationIdBeforeMigration)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(catalogPath, {QStringLiteral("PRAGMA application_id = 1234")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v4-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, RejectsTriggerOnManagedTableBeforeMigration)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("CREATE TRIGGER external_photo_trigger BEFORE UPDATE ON photos BEGIN SELECT 1; END")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v4-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, PreservesIndependentExtensionTableAcrossMigration)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("CREATE TABLE external_notes (id INTEGER PRIMARY KEY, note TEXT NOT NULL)"),
+         QStringLiteral("INSERT INTO external_notes (id, note) VALUES (1, 'preserved')")}));
+
+    CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasValue());
+    result.value().reset();
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(catalogPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT note FROM external_notes WHERE id = 1")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(QStringLiteral("preserved"), query.value(0).toString());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionOneCatalogToCurrentSchema)
@@ -269,7 +609,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionOneCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionTwoCatalogToCurrentSchema)
@@ -284,7 +624,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionTwoCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionThreeCatalogToCurrentSchema)
@@ -299,7 +639,7 @@ TEST_F(CatalogDatabaseTest, MigratesVersionThreeCatalogToCurrentSchema)
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
 }
 
 TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhotoId)
@@ -314,12 +654,14 @@ TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhoto
     ASSERT_TRUE(result.hasValue());
     const CatalogSchemaVersionResult version = result.value()->schemaVersion();
     ASSERT_TRUE(version.hasValue());
-    EXPECT_EQ(8, version.value());
+    EXPECT_EQ(11, version.value());
     CatalogPhotoRepository repository(*result.value());
     const CatalogPhotoRecordResult migrated = repository.findById(types::PhotoId{42});
     ASSERT_TRUE(migrated.hasValue());
     ASSERT_TRUE(migrated.value().has_value());
     EXPECT_EQ(SourceBindingState::FingerprintPending, migrated.value()->sourceState);
+    EXPECT_EQ(CatalogCullingState::Neutral, migrated.value()->cullingState);
+    EXPECT_EQ(CatalogInclusionState::Included, migrated.value()->inclusionState);
     const types::SourceFingerprint trustedBaseline{2048, 9999, QByteArray(32, 'a')};
     ASSERT_TRUE(repository.establishSourceFingerprint(types::PhotoId{42}, trustedBaseline).hasValue());
     result.value().reset();
@@ -367,6 +709,176 @@ TEST_F(CatalogDatabaseTest, MigratesVersionFourPhotoIdentityWithoutChangingPhoto
         ASSERT_TRUE(query.exec(QStringLiteral("PRAGMA foreign_key_list(develop_params)")));
         ASSERT_TRUE(query.next());
         EXPECT_EQ(QStringLiteral("photos"), query.value(2).toString());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+TEST_F(CatalogDatabaseTest, RejectsMalformedLegacyCatalogIdentityBeforeBackup)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    ASSERT_TRUE(executeCatalogStatements(
+        catalogPath,
+        {QStringLiteral("CREATE TABLE flexraw_catalog_metadata (id INTEGER PRIMARY KEY, catalog_uuid TEXT, note TEXT)"),
+         QStringLiteral(
+             "INSERT INTO flexraw_catalog_metadata (id, catalog_uuid, note) VALUES (1, 'not-a-uuid', 'x')")}));
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+    EXPECT_FALSE(QFileInfo::exists(catalogPath + QStringLiteral(".v4-to-v11.bak")));
+}
+
+TEST_F(CatalogDatabaseTest, CreatesVerifiedVersionedBackupBeforeMigration)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    const QString backupPath = catalogPath + QStringLiteral(".v4-to-v11.bak");
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+
+    CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasValue());
+    result.value().reset();
+    ASSERT_TRUE(QFileInfo::exists(backupPath));
+
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(backupPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        ASSERT_TRUE(query.exec(QStringLiteral("PRAGMA quick_check")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(QStringLiteral("ok"), query.value(0).toString());
+
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT version FROM schema_version")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(4, query.value(0).toInt());
+
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT source_version, target_version, created_at_ms, "
+                                              "application_version, original_file_name, catalog_uuid "
+                                              "FROM flexraw_migration_backup_metadata WHERE id = 1")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(4, query.value(0).toInt());
+        EXPECT_EQ(11, query.value(1).toInt());
+        EXPECT_GT(query.value(2).toLongLong(), 0);
+        EXPECT_FALSE(query.value(3).toString().isEmpty());
+        EXPECT_EQ(QStringLiteral("library.flexraw-catalog"), query.value(4).toString());
+        EXPECT_EQ(readCatalogUuidFromFile(catalogPath), query.value(5).toString());
+        EXPECT_EQ(readCatalogUuidFromFile(catalogPath), readCatalogUuidFromFile(backupPath));
+
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT path FROM photos WHERE id = 42")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(QStringLiteral("C:/photos/legacy.CR3"), query.value(0).toString());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+TEST_F(CatalogDatabaseTest, RejectsMigrationWhenExistingBackupIsInvalid)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    const QString backupPath = catalogPath + QStringLiteral(".v4-to-v11.bak");
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    QFile invalidBackup(backupPath);
+    ASSERT_TRUE(invalidBackup.open(QIODevice::WriteOnly));
+    ASSERT_GT(invalidBackup.write("invalid backup"), 0);
+    invalidBackup.close();
+
+    const CatalogDatabaseOpenResult result = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, result.error().code);
+
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(catalogPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT version FROM schema_version")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(4, query.value(0).toInt());
+    }
+    database.close();
+    database = QSqlDatabase{};
+    QSqlDatabase::removeDatabase(connectionName);
+}
+
+TEST_F(CatalogDatabaseTest, ReusesVerifiedMigrationBackupWithoutOverwritingIt)
+{
+    QTemporaryDir directory;
+    ASSERT_TRUE(directory.isValid());
+    const QString catalogPath = QDir(directory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    const QString backupPath = catalogPath + QStringLiteral(".v4-to-v11.bak");
+    ASSERT_TRUE(createVersionFourCatalog(catalogPath));
+    CatalogDatabaseOpenResult firstMigration = CatalogDatabase::open(catalogPath);
+    ASSERT_TRUE(firstMigration.hasValue());
+    firstMigration.value().reset();
+
+    QFile backupBefore(backupPath);
+    ASSERT_TRUE(backupBefore.open(QIODevice::ReadOnly));
+    const QByteArray originalBackup = backupBefore.readAll();
+    backupBefore.close();
+    ASSERT_FALSE(originalBackup.isEmpty());
+    ASSERT_TRUE(QFile::remove(catalogPath));
+    ASSERT_TRUE(QFile::copy(backupPath, catalogPath));
+
+    const CatalogDatabaseOpenResult repeatedMigration = CatalogDatabase::open(catalogPath);
+
+    ASSERT_TRUE(repeatedMigration.hasValue());
+    QFile backupAfter(backupPath);
+    ASSERT_TRUE(backupAfter.open(QIODevice::ReadOnly));
+    EXPECT_EQ(originalBackup, backupAfter.readAll());
+}
+
+TEST_F(CatalogDatabaseTest, RejectsSameNameBackupFromDifferentCatalogIdentity)
+{
+    QTemporaryDir firstDirectory;
+    QTemporaryDir secondDirectory;
+    ASSERT_TRUE(firstDirectory.isValid());
+    ASSERT_TRUE(secondDirectory.isValid());
+    const QString firstCatalogPath = QDir(firstDirectory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    const QString secondCatalogPath = QDir(secondDirectory.path()).filePath(QStringLiteral("library.flexraw-catalog"));
+    const QString firstBackupPath = firstCatalogPath + QStringLiteral(".v4-to-v11.bak");
+    const QString secondBackupPath = secondCatalogPath + QStringLiteral(".v4-to-v11.bak");
+    ASSERT_TRUE(createVersionFourCatalog(firstCatalogPath));
+    ASSERT_TRUE(createVersionFourCatalog(secondCatalogPath));
+    CatalogDatabaseOpenResult firstMigration = CatalogDatabase::open(firstCatalogPath);
+    ASSERT_TRUE(firstMigration.hasValue());
+    firstMigration.value().reset();
+    ASSERT_TRUE(QFile::copy(firstBackupPath, secondBackupPath));
+
+    const CatalogDatabaseOpenResult secondMigration = CatalogDatabase::open(secondCatalogPath);
+
+    ASSERT_TRUE(secondMigration.hasError());
+    EXPECT_EQ(types::ErrorCode::DatabaseError, secondMigration.error().code);
+    EXPECT_NE(readCatalogUuidFromFile(firstBackupPath), readCatalogUuidFromFile(secondCatalogPath));
+    const QString connectionName =
+        QStringLiteral("catalog_database_test_%1").arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
+    QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+    database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+    database.setDatabaseName(secondCatalogPath);
+    ASSERT_TRUE(database.open());
+    {
+        QSqlQuery query(database);
+        ASSERT_TRUE(query.exec(QStringLiteral("SELECT version FROM schema_version")));
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(4, query.value(0).toInt());
     }
     database.close();
     database = QSqlDatabase{};

@@ -1,12 +1,16 @@
 #include "general_settings_page.h"
 
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QString>
 #include <QVBoxLayout>
+#include <QtGlobal>
+
+#include "settings_page_header.h"
 
 namespace flexraw::ui::settings
 {
@@ -32,6 +36,7 @@ GeneralSettingsPage::GeneralSettingsPage(core::client::ICatalogStartupSettingsCl
 
     m_managedCatalogPathEdit->setObjectName(QStringLiteral("managedCatalogPathEdit"));
     m_managedCatalogPathEdit->setReadOnly(true);
+    m_managedCatalogPathEdit->setToolTip(tr("Resolved per-user Managed Catalog location"));
 
     auto* catalogGroup = new QGroupBox(tr("Catalog startup"), this);
     auto* catalogLayout = new QFormLayout(catalogGroup);
@@ -52,11 +57,27 @@ GeneralSettingsPage::GeneralSettingsPage(core::client::ICatalogStartupSettingsCl
     languageNotice->setWordWrap(true);
     languageLayout->addRow(QString{}, languageNotice);
 
+    auto* applicationGroup = new QGroupBox(tr("Application information"), this);
+    auto* applicationLayout = new QFormLayout(applicationGroup);
+    const QString applicationVersion = QCoreApplication::applicationVersion().trimmed();
+    auto* versionValue =
+        new QLabel(applicationVersion.isEmpty() ? tr("Development build") : applicationVersion, applicationGroup);
+    versionValue->setObjectName(QStringLiteral("applicationVersionLabel"));
+    versionValue->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    auto* qtVersionValue = new QLabel(QString::fromLatin1(qVersion()), applicationGroup);
+    qtVersionValue->setObjectName(QStringLiteral("qtRuntimeVersionLabel"));
+    qtVersionValue->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    applicationLayout->addRow(tr("Flexraw version"), versionValue);
+    applicationLayout->addRow(tr("Qt runtime"), qtVersionValue);
+
     m_statusLabel->setObjectName(QStringLiteral("generalSettingsStatusLabel"));
     m_statusLabel->setWordWrap(true);
     auto* layout = new QVBoxLayout(this);
+    layout->addWidget(new SettingsPageHeader(
+        tr("General"), tr("Configure startup behavior and review information about this installation."), this));
     layout->addWidget(catalogGroup);
     layout->addWidget(languageGroup);
+    layout->addWidget(applicationGroup);
     layout->addWidget(m_statusLabel);
     layout->addStretch(1);
 

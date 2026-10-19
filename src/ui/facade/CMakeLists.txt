@@ -9,6 +9,8 @@ target_sources(flexraw_ui_facade PRIVATE
     catalog_photo_page_qt_adapter.h
     display_frame_qt_adapter.cpp
     display_frame_qt_adapter.h
+    qt_display_presentation_adapter.cpp
+    qt_display_presentation_adapter.h
     qt_catalog_thumbnail_event_adapter.cpp
     qt_catalog_thumbnail_event_adapter.h
     qt_editor_event_adapter.cpp
@@ -26,6 +28,11 @@ target_include_directories(flexraw_ui_facade PUBLIC
 target_link_libraries(flexraw_ui_facade PUBLIC
     flexraw_core_client
     flexraw_core_orchestration
+    flexraw_platform_api
     Qt6::Core
     Qt6::Gui
+)
+
+target_link_libraries(flexraw_ui_facade PRIVATE
+    lcms2::lcms2
 )

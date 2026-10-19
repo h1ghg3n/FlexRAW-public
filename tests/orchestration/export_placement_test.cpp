@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -859,6 +860,10 @@ TEST(ExportPlacementTest, LocalResourceReserveDefersInsteadOfOvercommitting)
     configuration.reservedLogicalProcessors = 0;
     configuration.memoryReserveBytes = 10 * GiB;
     configuration.memoryClaimPerJobBytes = 1 * GiB;
+    std::vector<ExportLocalAdmissionObservation> admissions;
+    configuration.localAdmissionObserver = [&](const ExportLocalAdmissionObservation& decision) {
+        admissions.push_back(decision);
+    };
     auto pipeline = std::make_unique<ScriptedExportPipeline>(1);
     ScriptedExportPipeline* const local = pipeline.get();
     ExportOrchestrator orchestrator(std::move(pipeline), {}, &memoryProbe, configuration);
@@ -870,10 +875,16 @@ TEST(ExportPlacementTest, LocalResourceReserveDefersInsteadOfOvercommitting)
     QThread::msleep(50);
     QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
     EXPECT_EQ(0, local->callCount());
+    EXPECT_TRUE(std::any_of(admissions.cbegin(), admissions.cend(), [](const auto& decision) {
+        return decision.availableMemoryBytes == 10 * GiB && decision.effectiveSlots == 0 && decision.localInFlight == 0;
+    }));
 
     memoryProbe.setAvailableBytes(12 * GiB);
     ASSERT_TRUE(waitForCondition([&]() { return observation.completed.has_value(); }, 3000));
     EXPECT_EQ(1, local->callCount());
+    EXPECT_TRUE(std::any_of(admissions.cbegin(), admissions.cend(), [](const auto& decision) {
+        return decision.availableMemoryBytes == 12 * GiB && decision.memorySlots == 2 && decision.effectiveSlots == 2;
+    }));
 }
 
 }  // namespace

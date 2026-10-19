@@ -7,6 +7,8 @@ target_sources(flexraw_mcp_adapter PRIVATE
     mcp_client_error_projection.h
     mcp_editor_tools.cpp
     mcp_editor_tools.h
+    mcp_export_tools.cpp
+    mcp_export_tools.h
     mcp_json_projection.cpp
     mcp_json_projection.h
     mcp_project_tools.cpp
@@ -48,7 +50,7 @@ if(WIN32)
     qt_generate_deploy_app_script(
         TARGET flexraw-mcp
         OUTPUT_SCRIPT flexraw_mcp_deploy_script
-        INCLUDE_PLUGIN_TYPES sqldrivers
+        INCLUDE_PLUGIN_TYPES imageformats sqldrivers
         NO_TRANSLATIONS
     )
     add_custom_command(TARGET flexraw-mcp POST_BUILD
@@ -61,4 +63,5 @@ if(WIN32)
         WORKING_DIRECTORY $<TARGET_FILE_DIR:flexraw-mcp>
         COMMENT "Deploying MCP runtime dependencies"
     )
+    flexraw_deploy_imageformat_runtime_dependencies(flexraw-mcp)
 endif()

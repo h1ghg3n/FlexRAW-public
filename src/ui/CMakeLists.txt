@@ -2,6 +2,7 @@
 # flexraw_ui 는 INTERFACE library 로, 모든 sub 모듈을 묶어 노출한다.
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(lcms2 CONFIG REQUIRED)
 
 add_subdirectory(catalog)
 add_subdirectory(editor)

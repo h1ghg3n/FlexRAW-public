@@ -90,6 +90,39 @@ namespace
     return core::client::CatalogSourceState::FingerprintPending;
 }
 
+// 목적: persisted Catalog 선별 상태를 Qt-free client enum으로 투영
+// 입력: state: repository가 검증한 Neutral·Pick·Reject 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] core::client::CatalogCullingState toClientCullingState(core::catalog::CatalogCullingState state) noexcept
+{
+    switch (state)
+    {
+    case core::catalog::CatalogCullingState::Neutral:
+        return core::client::CatalogCullingState::Neutral;
+    case core::catalog::CatalogCullingState::Pick:
+        return core::client::CatalogCullingState::Pick;
+    case core::catalog::CatalogCullingState::Reject:
+        return core::client::CatalogCullingState::Reject;
+    }
+    return core::client::CatalogCullingState::Neutral;
+}
+
+// 목적: persisted Catalog 등록 포함 상태를 Qt-free client enum으로 투영
+// 입력: state: repository가 검증한 Included·Excluded 상태
+// 출력: 같은 의미의 client enum
+[[nodiscard]] core::client::CatalogInclusionState toClientInclusionState(
+    core::catalog::CatalogInclusionState state) noexcept
+{
+    switch (state)
+    {
+    case core::catalog::CatalogInclusionState::Included:
+        return core::client::CatalogInclusionState::Included;
+    case core::catalog::CatalogInclusionState::Excluded:
+        return core::client::CatalogInclusionState::Excluded;
+    }
+    return core::client::CatalogInclusionState::Included;
+}
+
 // 목적: persisted source fingerprint를 Qt-free byte snapshot으로 투영
 // 입력: fingerprint: metadata와 optional SHA-256 baseline
 // 출력: fixed-width metadata와 independent byte vector
@@ -125,6 +158,8 @@ namespace
     snapshot.scanStatus = toClientScanStatus(photo.scanStatus);
     snapshot.fingerprint = toClientFingerprint(photo.fingerprint);
     snapshot.sourceState = toClientSourceState(photo.sourceState);
+    snapshot.cullingState = toClientCullingState(photo.cullingState);
+    snapshot.inclusionState = toClientInclusionState(photo.inclusionState);
     return snapshot;
 }
 

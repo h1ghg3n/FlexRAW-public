@@ -50,14 +50,15 @@ public:
                           QWidget* parent = nullptr);
 
     // 목적: 선택된 여러 photo source를 editable output 목록과 통합 placement 경계에 연결
-    // 입력: Export command/event contract, source별 develop resolution 정보, Worker/profile default client와 Qt parent
-    // parent 출력: item 단위 Local/Remote/Auto scheduling을 제출할 graphical dialog 객체
+    // 입력: Export contract, source별 develop 정보, settings client, parent와 제외된 source 수
+    // 출력: item 단위 Local/Remote/Auto scheduling을 제출할 graphical dialog 객체
     explicit ExportDialog(core::client::IExportClient& exportClient,
                           core::client::IExportEventSource& exportEventSource,
                           QVector<ExportDialogSource> sources,
                           core::client::IWorkerProfileClient& workerProfileClient,
                           core::client::IExportDefaultsClient& exportDefaultsClient,
-                          QWidget* parent = nullptr);
+                          QWidget* parent = nullptr,
+                          qsizetype skippedSourceCount = 0);
 
     // 목적: dialog 종료 중 active export가 남아 있으면 cancellation 요청
     // 입력: 없음
@@ -170,6 +171,16 @@ private:
     // 출력: 성공 설정 저장 또는 실패 상세 표시
     void handleCompleted(const core::client::ExportResult& result);
 
+    // 목적: terminal item result를 matching source/output 표 행에 표시
+    // 입력: items: source/output identity와 성공·실패 의미를 가진 terminal result 목록
+    // 출력: 각 matching Result cell에 localized terminal 상태 표시
+    void presentItemResults(const std::vector<core::client::ExportItemResult>& items);
+
+    // 목적: 아직 개별 terminal이 없는 모든 output 행의 상태 표시
+    // 입력: statusText: 모든 행에 적용할 localized 상태 문구
+    // 출력: Result column text 갱신
+    void setAllItemStatuses(const QString& statusText);
+
     // 목적: pipeline-level current request 실패를 사용자에게 표시
     // 입력: issue: request identity와 structured error
     // 출력: retry 가능한 Failed 상태 표시
@@ -186,6 +197,11 @@ private:
     [[nodiscard]] QString exportErrorText(
         const core::client::ClientError& error,
         core::client::ExportFailureKind failureKind = core::client::ExportFailureKind::None) const;
+
+    // 목적: Core raster path validation 오류를 stable localized 문구로 변환
+    // 입력: error: 진단 message와 stable code를 가진 path validation 오류
+    // 출력: diagnostic 원문을 노출하지 않는 사용자용 문자열
+    [[nodiscard]] QString pathValidationErrorText(const core::types::CoreError& error) const;
 
     // 목적: active request 경과시간 label 갱신
     // 입력: 없음
@@ -204,7 +220,6 @@ private:
     std::vector<core::client::WorkerProfileSnapshot> m_workerProfiles;
     QVector<ExportDialogSource> m_sources;
     core::types::FileDescriptor m_source;
-    core::types::DevelopParams m_developParams;
     core::client::ExportExecutionDefaults m_executionDefaults;
     QLabel* m_sourceLabel{nullptr};
     QTableWidget* m_outputTable{nullptr};

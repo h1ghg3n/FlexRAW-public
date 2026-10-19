@@ -18,6 +18,7 @@
 
 #include "mcp_catalog_tools.h"
 #include "mcp_editor_tools.h"
+#include "mcp_export_tools.h"
 #include "mcp_project_tools.h"
 #include "mcp_source_resolution_tools.h"
 #include "mcp_tool_result.h"
@@ -86,12 +87,13 @@ constexpr int UnsupportedProtocolVersion = -32022;
 }  // namespace
 
 // 목적: local STDIO MCP transport를 독립된 tool adapter와 stream에 연결
-// 입력: 네 domain tool adapter, serverVersion과 STDIO streams
+// 입력: 다섯 domain tool adapter, serverVersion과 STDIO streams
 // 출력: 주어진 stream lifetime 안에서 동작하는 MCP server
 McpServer::McpServer(McpCatalogTools& catalogTools,
                      McpProjectTools& projectTools,
                      McpEditorTools& editorTools,
                      McpSourceResolutionTools& sourceTools,
+                     McpExportTools& exportTools,
                      std::string serverVersion,
                      std::istream& input,
                      std::ostream& output,
@@ -100,6 +102,7 @@ McpServer::McpServer(McpCatalogTools& catalogTools,
       m_projectTools(&projectTools),
       m_editorTools(&editorTools),
       m_sourceTools(&sourceTools),
+      m_exportTools(&exportTools),
       m_serverVersion(std::move(serverVersion)),
       m_input(&input),
       m_output(&output),
@@ -115,6 +118,7 @@ int McpServer::run()
     {
         *m_diagnostics << "MCP serialized delivery requires the QCoreApplication owner thread.\n";
         m_sourceTools->shutdown();
+        m_exportTools->shutdown();
         return 3;
     }
 
@@ -138,6 +142,7 @@ int McpServer::run()
             this,
             [this, &deliveryLoop] {
                 m_sourceTools->shutdown();
+                m_exportTools->shutdown();
                 deliveryLoop.quit();
             },
             Qt::BlockingQueuedConnection);
@@ -304,7 +309,7 @@ QJsonObject McpServer::handleInitialize(const QJsonObject& request)
          QJsonObject{{QStringLiteral("name"), QStringLiteral("Flexraw MCP")},
                      {QStringLiteral("version"), toQString(m_serverVersion)}}},
         {QStringLiteral("instructions"),
-         QStringLiteral("Use bounded Flexraw Catalog and Editor tools from the explicitly opened Catalog.")}};
+         QStringLiteral("Use bounded Flexraw Catalog, Editor and Export tools from the explicitly opened Catalog.")}};
     return successResponse(id, result);
 }
 
@@ -326,7 +331,7 @@ QJsonObject McpServer::handleDiscover(const QJsonObject& request) const
         {QStringLiteral("supportedVersions"), QJsonArray{QString::fromLatin1(ModernProtocolVersion)}},
         {QStringLiteral("capabilities"), QJsonObject{{QStringLiteral("tools"), QJsonObject{}}}},
         {QStringLiteral("instructions"),
-         QStringLiteral("Use bounded Flexraw Catalog and Editor tools from the explicitly opened Catalog.")}};
+         QStringLiteral("Use bounded Flexraw Catalog, Editor and Export tools from the explicitly opened Catalog.")}};
     return successResponse(id, decorateModernResult(std::move(result), m_serverVersion, true));
 }
 
@@ -338,7 +343,8 @@ QJsonObject McpServer::handleToolsList(const QJsonObject& request) const
     QJsonArray tools{m_catalogTools->queryPhotosDescriptor(),
                      m_projectTools->listProjectsDescriptor(),
                      m_editorTools->getStateDescriptor(),
-                     m_sourceTools->eventsDescriptor()};
+                     m_sourceTools->eventsDescriptor(),
+                     m_exportTools->eventsDescriptor()};
     if (m_projectTools->writesEnabled())
     {
         tools.append(m_projectTools->addPhotoToProjectDescriptor());
@@ -351,6 +357,11 @@ QJsonObject McpServer::handleToolsList(const QJsonObject& request) const
     if (m_sourceTools->writesEnabled())
     {
         tools.append(m_sourceTools->cancelRequestDescriptor());
+    }
+    if (m_exportTools->writesEnabled())
+    {
+        tools.append(m_exportTools->submitSelectedPhotoDescriptor());
+        tools.append(m_exportTools->cancelRequestDescriptor());
     }
     QJsonObject result{{QStringLiteral("tools"), std::move(tools)}};
     if (isModernRequest(request))
@@ -410,6 +421,18 @@ QJsonObject McpServer::handleToolsCall(const QJsonObject& request) const
     else if (toolName == McpSourceResolutionTools::cancelRequestToolName())
     {
         called = m_sourceTools->callCancelRequest(arguments);
+    }
+    else if (toolName == McpExportTools::submitSelectedPhotoToolName())
+    {
+        called = m_exportTools->callSubmitSelectedPhoto(arguments);
+    }
+    else if (toolName == McpExportTools::eventsToolName())
+    {
+        called = m_exportTools->callEvents(arguments);
+    }
+    else if (toolName == McpExportTools::cancelRequestToolName())
+    {
+        called = m_exportTools->callCancelRequest(arguments);
     }
     else
     {

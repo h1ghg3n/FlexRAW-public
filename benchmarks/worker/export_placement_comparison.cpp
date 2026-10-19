@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <QCommandLineParser>
 #include <QCoreApplication>
@@ -12,6 +14,8 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QImageReader>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QTimer>
 #include <QUuid>
 
@@ -23,6 +27,7 @@
 #include "measurement_csv.h"
 #include "remote_export_execution_adapter.h"
 #include "remote_render_executor.h"
+#include "resolved_render_pipeline.h"
 #include "shared_storage_locator.h"
 #include "stage_timer.h"
 #include "supported_extensions.h"
@@ -46,6 +51,235 @@ struct PlacementBenchmarkConfiguration
     int localConcurrency{4};
     int remoteConcurrency{2};
     int warmupCount{0};
+    bool instrumentedLocal{false};
+    bool traceLocalAdmission{false};
+};
+
+struct TimedLocalAdmission
+{
+    std::uint64_t elapsedNanoseconds{0};
+    flexraw::core::orchestration::ExportLocalAdmissionObservation decision;
+};
+
+class LocalAdmissionTrace final
+{
+public:
+    // 목적: warm-up 이후 Local admission 결정의 시간축만 보존
+    // 입력: 없음
+    // 출력: 이전 sample이 없는 새 측정 구간
+    void startMeasurement()
+    {
+        m_samples.clear();
+        m_epoch = std::chrono::steady_clock::now();
+        m_measuring = true;
+    }
+
+    // 목적: 추가 memory probe 없이 scheduler가 이미 계산한 결정을 저장
+    // 입력: decision: 당시의 available memory, cap 및 실제 Local in-flight
+    // 출력: benchmark 전용 in-memory sample
+    void observe(const flexraw::core::orchestration::ExportLocalAdmissionObservation& decision)
+    {
+        if (m_measuring)
+        {
+            const auto elapsed = std::chrono::steady_clock::now() - m_epoch;
+            m_samples.push_back(
+                {static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                 decision});
+        }
+    }
+
+    // 목적: 측정 종료 후에만 admission 결정 log를 stderr로 출력
+    // 입력: 없음
+    // 출력: 별도 log로 보존 가능한 구조화된 sample line
+    void writeLog() const
+    {
+        for (const TimedLocalAdmission& sample : m_samples)
+        {
+            const auto& decision = sample.decision;
+            std::cerr << "local_admission,time_ns=" << sample.elapsedNanoseconds << ",available_bytes=";
+            if (decision.availableMemoryBytes.has_value())
+            {
+                std::cerr << *decision.availableMemoryBytes;
+            }
+            else
+            {
+                std::cerr << "unknown";
+            }
+            std::cerr << ",configured_slots=" << decision.configuredSlots << ",cpu_slots=" << decision.cpuSlots
+                      << ",memory_slots=" << decision.memorySlots << ",effective_slots=" << decision.effectiveSlots
+                      << ",local_in_flight=" << decision.localInFlight << '\n';
+        }
+    }
+
+private:
+    std::vector<TimedLocalAdmission> m_samples;
+    std::chrono::steady_clock::time_point m_epoch{};
+    bool m_measuring{false};
+};
+
+struct LocalExecutionSample
+{
+    std::uint64_t startedNanoseconds{0};
+    std::uint64_t finishedNanoseconds{0};
+    flexraw::core::measurement::RenderStats render;
+};
+
+class MeasuredLocalExportPipeline final : public flexraw::core::orchestration::IExportPipeline
+{
+public:
+    // 목적: 기존 Export 준비/검증과 단계 계측용 RAW renderer를 함께 조립
+    // 입력: pathIdentityService: benchmark보다 오래 살아야 하는 OS path dependency
+    // 출력: LocalOnly 전용 계측 pipeline
+    explicit MeasuredLocalExportPipeline(const flexraw::platform::IPathIdentityService& pathIdentityService)
+        : m_delegate(pathIdentityService)
+    {}
+
+    // 목적: warm-up 이후의 실제 Local 실행만 계측하도록 상태 초기화
+    // 입력: 없음
+    // 출력: job timing과 in-flight high-water의 새 측정 구간
+    void startMeasurement()
+    {
+        QMutexLocker lock(&m_mutex);
+        m_samples.clear();
+        m_running = 0;
+        m_runningHighWater = 0;
+        m_epoch = std::chrono::steady_clock::now();
+        m_measuring = true;
+    }
+
+    // 목적: 준비된 item의 기존 source/output validation과 develop state 해석 보존
+    // 입력: request: Export 요청, cancellationToken: 중단 상태
+    // 출력: FileExportPipeline의 원래 준비 결과
+    [[nodiscard]] flexraw::core::orchestration::ExportPreparationResult prepare(
+        const flexraw::core::orchestration::ExportRequest& request,
+        const flexraw::core::types::CancellationToken& cancellationToken) const override
+    {
+        return m_delegate.prepare(request, cancellationToken);
+    }
+
+    // 목적: 같은 Local slot에서 stage timer가 있는 RAW renderer를 실행하고 실제 실행 구간 관측
+    // 입력: item: 준비된 source/develop/output, cancellationToken: 중단 상태
+    // 출력: RenderStats를 별도 보관한 item 성공 또는 실패
+    [[nodiscard]] flexraw::core::orchestration::ExportItemResult executeItem(
+        const flexraw::core::orchestration::PreparedExportItem& item,
+        const flexraw::core::types::CancellationToken& cancellationToken) const override
+    {
+        if (item.preparationError.has_value() ||
+            item.request.source.kind != flexraw::core::types::SupportedFileKind::Raw)
+        {
+            return m_delegate.executeItem(item, cancellationToken);
+        }
+
+        ActiveJob sample(*this, item.request.source.path);
+        flexraw::core::render::ResolvedRenderRequest request{
+            item.request.source.path,
+            item.request.outputPath,
+            item.request.developParams.value_or(flexraw::core::types::DevelopParams{}),
+            item.request.options};
+        const flexraw::core::render::ResolvedRenderPipelineResult result =
+            m_renderer.execute(request, cancellationToken);
+        if (result.hasError())
+        {
+            sample.render = result.error().stats;
+            return {item.request.source.path,
+                    item.request.outputPath,
+                    false,
+                    result.error().cause,
+                    flexraw::core::orchestration::ExportItemFailureKind::Execution};
+        }
+        sample.render = result.value().stats;
+        return {item.request.source.path, result.value().artifact.outputPath, true, {}};
+    }
+
+    // 목적: benchmark에서 사용하지 않는 synchronous legacy call을 기존 구현에 위임
+    // 입력: request/cancellationToken/progress: legacy Export 인자
+    // 출력: FileExportPipeline의 원래 request-level 결과
+    [[nodiscard]] flexraw::core::orchestration::ExportPipelineResult execute(
+        const flexraw::core::orchestration::ExportRequest& request,
+        const flexraw::core::types::CancellationToken& cancellationToken,
+        const flexraw::core::orchestration::ExportProgressCallback& progress) const override
+    {
+        return m_delegate.execute(request, cancellationToken, progress);
+    }
+
+    // 목적: 완료된 RAW job의 stage 및 실행 시작·종료 측정값 조회
+    // 입력: sourcePath: prepared source identity
+    // 출력: 해당 job이 실제 실행됐으면 sample
+    [[nodiscard]] std::optional<LocalExecutionSample> sample(const QString& sourcePath) const
+    {
+        QMutexLocker lock(&m_mutex);
+        const auto found = m_samples.constFind(QDir::cleanPath(sourcePath));
+        return found == m_samples.cend() ? std::nullopt : std::optional<LocalExecutionSample>(*found);
+    }
+
+    // 목적: request 기간에 실제 renderer에 진입한 동시 job 최고치 조회
+    // 입력: 없음
+    // 출력: measured Local 실행 high-water
+    [[nodiscard]] int runningHighWater() const
+    {
+        QMutexLocker lock(&m_mutex);
+        return m_runningHighWater;
+    }
+
+private:
+    class ActiveJob
+    {
+    public:
+        // 목적: worker가 renderer를 실제 실행하기 시작한 시각과 동시 개수 기록
+        // 입력: owner: 측정 owner, sourcePath: item identity
+        // 출력: 종료 시점을 보장하는 scope-bound recorder
+        ActiveJob(const MeasuredLocalExportPipeline& owner, QString sourcePath)
+            : m_owner(owner), m_sourcePath(QDir::cleanPath(sourcePath))
+        {
+            QMutexLocker lock(&m_owner.m_mutex);
+            if (m_owner.m_measuring)
+            {
+                m_startedNanoseconds = m_owner.elapsedNanoseconds();
+                ++m_owner.m_running;
+                m_owner.m_runningHighWater = std::max(m_owner.m_runningHighWater, m_owner.m_running);
+            }
+        }
+
+        // 목적: 실패 또는 예외 시에도 active count를 회수하고 관측값 보존
+        // 입력: 없음
+        // 출력: source별 timing sample과 감소된 in-flight count
+        ~ActiveJob()
+        {
+            if (!m_startedNanoseconds.has_value())
+            {
+                return;
+            }
+            const auto finishedNanoseconds = m_owner.elapsedNanoseconds();
+            QMutexLocker lock(&m_owner.m_mutex);
+            m_owner.m_samples.insert(m_sourcePath, {*m_startedNanoseconds, finishedNanoseconds, render});
+            --m_owner.m_running;
+        }
+
+        flexraw::core::measurement::RenderStats render;
+
+    private:
+        const MeasuredLocalExportPipeline& m_owner;
+        QString m_sourcePath;
+        std::optional<std::uint64_t> m_startedNanoseconds;
+    };
+
+    // 목적: measured request 시작 이후의 monotonic elapsed time 계산
+    // 입력: 없음
+    // 출력: nanosecond 단위 상대 시각
+    [[nodiscard]] std::uint64_t elapsedNanoseconds() const
+    {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - m_epoch).count());
+    }
+
+    flexraw::core::orchestration::FileExportPipeline m_delegate;
+    flexraw::core::render::ResolvedRenderPipeline m_renderer;
+    mutable QMutex m_mutex;
+    mutable QHash<QString, LocalExecutionSample> m_samples;
+    mutable int m_running{0};
+    mutable int m_runningHighWater{0};
+    bool m_measuring{false};
+    std::chrono::steady_clock::time_point m_epoch;
 };
 
 struct CompletionSample
@@ -182,6 +416,10 @@ struct ObservedExport
                       QStringLiteral("Single-photo warm-up request count."),
                       QStringLiteral("count"),
                       QStringLiteral("0")});
+    parser.addOption({QStringLiteral("instrumented-local"),
+                      QStringLiteral("Use measured RAW renderer for LocalOnly stage/in-flight diagnostics.")});
+    parser.addOption({QStringLiteral("trace-local-admission"),
+                      QStringLiteral("Record Local admission decisions without replacing the production renderer.")});
     parser.addOption(
         {QStringLiteral("run-id"), QStringLiteral("Stable CSV run label."), QStringLiteral("id"), configuration.runId});
     parser.addOption({QStringLiteral("target"),
@@ -222,6 +460,14 @@ struct ObservedExport
     configuration.remoteHost = parser.value(QStringLiteral("remote-host")).trimmed();
     configuration.remotePort = static_cast<std::uint16_t>(port);
     configuration.warmupCount = warmup;
+    configuration.instrumentedLocal = parser.isSet(QStringLiteral("instrumented-local"));
+    configuration.traceLocalAdmission = parser.isSet(QStringLiteral("trace-local-admission"));
+    if ((configuration.instrumentedLocal || configuration.traceLocalAdmission) &&
+        configuration.policy != flexraw::core::orchestration::ExportPlacementPolicy::LocalOnly)
+    {
+        std::cerr << "Local diagnostics require --mode local.\n";
+        return false;
+    }
     configuration.runId = parser.value(QStringLiteral("run-id"));
     configuration.target = parser.value(QStringLiteral("target"));
     return true;
@@ -410,7 +656,8 @@ struct ObservedExport
 // 출력: 모든 item이 성공하고 Local/Remote mode 계약을 만족하면 true
 [[nodiscard]] bool writeResults(const PlacementBenchmarkConfiguration& configuration,
                                 const ObservedExport& observed,
-                                const std::optional<flexraw::platform::ProcessMemorySnapshot>& processMemory)
+                                const std::optional<flexraw::platform::ProcessMemorySnapshot>& processMemory,
+                                const MeasuredLocalExportPipeline* measuredPipeline)
 {
     if (!observed.completed.has_value())
     {
@@ -427,6 +674,7 @@ struct ObservedExport
     }
 
     const auto& report = observed.completed->report;
+    int missingLocalSamples = 0;
     flexraw::core::measurement::writeRenderMeasurementCsvHeader(std::cout);
     for (qsizetype index = 0; index < report.items.size(); ++index)
     {
@@ -449,6 +697,21 @@ struct ObservedExport
         record.succeeded = item.succeeded;
         record.endToEndNanoseconds =
             completionTimes.value(QDir::cleanPath(item.sourcePath), observed.makespanNanoseconds);
+        if (measuredPipeline != nullptr)
+        {
+            record.scheduler.runningHighWater = static_cast<std::uint64_t>(measuredPipeline->runningHighWater());
+            if (const auto sample = measuredPipeline->sample(item.sourcePath); sample.has_value())
+            {
+                record.render = sample->render;
+                std::cerr << "local_item_timing,source=" << toUtf8(QFileInfo(item.sourcePath).fileName())
+                          << ",start_ns=" << sample->startedNanoseconds << ",finish_ns=" << sample->finishedNanoseconds
+                          << '\n';
+            }
+            else
+            {
+                ++missingLocalSamples;
+            }
+        }
         if (processMemory.has_value())
         {
             record.peakRssBytes = processMemory->peakResidentBytes;
@@ -480,8 +743,13 @@ struct ObservedExport
         std::cerr << ",current_rss_bytes=" << processMemory->residentBytes
                   << ",peak_rss_bytes=" << processMemory->peakResidentBytes;
     }
+    if (measuredPipeline != nullptr)
+    {
+        std::cerr << ",actual_local_running_high_water=" << measuredPipeline->runningHighWater()
+                  << ",missing_local_samples=" << missingLocalSamples;
+    }
     std::cerr << '\n';
-    return report.failedCount == 0;
+    return report.failedCount == 0 && missingLocalSamples == 0;
 }
 
 // 목적: production-equivalent Export placement object graph과 measured corpus 실행
@@ -508,14 +776,30 @@ struct ObservedExport
     scheduling.reservedLogicalProcessors = 4;
     scheduling.memoryReserveBytes = 10ULL * 1024ULL * Mebibyte;
     scheduling.memoryClaimPerJobBytes = 1024ULL * Mebibyte;
+    LocalAdmissionTrace admissionTrace;
+    if (configuration.traceLocalAdmission)
+    {
+        scheduling.localAdmissionObserver = [&admissionTrace](const auto& decision) {
+            admissionTrace.observe(decision);
+        };
+    }
     auto remoteAdapter = std::make_unique<flexraw::worker::client::RemoteExportExecutionAdapter>(
         std::make_unique<flexraw::worker::client::RemoteRenderExecutor>());
     const auto pathIdentityService = flexraw::platform::createCurrentPathIdentityService();
+    std::unique_ptr<flexraw::core::orchestration::IExportPipeline> pipeline;
+    MeasuredLocalExportPipeline* measuredPipeline = nullptr;
+    if (configuration.instrumentedLocal)
+    {
+        auto measured = std::make_unique<MeasuredLocalExportPipeline>(*pathIdentityService);
+        measuredPipeline = measured.get();
+        pipeline = std::move(measured);
+    }
+    else
+    {
+        pipeline = std::make_unique<flexraw::core::orchestration::FileExportPipeline>(*pathIdentityService);
+    }
     flexraw::core::orchestration::ExportOrchestrator orchestrator(
-        std::make_unique<flexraw::core::orchestration::FileExportPipeline>(*pathIdentityService),
-        std::move(remoteAdapter),
-        systemMemoryProbe.get(),
-        scheduling);
+        std::move(pipeline), std::move(remoteAdapter), systemMemoryProbe.get(), scheduling);
     const flexraw::core::orchestration::ExportPlacementOptions placement = makePlacement(configuration, *source);
 
     for (int index = 1; index <= configuration.warmupCount; ++index)
@@ -529,9 +813,22 @@ struct ObservedExport
         std::cerr << "warmup,index=" << index << ",state=completed\n";
     }
 
+    if (measuredPipeline != nullptr)
+    {
+        measuredPipeline->startMeasurement();
+    }
+    if (configuration.traceLocalAdmission)
+    {
+        admissionTrace.startMeasurement();
+    }
     const ObservedExport observed = executeObserved(orchestrator, makeBatchRequest(configuration), placement);
     const std::optional<flexraw::platform::ProcessMemorySnapshot> processMemory = processMemoryProbe->snapshot();
-    return writeResults(configuration, observed, processMemory) ? 0 : 5;
+    const bool succeeded = writeResults(configuration, observed, processMemory, measuredPipeline);
+    if (configuration.traceLocalAdmission)
+    {
+        admissionTrace.writeLog();
+    }
+    return succeeded ? 0 : 5;
 }
 
 }  // namespace

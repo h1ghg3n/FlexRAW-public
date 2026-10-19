@@ -6,7 +6,7 @@
 #include <QFileInfo>
 #include <QStringList>
 
-#include "develop.h"
+#include "develop_validation_adapter.h"
 #include "export.h"
 
 namespace flexraw::worker::runtime

@@ -5,8 +5,10 @@
 
 #include <QFileInfo>
 
-#include "develop.h"
+#include "develop_qt_adapter.h"
+#include "develop_validation_adapter.h"
 #include "export.h"
+#include "export_qt_adapter.h"
 #include "raw_file_reader.h"
 #include "stage_timer.h"
 
@@ -73,7 +75,7 @@ ResolvedRenderPipelineResult ResolvedRenderPipeline::execute(const ResolvedRende
     }
 
     const measurement::StageTimer decodeTimer;
-    const raw::RawPreviewImageResult decodedRaw = raw::decodeRawPreviewImage(request.sourcePath);
+    raw::RawPreviewImageResult decodedRaw = raw::decodeRawPreviewImage(request.sourcePath);
     stats.decodeNanoseconds = decodeTimer.elapsedNanoseconds();
     if (decodedRaw.hasError())
     {
@@ -86,7 +88,9 @@ ResolvedRenderPipelineResult ResolvedRenderPipeline::execute(const ResolvedRende
     }
 
     const measurement::StageTimer conversionTimer;
-    const export_::RasterSourceImageResult sourceImage = export_::prepareRawForRasterExport(decodedRaw.value());
+    const QString metadataSourcePath = decodedRaw.value().diagnostics.sourcePath;
+    export_::qt_adapter::RasterSourceImageResult sourceImage =
+        export_::qt_adapter::consumeRawForRasterExport(std::move(decodedRaw.value()));
     stats.sourceConversionNanoseconds = conversionTimer.elapsedNanoseconds();
     if (sourceImage.hasError())
     {
@@ -100,12 +104,13 @@ ResolvedRenderPipelineResult ResolvedRenderPipeline::execute(const ResolvedRende
 
     const measurement::StageTimer developTimer;
     const develop::DevelopImageResult developedImage =
-        develop::applyDevelop(sourceImage.value(), validatedParams.value());
+        develop::qt_adapter::apply(sourceImage.value(), validatedParams.value());
     stats.developNanoseconds = developTimer.elapsedNanoseconds();
     if (developedImage.hasError())
     {
         return makeFailure(developedImage.error(), stats, totalTimer);
     }
+    sourceImage.value() = QImage{};
 
     if (cancellationToken.isCancellationRequested())
     {
@@ -116,7 +121,7 @@ ResolvedRenderPipelineResult ResolvedRenderPipeline::execute(const ResolvedRende
     const export_::RasterExportResult exported = export_::writeRasterImage(developedImage.value(),
                                                                            validatedOutputPath.value(),
                                                                            request.outputOptions,
-                                                                           decodedRaw.value().diagnostics.sourcePath,
+                                                                           metadataSourcePath,
                                                                            &cancellationToken);
     stats.outputNanoseconds = outputTimer.elapsedNanoseconds();
     if (exported.hasError())

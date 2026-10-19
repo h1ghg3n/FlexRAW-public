@@ -1,25 +1,23 @@
 #include "export.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
-#include <limits>
+#include <optional>
 #include <system_error>
 #include <utility>
 
 #include <QByteArray>
-#include <QColorSpace>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QImageWriter>
 #include <QSaveFile>
 #include <QTemporaryFile>
 
 #include <exiv2/exiv2.hpp>
 
-#include "color.h"
-#include "develop.h"
+#include "develop_qt_adapter.h"
+#include "export_processing.h"
+#include "export_qt_adapter.h"
 #include "raw_file_reader.h"
 
 namespace flexraw::core::export_
@@ -27,12 +25,6 @@ namespace flexraw::core::export_
 namespace
 {
 
-constexpr int MinimumJpegQuality = 1;
-constexpr int MaximumJpegQuality = 100;
-constexpr int MinimumPngCompression = 0;
-constexpr int MaximumPngCompression = 9;
-constexpr int TiffNoCompression = 0;
-constexpr int TiffLzwCompression = 1;
 constexpr qsizetype CopyChunkSize = 64 * 1024;
 
 // 목적: raster export 실패 정보를 구조화된 CoreError로 생성
@@ -131,243 +123,30 @@ constexpr qsizetype CopyChunkSize = 64 * 1024;
         types::ErrorCode::Conflict, QStringLiteral("Raster export source and output paths refer to the same file.")));
 }
 
-// 목적: 선택한 raster format에 적용되는 인코딩 옵션 범위 검증
-// 입력: options: 검증할 format 및 인코딩 설정
-// 출력: 성공 표식 또는 유효하지 않은 옵션 정보
-[[nodiscard]] RasterExportResult validateOptions(const RasterExportOptions& options)
+// 목적: neutral raster export validation issue를 기존 CoreError 의미로 투영
+// 입력: issue: option 허용 범위 또는 지원 범위 위반
+// 출력: 기존 caller가 소비하는 error code와 diagnostic message
+[[nodiscard]] types::CoreError projectOptionsValidationIssue(RasterExportOptionsValidationIssue issue)
 {
-    if (options.maximumDimension < 0)
+    switch (issue)
     {
-        return RasterExportResult::failure(makeError(types::ErrorCode::InvalidArgument,
-                                                     QStringLiteral("Export maximum dimension must not be negative.")));
+    case RasterExportOptionsValidationIssue::MaximumDimensionNegative:
+        return makeError(types::ErrorCode::InvalidArgument,
+                         QStringLiteral("Export maximum dimension must not be negative."));
+    case RasterExportOptionsValidationIssue::JpegQualityOutOfRange:
+        return makeError(types::ErrorCode::InvalidArgument, QStringLiteral("JPEG quality must be between 1 and 100."));
+    case RasterExportOptionsValidationIssue::PngCompressionOutOfRange:
+        return makeError(types::ErrorCode::InvalidArgument, QStringLiteral("PNG compression must be between 0 and 9."));
+    case RasterExportOptionsValidationIssue::TiffCompressionInvalid:
+        return makeError(types::ErrorCode::InvalidArgument, QStringLiteral("TIFF compression option is invalid."));
+    case RasterExportOptionsValidationIssue::FormatUnsupported:
+        return makeError(types::ErrorCode::UnsupportedFormat, QStringLiteral("Raster export format is unsupported."));
+    case RasterExportOptionsValidationIssue::ColorSpaceUnsupported:
+        return makeError(types::ErrorCode::UnsupportedFormat,
+                         QStringLiteral("Raster export color space is unsupported."));
     }
 
-    switch (options.format)
-    {
-    case RasterExportFormat::Jpeg:
-        if (options.jpegQuality < MinimumJpegQuality || options.jpegQuality > MaximumJpegQuality)
-        {
-            return RasterExportResult::failure(makeError(types::ErrorCode::InvalidArgument,
-                                                         QStringLiteral("JPEG quality must be between 1 and 100.")));
-        }
-        break;
-    case RasterExportFormat::Png:
-        if (options.pngCompression < MinimumPngCompression || options.pngCompression > MaximumPngCompression)
-        {
-            return RasterExportResult::failure(makeError(types::ErrorCode::InvalidArgument,
-                                                         QStringLiteral("PNG compression must be between 0 and 9.")));
-        }
-        break;
-    case RasterExportFormat::Tiff:
-        if (options.tiffCompression != TiffCompression::None && options.tiffCompression != TiffCompression::Lzw)
-        {
-            return RasterExportResult::failure(
-                makeError(types::ErrorCode::InvalidArgument, QStringLiteral("TIFF compression option is invalid.")));
-        }
-        break;
-    default:
-        return RasterExportResult::failure(
-            makeError(types::ErrorCode::UnsupportedFormat, QStringLiteral("Raster export format is unsupported.")));
-    }
-
-    if (options.outputColorSpace != RasterOutputColorSpace::Srgb &&
-        options.outputColorSpace != RasterOutputColorSpace::AdobeRgb &&
-        options.outputColorSpace != RasterOutputColorSpace::DisplayP3)
-    {
-        return RasterExportResult::failure(makeError(types::ErrorCode::UnsupportedFormat,
-                                                     QStringLiteral("Raster export color space is unsupported.")));
-    }
-
-    return RasterExportResult::success({});
-}
-
-// 목적: export 최대 변 길이에 맞춰 필요할 때만 image를 aspect ratio 유지하며 축소
-// 입력: image: export할 원본 image, maximumDimension: 0 또는 최대 pixel 길이
-// 출력: resize가 적용됐거나 원본 크기가 유지된 QImage
-[[nodiscard]] QImage resizeForExport(const QImage& image, int maximumDimension)
-{
-    if (maximumDimension == 0 || std::max(image.width(), image.height()) <= maximumDimension)
-    {
-        return image;
-    }
-
-    const QSize targetSize = image.size().scaled(maximumDimension, maximumDimension, Qt::KeepAspectRatio);
-    return image.scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-}
-
-// 목적: 현재 sRGB 작업 image를 선택한 출력 색 공간으로 변환하고 ICC 프로필을 연결
-// 입력: sourceImage: sRGB 작업 image, outputColorSpace: export 대상 색 공간
-// 출력: 색 변환 및 ICC 연결이 완료된 image 또는 프로필/변환 실패 정보
-[[nodiscard]] color::ColorImageResult convertForExport(const QImage& sourceImage,
-                                                       RasterOutputColorSpace outputColorSpace)
-{
-    const color::IccProfileResult sourceProfile = color::createRgbIccProfile(color::RgbColorSpace::Srgb);
-    if (sourceProfile.hasError())
-    {
-        return color::ColorImageResult::failure(sourceProfile.error());
-    }
-
-    const color::RgbColorSpace destinationColorSpace = [&]() {
-        switch (outputColorSpace)
-        {
-        case RasterOutputColorSpace::Srgb:
-            return color::RgbColorSpace::Srgb;
-        case RasterOutputColorSpace::AdobeRgb:
-            return color::RgbColorSpace::AdobeRgb;
-        case RasterOutputColorSpace::DisplayP3:
-            return color::RgbColorSpace::DisplayP3;
-        }
-
-        return color::RgbColorSpace::Srgb;
-    }();
-    const color::IccProfileResult destinationProfile = color::createRgbIccProfile(destinationColorSpace);
-    if (destinationProfile.hasError())
-    {
-        return color::ColorImageResult::failure(destinationProfile.error());
-    }
-
-    color::ColorImageResult convertedImage =
-        color::transformIccImage(sourceImage, sourceProfile.value(), destinationProfile.value());
-    if (convertedImage.hasError())
-    {
-        return convertedImage;
-    }
-
-    const QColorSpace outputProfile = QColorSpace::fromIccProfile(destinationProfile.value());
-    if (!outputProfile.isValid())
-    {
-        return color::ColorImageResult::failure(
-            makeError(types::ErrorCode::DecodeFailed, QStringLiteral("Failed to load the raster export ICC profile.")));
-    }
-
-    convertedImage.value().setColorSpace(outputProfile);
-    return convertedImage;
-}
-
-// 목적: LibRaw full decode bitmap을 develop 및 export에 사용할 독립 sRGB QImage로 변환
-// 입력: rawImage: LibRaw가 반환한 8-bit RGB 또는 RGBA bitmap
-// 출력: 복사된 sRGB QImage 또는 bitmap 형식/크기 오류
-[[nodiscard]] types::Result<QImage, types::CoreError> createRawExportImage(const raw::RawPreviewImage& rawImage)
-{
-    if (rawImage.width <= 0 || rawImage.height <= 0 || rawImage.bitsPerChannel != 8)
-    {
-        return types::Result<QImage, types::CoreError>::failure(makeError(
-            types::ErrorCode::DecodeFailed, QStringLiteral("Decoded RAW image dimensions or bit depth are invalid.")));
-    }
-
-    QImage::Format format = QImage::Format_Invalid;
-    switch (rawImage.channelCount)
-    {
-    case 3:
-        format = QImage::Format_RGB888;
-        break;
-    case 4:
-        format = QImage::Format_RGBA8888;
-        break;
-    default:
-        return types::Result<QImage, types::CoreError>::failure(makeError(
-            types::ErrorCode::DecodeFailed, QStringLiteral("Decoded RAW image channel count is unsupported.")));
-    }
-
-    const qsizetype width = rawImage.width;
-    const qsizetype height = rawImage.height;
-    const qsizetype channels = rawImage.channelCount;
-    if (width > std::numeric_limits<qsizetype>::max() / channels)
-    {
-        return types::Result<QImage, types::CoreError>::failure(
-            makeError(types::ErrorCode::DecodeFailed, QStringLiteral("Decoded RAW image row size is too large.")));
-    }
-
-    const qsizetype bytesPerLine = width * channels;
-    if (bytesPerLine > std::numeric_limits<int>::max() ||
-        height > std::numeric_limits<qsizetype>::max() / bytesPerLine || rawImage.data.size() < bytesPerLine * height)
-    {
-        return types::Result<QImage, types::CoreError>::failure(
-            makeError(types::ErrorCode::DecodeFailed, QStringLiteral("Decoded RAW image data is incomplete.")));
-    }
-
-    const QImage borrowedImage(reinterpret_cast<const uchar*>(rawImage.data.constData()),
-                               rawImage.width,
-                               rawImage.height,
-                               static_cast<int>(bytesPerLine),
-                               format);
-    QImage image = borrowedImage.copy();
-    if (image.isNull())
-    {
-        return types::Result<QImage, types::CoreError>::failure(
-            makeError(types::ErrorCode::DecodeFailed, QStringLiteral("Unable to allocate the decoded RAW image.")));
-    }
-
-    image.setColorSpace(QColorSpace(QColorSpace::SRgb));
-    image = raw::applyRawPreviewOrientation(image, rawImage.orientation);
-    if (image.isNull())
-    {
-        return types::Result<QImage, types::CoreError>::failure(
-            makeError(types::ErrorCode::DecodeFailed, QStringLiteral("Unable to apply RAW image orientation.")));
-    }
-    return types::Result<QImage, types::CoreError>::success(std::move(image));
-}
-
-// 목적: raster format 값을 QImageWriter format 식별자로 변환
-// 입력: format: 변환할 raster export format
-// 출력: QImageWriter가 인식하는 format 이름
-[[nodiscard]] QByteArray writerFormat(RasterExportFormat format)
-{
-    switch (format)
-    {
-    case RasterExportFormat::Jpeg:
-        return QByteArrayLiteral("JPEG");
-    case RasterExportFormat::Png:
-        return QByteArrayLiteral("PNG");
-    case RasterExportFormat::Tiff:
-        return QByteArrayLiteral("TIFF");
-    }
-
-    return {};
-}
-
-// 목적: 검증된 format별 옵션을 QImageWriter에 적용
-// 입력: writer: 구성할 image writer, options: 검증된 raster export 옵션
-// 출력: writer 설정 변경
-void configureWriter(QImageWriter& writer, const RasterExportOptions& options)
-{
-    switch (options.format)
-    {
-    case RasterExportFormat::Jpeg:
-        writer.setQuality(options.jpegQuality);
-        break;
-    case RasterExportFormat::Png:
-        writer.setCompression(options.pngCompression);
-        break;
-    case RasterExportFormat::Tiff:
-        writer.setCompression(options.tiffCompression == TiffCompression::Lzw ? TiffLzwCompression : TiffNoCompression);
-        break;
-    }
-}
-
-// 목적: QImageWriter 오류를 기존 CoreError 분류로 변환
-// 입력: writer: 실패 상태와 상세 message를 보유한 image writer
-// 출력: 호출자가 처리할 수 있는 구조화된 오류
-[[nodiscard]] types::CoreError makeWriterError(const QImageWriter& writer)
-{
-    types::ErrorCode code = types::ErrorCode::DecodeFailed;
-
-    switch (writer.error())
-    {
-    case QImageWriter::DeviceError:
-        code = types::ErrorCode::PermissionDenied;
-        break;
-    case QImageWriter::UnsupportedFormatError:
-        code = types::ErrorCode::UnsupportedFormat;
-        break;
-    case QImageWriter::InvalidImageError:
-        code = types::ErrorCode::InvalidArgument;
-        break;
-    case QImageWriter::UnknownError:
-        break;
-    }
-
-    return makeError(code, QStringLiteral("Unable to encode raster export image: %1").arg(writer.errorString()));
+    return makeError(types::ErrorCode::Unknown, QStringLiteral("Raster export options are invalid."));
 }
 
 // 목적: raster format에 맞는 임시 파일 확장자를 반환
@@ -531,7 +310,12 @@ void normalizeExifForRasterOutput(Exiv2::ExifData& exifData, const QSize& output
 // 출력: 성공 표식 또는 유효하지 않은 option 정보
 RasterExportResult validateRasterExportOptions(const RasterExportOptions& options)
 {
-    return validateOptions(options);
+    const std::optional<RasterExportOptionsValidationIssue> issue = findRasterExportOptionsValidationIssue(options);
+    if (issue.has_value())
+    {
+        return RasterExportResult::failure(projectOptionsValidationIssue(*issue));
+    }
+    return RasterExportResult::success({});
 }
 
 // 목적: raster output 경로와 parent directory의 기본 파일 시스템 조건 검증
@@ -568,14 +352,6 @@ bool exportPathsReferToSameFile(const QString& firstPath, const QString& secondP
     const bool equivalent = std::filesystem::equivalent(
         firstInfo.filesystemAbsoluteFilePath(), secondInfo.filesystemAbsoluteFilePath(), error);
     return !error && equivalent;
-}
-
-// 목적: LibRaw decode bitmap을 raster export용 독립 sRGB QImage로 변환
-// 입력: rawImage: LibRaw가 반환한 bitmap과 남은 orientation
-// 출력: color tag와 orientation이 적용된 image 또는 bitmap 구조 오류
-RasterSourceImageResult prepareRawForRasterExport(const raw::RawPreviewImage& rawImage)
-{
-    return createRawExportImage(rawImage);
 }
 
 // 목적: 출력 준비가 끝난 image를 지정한 raster format으로 원자적으로 저장
@@ -630,37 +406,17 @@ RasterExportResult writeRasterImage(const QImage& image,
             QStringLiteral("Unable to create temporary raster export file: %1").arg(encodedFile.errorString())));
     }
 
-    QImageWriter writer(&encodedFile, writerFormat(options.format));
-    configureWriter(writer, options);
-
-    const color::ColorImageResult convertedImage = convertForExport(image, options.outputColorSpace);
-    if (convertedImage.hasError())
+    const qt_adapter::RasterEncodingResult encoded =
+        qt_adapter::encodeRasterImage(image, encodedFile, options, cancellationToken);
+    if (encoded.hasError())
     {
-        return RasterExportResult::failure(convertedImage.error());
-    }
-
-    if (isCancellationRequested(cancellationToken))
-    {
-        return makeCancelledResult();
-    }
-
-    const QImage outputImage = resizeForExport(convertedImage.value(), options.maximumDimension);
-
-    if (!writer.write(outputImage))
-    {
-        const types::CoreError error = makeWriterError(writer);
-        return RasterExportResult::failure(error);
-    }
-
-    if (isCancellationRequested(cancellationToken))
-    {
-        return makeCancelledResult();
+        return RasterExportResult::failure(encoded.error());
     }
 
     encodedFile.close();
     const RasterExportResult metadataResult =
         supportsExifMetadata(options.format)
-            ? copyExifMetadata(metadataSourcePath, encodedFile.fileName(), outputImage.size(), options.includeMetadata)
+            ? copyExifMetadata(metadataSourcePath, encodedFile.fileName(), encoded.value(), options.includeMetadata)
             : RasterExportResult::success({});
     if (metadataResult.hasError())
     {
@@ -701,7 +457,7 @@ RasterExportResult writeRawImage(const QString& rawPath,
         return distinctPaths;
     }
 
-    const raw::RawPreviewImageResult decodedRaw = raw::decodeRawPreviewImage(rawPath);
+    raw::RawPreviewImageResult decodedRaw = raw::decodeRawPreviewImage(rawPath);
     if (decodedRaw.hasError())
     {
         return RasterExportResult::failure(decodedRaw.error());
@@ -712,7 +468,8 @@ RasterExportResult writeRawImage(const QString& rawPath,
         return makeCancelledResult();
     }
 
-    const RasterSourceImageResult sourceImage = prepareRawForRasterExport(decodedRaw.value());
+    qt_adapter::RasterSourceImageResult sourceImage =
+        qt_adapter::consumeRawForRasterExport(std::move(decodedRaw.value()));
     if (sourceImage.hasError())
     {
         return RasterExportResult::failure(sourceImage.error());
@@ -723,11 +480,12 @@ RasterExportResult writeRawImage(const QString& rawPath,
         return makeCancelledResult();
     }
 
-    const develop::DevelopImageResult developedImage = develop::applyDevelop(sourceImage.value(), params);
+    const develop::DevelopImageResult developedImage = develop::qt_adapter::apply(sourceImage.value(), params);
     if (developedImage.hasError())
     {
         return RasterExportResult::failure(developedImage.error());
     }
+    sourceImage.value() = QImage{};
 
     if (isCancellationRequested(cancellationToken))
     {

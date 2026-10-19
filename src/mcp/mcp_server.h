@@ -14,6 +14,7 @@ namespace flexraw::mcp
 
 class McpCatalogTools;
 class McpEditorTools;
+class McpExportTools;
 class McpProjectTools;
 class McpSourceResolutionTools;
 
@@ -21,12 +22,13 @@ class McpServer final : public QObject
 {
 public:
     // 목적: local STDIO MCP transport를 독립된 tool adapter와 stream에 연결
-    // 입력: 네 domain tool adapter, serverVersion과 STDIO streams
+    // 입력: 다섯 domain tool adapter, serverVersion과 STDIO streams
     // 출력: 주어진 stream lifetime 안에서 동작하는 MCP server
     McpServer(McpCatalogTools& catalogTools,
               McpProjectTools& projectTools,
               McpEditorTools& editorTools,
               McpSourceResolutionTools& sourceTools,
+              McpExportTools& exportTools,
               std::string serverVersion,
               std::istream& input,
               std::ostream& output,
@@ -102,6 +104,7 @@ private:
     McpProjectTools* m_projectTools{nullptr};
     McpEditorTools* m_editorTools{nullptr};
     McpSourceResolutionTools* m_sourceTools{nullptr};
+    McpExportTools* m_exportTools{nullptr};
     std::string m_serverVersion;
     std::istream* m_input{nullptr};
     std::ostream* m_output{nullptr};

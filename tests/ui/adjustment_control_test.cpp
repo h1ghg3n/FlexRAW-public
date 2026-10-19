@@ -146,6 +146,24 @@ TEST(AdjustmentParameterControlTest, ClassicTrackClickPublishesOneAdjustmentTran
     EXPECT_EQ(1, finishedCount);
 }
 
+TEST(AdjustmentParameterControlTest, NumericValueFinishesAdjustmentAfterIdle)
+{
+    AdjustmentParameterControl control(exposureConfiguration());
+    auto* valueSpinBox = control.findChild<QDoubleSpinBox*>(QStringLiteral("exposureValueSpinBox"));
+    ASSERT_NE(nullptr, valueSpinBox);
+    int startedCount = 0;
+    int finishedCount = 0;
+    QObject::connect(&control, &AdjustmentParameterControl::adjustmentStarted, [&startedCount] { ++startedCount; });
+    QObject::connect(&control, &AdjustmentParameterControl::adjustmentFinished, [&finishedCount] { ++finishedCount; });
+
+    valueSpinBox->setValue(3.0);
+
+    EXPECT_EQ(1, startedCount);
+    EXPECT_EQ(0, finishedCount);
+    processEventsFor(350);
+    EXPECT_EQ(1, finishedCount);
+}
+
 TEST(AdjustmentParameterControlTest, StyleSwitchPreservesValueWithoutPublishingEdit)
 {
     AdjustmentParameterControl control(exposureConfiguration());

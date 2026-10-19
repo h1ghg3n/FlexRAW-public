@@ -15,5 +15,6 @@ target_link_libraries(flexraw_app_mcp
     PRIVATE
         flexraw_product_runtime
         flexraw_core_orchestration
+        flexraw_platform_current
         Qt6::Core
 )

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "hsl_params.h"
+
 namespace flexraw::core::types
 {
 
@@ -19,6 +21,7 @@ struct DevelopParams
     float blacks{0.0F};
     float saturation{0.0F};
     float vibrance{0.0F};
+    HslParams hsl;
     WhiteBalanceMode whiteBalanceMode{WhiteBalanceMode::AsShot};
     float whiteBalanceTemperatureKelvin{6500.0F};
     float whiteBalanceTint{0.0F};

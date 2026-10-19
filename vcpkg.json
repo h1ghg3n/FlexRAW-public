@@ -48,11 +48,22 @@
           "default-features": false,
           "features": [
             "gui",
+            "jpeg",
+            "png",
             "sql",
             "thread"
           ]
         },
+        "qtimageformats",
         "spdlog"
+      ]
+    },
+    "portable-processing": {
+      "description": "Portable RAW processing dependencies without Qt",
+      "dependencies": [
+        "lcms",
+        "libraw",
+        "libpng"
       ]
     },
     "tests": {

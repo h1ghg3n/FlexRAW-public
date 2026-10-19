@@ -203,14 +203,37 @@ public:
         histogram.pixelCount = 1;
         develop::ClippingSummary clipping;
         clipping.pixelCount = 1;
+        renderReturned.release();
         return PreviewPipelineResult::success({image, histogram, clipping, {}});
     }
 
     QSemaphore firstRenderStarted;
     QSemaphore allowFirstRenderToFinish;
+    QSemaphore renderReturned;
 
 private:
     std::atomic_int m_renderCount{0};
+};
+
+class FailingComparisonPipeline final : public IPreviewPipeline
+{
+public:
+    // 목적: 기본 Develop 비교 요청만 실패시키고 일반 Preview는 정상 생성
+    // 입력: request: Develop 값, tier/cancellationToken: 테스트에 사용하지 않음
+    // 출력: 비교면 DecodeFailed, 그 외에는 1x1 정상 frame
+    [[nodiscard]] PreviewPipelineResult render(const PreviewRequest& request,
+                                               PreviewTier,
+                                               const types::CancellationToken&) override
+    {
+        if (request.params == types::DevelopParams{})
+        {
+            return PreviewPipelineResult::failure(
+                {types::ErrorCode::DecodeFailed, QStringLiteral("Comparison test failure.")});
+        }
+        QImage image(1, 1, QImage::Format_RGBA8888);
+        image.fill(Qt::black);
+        return PreviewPipelineResult::success({image, {}, {}, {}});
+    }
 };
 
 TEST(EditorClientProjectionTest, PreservesEveryDevelopParameter)
@@ -223,6 +246,7 @@ TEST(EditorClientProjectionTest, PreservesEveryDevelopParameter)
     params.whites = 0.5F;
     params.blacks = 0.6F;
     params.saturation = 0.7F;
+    params.hsl.channels[2] = {0.3F, -0.2F, 0.4F};
     params.vibrance = 0.8F;
     params.whiteBalanceMode = types::WhiteBalanceMode::Custom;
     params.whiteBalanceTemperatureKelvin = 7200.0F;
@@ -996,6 +1020,314 @@ TEST(EditorOrchestratorTest, FiltersCancelledSelectionBeforePublishingLatestFram
 
     ASSERT_EQ(publishedPaths.size(), 1U);
     EXPECT_EQ(publishedPaths.front(), secondEntry->file.path);
+}
+
+TEST(EditorOrchestratorTest, ComparesDefaultDevelopWithoutChangingCurrentEditOrPreview)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    auto pipeline = std::make_unique<RecordingPreviewPipeline>();
+    RecordingPreviewPipeline* const recorder = pipeline.get();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("comparison.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*entry, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+
+    types::DevelopParams params;
+    params.exposureEv = 0.75F;
+    ASSERT_TRUE(editor.updateDevelopParams(params, QSize{}));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+    std::vector<PreviewResult> comparisonFrames;
+    std::vector<PreviewResult> currentFrames;
+    int comparisonCompleted = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonUpdated, [&](const PreviewResult& result) {
+        comparisonFrames.push_back(result);
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewUpdated, [&](const PreviewResult& result) {
+        currentFrames.push_back(result);
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonCompleted, [&](types::RequestId) {
+        ++comparisonCompleted;
+    });
+
+    client::IPreviewComparisonClient& comparisonClient = editor;
+    const client::PreviewComparisonResult started = comparisonClient.setPreviewComparison({true});
+    ASSERT_TRUE(started.hasValue());
+    ASSERT_TRUE(started.value().activeRequestId.has_value());
+    EXPECT_TRUE(comparisonClient.setPreviewComparison({true}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(comparisonCompleted, 1));
+    ASSERT_EQ(1U, comparisonFrames.size());
+    EXPECT_EQ(started.value().activeRequestId->value, comparisonFrames.front().requestId);
+    EXPECT_EQ(1, comparisonFrames.front().photo.developRevision);
+    EXPECT_EQ(PreviewTier::Thumbnail, comparisonFrames.front().tier);
+    const std::vector<PreviewRequest> initialRequests = recorder->requests();
+    ASSERT_EQ(1U, initialRequests.size());
+    EXPECT_EQ(types::DevelopParams{}, initialRequests.front().params);
+    EXPECT_EQ(PreviewRenderMode::Final, initialRequests.front().renderMode);
+    EXPECT_EQ(PreviewProgression::FinalOnly, initialRequests.front().progression);
+
+    int currentFrameCount = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewUpdated, [&currentFrameCount](const PreviewResult&) {
+        ++currentFrameCount;
+    });
+    params.exposureEv = 1.0F;
+    ASSERT_TRUE(editor.updateDevelopParams(params, QSize{640, 480}));
+    ASSERT_TRUE(waitForRequestCount(*recorder, 2));
+    ASSERT_TRUE(waitForCatalogUpdate(currentFrameCount, 1));
+    ASSERT_FALSE(currentFrames.empty());
+    EXPECT_EQ(params, editor.state().params);
+    EXPECT_EQ(2, currentFrames.back().photo.developRevision);
+    EXPECT_EQ(params, recorder->requests().back().params);
+    EXPECT_EQ(1, comparisonCompleted);
+    EXPECT_TRUE(editor.previewComparisonState().enabled);
+    EXPECT_FALSE(editor.previewComparisonState().activeRequestId.has_value());
+}
+
+TEST(EditorOrchestratorTest, CancelsComparisonOnceAndDropsLateFrameWithoutCancellingCurrentPreview)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    auto pipeline = std::make_unique<BlockingEditorPreviewPipeline>();
+    BlockingEditorPreviewPipeline* const blocker = pipeline.get();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("comparison-cancel.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*entry, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+
+    std::vector<types::RequestId> cancelled;
+    int comparisonFrames = 0;
+    int comparisonCompleted = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonCancelled, [&](types::RequestId id) {
+        cancelled.push_back(id);
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonUpdated, [&](const PreviewResult&) {
+        ++comparisonFrames;
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonCompleted, [&](types::RequestId) {
+        ++comparisonCompleted;
+    });
+
+    const client::PreviewComparisonResult started = editor.setPreviewComparison({true});
+    const bool renderStarted = blocker->firstRenderStarted.tryAcquire(1, 2000);
+    const client::PreviewComparisonResult disabled = editor.setPreviewComparison({false});
+    const client::PreviewComparisonResult disabledAgain = editor.setPreviewComparison({false});
+    blocker->allowFirstRenderToFinish.release();
+    ASSERT_TRUE(renderStarted);
+    ASSERT_TRUE(started.hasValue());
+    ASSERT_TRUE(disabled.hasValue());
+    ASSERT_TRUE(disabledAgain.hasValue());
+    EXPECT_FALSE(disabled.value().enabled);
+    ASSERT_TRUE(started.value().activeRequestId.has_value());
+    ASSERT_EQ(1U, cancelled.size());
+    EXPECT_EQ(started.value().activeRequestId->value, cancelled.front());
+    ASSERT_TRUE(blocker->renderReturned.tryAcquire(1, 2000));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    EXPECT_EQ(0, comparisonFrames);
+    EXPECT_EQ(0, comparisonCompleted);
+}
+
+TEST(EditorOrchestratorTest, KeepsInFlightDefaultFrameWhenAfterPreviewRevisionAdvances)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    auto pipeline = std::make_unique<BlockingEditorPreviewPipeline>();
+    BlockingEditorPreviewPipeline* const blocker = pipeline.get();
+    PreviewOrchestrator previewOrchestrator(std::move(pipeline));
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("comparison-concurrent.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*entry, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+
+    int afterStarted = 0;
+    int beforeCompleted = 0;
+    std::vector<PreviewResult> beforeFrames;
+    std::vector<PreviewResult> afterFrames;
+    QObject::connect(&editor, &EditorOrchestrator::previewStarted, [&](types::RequestId) { ++afterStarted; });
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonCompleted, [&](types::RequestId) {
+        ++beforeCompleted;
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonUpdated, [&](const PreviewResult& frame) {
+        beforeFrames.push_back(frame);
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewUpdated, [&](const PreviewResult& frame) {
+        afterFrames.push_back(frame);
+    });
+
+    const client::PreviewComparisonResult comparison = editor.setPreviewComparison({true});
+    const bool beforeStarted = blocker->firstRenderStarted.tryAcquire(1, 2000);
+    types::DevelopParams params;
+    params.exposureEv = 0.5F;
+    const bool edited = editor.updateDevelopParams(params, QSize{640, 480});
+    const bool afterAccepted = waitForCatalogUpdate(afterStarted, 1);
+    blocker->allowFirstRenderToFinish.release();
+    ASSERT_TRUE(beforeStarted);
+    ASSERT_TRUE(comparison.hasValue());
+    ASSERT_TRUE(edited);
+    ASSERT_TRUE(afterAccepted);
+    ASSERT_TRUE(waitForCatalogUpdate(beforeCompleted, 1));
+    int afterFrameCount = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewUpdated, [&afterFrameCount](const PreviewResult&) {
+        ++afterFrameCount;
+    });
+    if (afterFrames.empty())
+    {
+        ASSERT_TRUE(waitForCatalogUpdate(afterFrameCount, 1));
+    }
+    ASSERT_EQ(1U, beforeFrames.size());
+    ASSERT_FALSE(afterFrames.empty());
+    EXPECT_EQ(0, beforeFrames.front().photo.developRevision);
+    EXPECT_EQ(1, afterFrames.front().photo.developRevision);
+    EXPECT_NE(beforeFrames.front().requestId, afterFrames.front().requestId);
+    EXPECT_TRUE(editor.previewComparisonState().enabled);
+}
+
+TEST(EditorOrchestratorTest, InvalidatesComparisonOnViewportAndSelectionChange)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    PreviewOrchestrator previewOrchestrator(std::make_unique<RecordingPreviewPipeline>());
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> first =
+        catalog.createEntry(QStringLiteral("before-first.bmp"), types::SupportedFileKind::RasterImage);
+    const std::optional<catalog::CatalogEntry> second =
+        catalog.createEntry(QStringLiteral("before-second.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*first, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+
+    const client::PreviewComparisonResult firstRequest = editor.setPreviewComparison({true});
+    ASSERT_TRUE(firstRequest.hasValue());
+    ASSERT_TRUE(editor.setPreviewViewport({{800, 600}}).hasValue());
+    EXPECT_FALSE(editor.previewComparisonState().enabled);
+
+    const client::PreviewComparisonResult secondRequest = editor.setPreviewComparison({true});
+    ASSERT_TRUE(secondRequest.hasValue());
+    ASSERT_TRUE(editor.selectCatalogPhoto(editor.state().photo.photoId, QSize{800, 600}).hasValue());
+    EXPECT_FALSE(editor.previewComparisonState().enabled);
+
+    const client::PreviewComparisonResult thirdRequest = editor.setPreviewComparison({true});
+    ASSERT_TRUE(thirdRequest.hasValue());
+    const CatalogPhotoStateResult refreshed = catalog.orchestrator().resolvePhoto(editor.state().photo.photoId);
+    ASSERT_TRUE(refreshed.hasValue());
+    emit catalog.orchestrator().sourceBindingUpdated({0, editor.state().photo.photoId, refreshed.value().photo, {}});
+    EXPECT_FALSE(editor.previewComparisonState().enabled);
+
+    const client::PreviewComparisonResult fourthRequest = editor.setPreviewComparison({true});
+    ASSERT_TRUE(fourthRequest.hasValue());
+    ASSERT_TRUE(editor.activatePhoto(*second, QSize{800, 600}).hasValue());
+    EXPECT_FALSE(editor.previewComparisonState().enabled);
+    EXPECT_NE(firstRequest.value().activeRequestId, secondRequest.value().activeRequestId);
+    EXPECT_NE(secondRequest.value().activeRequestId, thirdRequest.value().activeRequestId);
+    EXPECT_NE(thirdRequest.value().activeRequestId, fourthRequest.value().activeRequestId);
+}
+
+TEST(EditorOrchestratorTest, UsesStandardTierForRawDefaultDevelopComparison)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    PreviewOrchestrator previewOrchestrator(std::make_unique<RecordingPreviewPipeline>());
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("comparison-raw.cr3"), types::SupportedFileKind::Raw);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*entry, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+    int comparisonFrames = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonUpdated, [&](const PreviewResult& result) {
+        EXPECT_EQ(PreviewTier::Standard, result.tier);
+        ++comparisonFrames;
+    });
+
+    ASSERT_TRUE(editor.setPreviewComparison({true}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(comparisonFrames, 1));
+    EXPECT_EQ(1, comparisonFrames);
+}
+
+TEST(EditorOrchestratorTest, ReportsComparisonFailureWithoutFailingNormalPreview)
+{
+    (void)test::application();
+    EditorTestCatalog catalog;
+    ASSERT_TRUE(catalog.isValid());
+    PreviewOrchestrator previewOrchestrator(std::make_unique<FailingComparisonPipeline>());
+    EditorOrchestrator editor(previewOrchestrator, catalog.orchestrator());
+    const std::optional<catalog::CatalogEntry> entry =
+        catalog.createEntry(QStringLiteral("comparison-failure.bmp"), types::SupportedFileKind::RasterImage);
+    ASSERT_TRUE(entry.has_value());
+    int sourceUpdates = 0;
+    QObject::connect(&catalog.orchestrator(),
+                     &CatalogOrchestrator::sourceBindingUpdated,
+                     &catalog.orchestrator(),
+                     [&sourceUpdates](const CatalogSourceUpdate&) { ++sourceUpdates; });
+    ASSERT_TRUE(editor.activatePhoto(*entry, QSize{}).hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(sourceUpdates, 1));
+    types::DevelopParams params;
+    params.exposureEv = 0.5F;
+    ASSERT_TRUE(editor.updateDevelopParams(params, QSize{}));
+    ASSERT_TRUE(editor.setPreviewViewport({{640, 480}}).hasValue());
+    int comparisonFailures = 0;
+    int currentFailures = 0;
+    int currentFrames = 0;
+    QObject::connect(&editor, &EditorOrchestrator::previewComparisonFailed, [&](const PreviewIssue& issue) {
+        EXPECT_EQ(types::ErrorCode::DecodeFailed, issue.error.code);
+        ++comparisonFailures;
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewFailed, [&](const PreviewIssue&) {
+        ++currentFailures;
+    });
+    QObject::connect(&editor, &EditorOrchestrator::previewUpdated, [&](const PreviewResult&) {
+        ++currentFrames;
+    });
+
+    const client::PreviewComparisonResult accepted = editor.setPreviewComparison({true});
+    ASSERT_TRUE(accepted.hasValue());
+    ASSERT_TRUE(waitForCatalogUpdate(comparisonFailures, 1));
+    EXPECT_FALSE(editor.previewComparisonState().enabled);
+    ASSERT_TRUE(waitForCatalogUpdate(currentFrames, 1));
+    EXPECT_EQ(0, currentFailures);
+    EXPECT_EQ(params, editor.state().params);
 }
 
 }  // namespace

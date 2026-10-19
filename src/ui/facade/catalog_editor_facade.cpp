@@ -88,6 +88,15 @@ core::client::PreviewRequestCancelResult CatalogEditorFacade::cancelPreviewReque
     return m_editorOrchestrator->cancelPreviewRequest(requestId);
 }
 
+// 목적: 기본 Develop 비교 command를 Editor session owner에 전달
+// 입력: command: 비교 활성화 여부
+// 출력: 적용된 상태와 accepted request ID 또는 owner 오류
+core::client::PreviewComparisonResult CatalogEditorFacade::setPreviewComparison(
+    const core::client::SetPreviewComparisonCommand& command)
+{
+    return m_editorOrchestrator->setPreviewComparison(command);
+}
+
 // 목적: Qt GUI delivery context에서 initial Preview snapshot과 이후 lifecycle 구독
 // 입력: callback: immutable frame·analysis·warning·terminal consumer
 // 출력: RAII unsubscribe handle 또는 callback·thread 오류
@@ -282,6 +291,24 @@ core::client::CatalogPhotoPageResult CatalogEditorFacade::queryPhotoPage(
     const core::client::CatalogPhotoPageRequest& request) const
 {
     return m_catalogOrchestrator->queryPhotoPage(request);
+}
+
+// 목적: Qt-free 선별 command를 active Catalog use case로 전달
+// 입력: command: expected Catalog path, target state와 stable Photo identity batch
+// 출력: 정규화된 identity receipt 또는 구조화된 client 오류
+core::client::CatalogCullingResult CatalogEditorFacade::setCatalogCulling(
+    const core::client::SetCatalogCullingCommand& command)
+{
+    return m_catalogOrchestrator->setCatalogCulling(command);
+}
+
+// 목적: Qt-free 등록 포함 command를 active Catalog use case로 전달
+// 입력: command: expected Catalog path, target state와 stable Photo identity batch
+// 출력: 정규화된 identity receipt 또는 구조화된 client 오류
+core::client::CatalogInclusionResult CatalogEditorFacade::setCatalogInclusion(
+    const core::client::SetCatalogInclusionCommand& command)
+{
+    return m_catalogOrchestrator->setCatalogInclusion(command);
 }
 
 // 목적: active Catalog navigation에 사용할 distinct Folder snapshot 조회

@@ -19,6 +19,7 @@
 #include "mcp_catalog_tools.h"
 #include "mcp_client_error_projection.h"
 #include "mcp_editor_tools.h"
+#include "mcp_export_tools.h"
 #include "mcp_project_tools.h"
 #include "mcp_server.h"
 #include "mcp_source_resolution_tools.h"
@@ -362,6 +363,96 @@ private:
     }
 };
 
+struct FakeExportSubscriptionState
+{
+    bool active{true};
+    core::client::ExportCallback callback;
+};
+
+class FakeExportSubscription final : public core::client::IExportSubscription
+{
+public:
+    // 목적: fake Export endpoint와 MCP adapter가 공유할 subscription state 보관
+    // 입력: state: callback과 active flag를 가진 shared state
+    // 출력: RAII fake subscription handle
+    explicit FakeExportSubscription(std::shared_ptr<FakeExportSubscriptionState> state) : m_state(std::move(state)) {}
+
+    // 목적: 마지막 fake handle 해제 시 이후 callback 전달 차단
+    // 입력: 없음
+    // 출력: inactive subscription
+    ~FakeExportSubscription() override
+    {
+        unsubscribe();
+    }
+
+    // 목적: fake Export callback 전달을 idempotent하게 차단
+    // 입력: 없음
+    // 출력: inactive state와 해제된 callback
+    void unsubscribe() noexcept override
+    {
+        m_state->active = false;
+        m_state->callback = {};
+    }
+
+    // 목적: fake Export callback 전달 가능 상태 조회
+    // 입력: 없음
+    // 출력: active이면 true
+    [[nodiscard]] bool isActive() const noexcept override
+    {
+        return m_state->active;
+    }
+
+private:
+    std::shared_ptr<FakeExportSubscriptionState> m_state;
+};
+
+class FakeExportEndpoint final : public core::client::IExportClient, public core::client::IExportEventSource
+{
+public:
+    // 목적: adapter가 조립한 Export command를 기록하고 stable test identity 반환
+    // 입력: command: selected-photo Local Export command
+    // 출력: request identity 17
+    [[nodiscard]] core::client::ExportSubmissionResult submitExport(
+        const core::client::SubmitExportCommand& command) override
+    {
+        submissions.push_back(command);
+        return core::client::ExportSubmissionResult::success({{17}});
+    }
+
+    // 목적: adapter가 전달한 Export cancellation identity 기록
+    // 입력: requestId: 취소할 owner identity
+    // 출력: 같은 identity
+    [[nodiscard]] core::client::ExportCancellationResult cancelExport(core::client::ExportRequestId requestId) override
+    {
+        cancellations.push_back(requestId);
+        return core::client::ExportCancellationResult::success(requestId);
+    }
+
+    // 목적: fake Export active state 조회
+    // 입력: requestId: test에서 사용하지 않는 optional filter
+    // 출력: 빈 active snapshot
+    [[nodiscard]] core::client::ExportSnapshotResult exportSnapshot(
+        std::optional<core::client::ExportRequestId>) const override
+    {
+        return core::client::ExportSnapshotResult::success({});
+    }
+
+    // 목적: MCP adapter callback을 fake Export subscription state에 연결
+    // 입력: callback: test가 publish할 immutable event consumer
+    // 출력: RAII fake subscription handle
+    [[nodiscard]] core::client::ExportSubscriptionResult subscribeToExports(
+        core::client::ExportCallback callback) override
+    {
+        state = std::make_shared<FakeExportSubscriptionState>();
+        state->callback = std::move(callback);
+        return core::client::ExportSubscriptionResult::success(std::make_shared<FakeExportSubscription>(state));
+    }
+
+    std::vector<core::client::SubmitExportCommand> submissions;
+    std::vector<core::client::ExportRequestId> cancellations;
+    std::shared_ptr<FakeExportSubscriptionState> state;
+};
+
 // 목적: serialized MCP server test에 필요한 process-wide Qt event dispatcher 보장
 // 입력: 없음
 // 출력: test process lifetime 동안 유지되는 QCoreApplication 참조
@@ -396,10 +487,13 @@ private:
     McpEditorTools editorTools(editorClient, writesEnabled);
     FakeSourceResolutionClient sourceClient;
     McpSourceResolutionTools sourceTools(sourceClient, sourceClient, writesEnabled);
+    FakeExportEndpoint exportEndpoint;
+    McpExportTools exportTools(editorClient, exportEndpoint, exportEndpoint, writesEnabled);
     McpServer server(catalogTools,
                      projectTools,
                      editorTools,
                      sourceTools,
+                     exportTools,
                      "0.1.0-test",
                      requestStream,
                      responseStream,
@@ -554,11 +648,12 @@ TEST(McpServerTest, ListsCatalogToolsAfterLegacyInitialization)
     ASSERT_EQ(responses.size(), 2U);
     const QJsonArray tools =
         responses[1].value(QStringLiteral("result")).toObject().value(QStringLiteral("tools")).toArray();
-    ASSERT_EQ(tools.size(), 4);
+    ASSERT_EQ(tools.size(), 5);
     EXPECT_EQ(tools[0].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("catalog_query_photos"));
     EXPECT_EQ(tools[1].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("catalog_list_projects"));
     EXPECT_EQ(tools[2].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_get_state"));
     EXPECT_EQ(tools[3].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("source_resolution_events"));
+    EXPECT_EQ(tools[4].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("export_events"));
     EXPECT_TRUE(tools[0]
                     .toObject()
                     .value(QStringLiteral("annotations"))
@@ -636,7 +731,7 @@ TEST(McpServerTest, HidesAndRejectsWriteToolWithoutExplicitOptIn)
     const std::vector<QJsonObject> responses = parseResponses(output);
     const QJsonArray tools =
         responses[1].value(QStringLiteral("result")).toObject().value(QStringLiteral("tools")).toArray();
-    ASSERT_EQ(tools.size(), 4);
+    ASSERT_EQ(tools.size(), 5);
     const QJsonObject callResult = responses[2].value(QStringLiteral("result")).toObject();
     EXPECT_TRUE(callResult.value(QStringLiteral("isError")).toBool());
     EXPECT_EQ(callResult.value(QStringLiteral("structuredContent"))
@@ -669,7 +764,7 @@ TEST(McpServerTest, HidesAndRejectsEditorCommandsWithoutExplicitOptIn)
     const std::vector<QJsonObject> responses = parseResponses(output);
     const QJsonArray tools =
         responses[1].value(QStringLiteral("result")).toObject().value(QStringLiteral("tools")).toArray();
-    ASSERT_EQ(tools.size(), 4);
+    ASSERT_EQ(tools.size(), 5);
     EXPECT_EQ(tools[2].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_get_state"));
     const QJsonObject error = responses[2]
                                   .value(QStringLiteral("result"))
@@ -724,12 +819,15 @@ TEST(McpServerTest, AdvertisesAndCallsIdempotentMembershipToolAfterWriteOptIn)
     const std::vector<QJsonObject> responses = parseResponses(output);
     const QJsonArray tools =
         responses[1].value(QStringLiteral("result")).toObject().value(QStringLiteral("tools")).toArray();
-    ASSERT_EQ(tools.size(), 8);
-    const QJsonObject writeTool = tools[4].toObject();
+    ASSERT_EQ(tools.size(), 11);
+    const QJsonObject writeTool = tools[5].toObject();
     EXPECT_EQ(writeTool.value(QStringLiteral("name")).toString(), QStringLiteral("catalog_add_photo_to_project"));
-    EXPECT_EQ(tools[5].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_select_photo"));
-    EXPECT_EQ(tools[6].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_set_exposure"));
-    EXPECT_EQ(tools[7].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("source_cancel_request"));
+    EXPECT_EQ(tools[6].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_select_photo"));
+    EXPECT_EQ(tools[7].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("editor_set_exposure"));
+    EXPECT_EQ(tools[8].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("source_cancel_request"));
+    EXPECT_EQ(tools[9].toObject().value(QStringLiteral("name")).toString(),
+              QStringLiteral("export_selected_photo_local"));
+    EXPECT_EQ(tools[10].toObject().value(QStringLiteral("name")).toString(), QStringLiteral("export_cancel_request"));
     EXPECT_TRUE(
         writeTool.value(QStringLiteral("annotations")).toObject().value(QStringLiteral("idempotentHint")).toBool());
     EXPECT_FALSE(responses[2].value(QStringLiteral("result")).toObject().value(QStringLiteral("isError")).toBool());
@@ -749,6 +847,7 @@ TEST(McpServerTest, ProjectsImmutableEditorSnapshotWithPrecisionSafeIdentityAndR
     editorClient.snapshot.sourceProcessingAllowed = true;
     editorClient.snapshot.sourceState = core::client::CatalogSourceState::Available;
     editorClient.snapshot.params.exposureEv = 0.75F;
+    editorClient.snapshot.params.hsl.channels[7] = {0.5F, -0.25F, 0.75F};
     editorClient.snapshot.dirty = true;
     editorClient.snapshot.canUndo = true;
 
@@ -779,6 +878,11 @@ TEST(McpServerTest, ProjectsImmutableEditorSnapshotWithPrecisionSafeIdentityAndR
     EXPECT_DOUBLE_EQ(editor.value(QStringLiteral("develop")).toObject().value(QStringLiteral("exposure_ev")).toDouble(),
                      0.75);
     EXPECT_TRUE(editor.value(QStringLiteral("dirty")).toBool());
+    const auto hsl = editor.value(QStringLiteral("develop")).toObject().value(QStringLiteral("hsl")).toArray();
+    ASSERT_EQ(hsl.size(), 8);
+    EXPECT_DOUBLE_EQ(hsl[7].toObject().value(QStringLiteral("hue")).toDouble(), 0.5);
+    EXPECT_DOUBLE_EQ(hsl[7].toObject().value(QStringLiteral("saturation")).toDouble(), -0.25);
+    EXPECT_DOUBLE_EQ(hsl[7].toObject().value(QStringLiteral("luminance")).toDouble(), 0.75);
     EXPECT_TRUE(editor.value(QStringLiteral("can_undo")).toBool());
 }
 
@@ -788,6 +892,7 @@ TEST(McpServerTest, SelectsPhotoAndAppliesAbsoluteSessionExposureThroughSharedEd
     FakeCatalogProjectClient projectClient;
     FakeEditorClient editorClient;
     editorClient.snapshot.params.contrast = 0.25F;
+    editorClient.snapshot.params.hsl.channels[3].hue = 0.5F;
     editorClient.snapshot.developRevision = {4};
 
     const auto [exitCode, output, diagnostics] = runServer(
@@ -808,6 +913,7 @@ TEST(McpServerTest, SelectsPhotoAndAppliesAbsoluteSessionExposureThroughSharedEd
     ASSERT_EQ(editorClient.updates.size(), 1U);
     EXPECT_FLOAT_EQ(editorClient.updates[0].params.exposureEv, 1.5F);
     EXPECT_FLOAT_EQ(editorClient.updates[0].params.contrast, 0.25F);
+    EXPECT_FLOAT_EQ(editorClient.updates[0].params.hsl.channels[3].hue, 0.5F);
     const QJsonObject editor = parseResponses(output)
                                    .back()
                                    .value(QStringLiteral("result"))
@@ -850,7 +956,7 @@ TEST(McpServerTest, DiscoversAndListsCatalogToolsWithModernPerRequestMetadata)
     const QJsonObject listed = responses[1].value(QStringLiteral("result")).toObject();
     EXPECT_EQ(listed.value(QStringLiteral("resultType")).toString(), QStringLiteral("complete"));
     EXPECT_EQ(listed.value(QStringLiteral("cacheScope")).toString(), QStringLiteral("private"));
-    ASSERT_EQ(listed.value(QStringLiteral("tools")).toArray().size(), 4);
+    ASSERT_EQ(listed.value(QStringLiteral("tools")).toArray().size(), 5);
 }
 
 TEST(McpServerTest, RejectsMixedProtocolErasOnOneStdioConnection)

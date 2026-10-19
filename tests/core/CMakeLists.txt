@@ -5,6 +5,7 @@ set_target_properties(flexraw_core_tests PROPERTIES
 )
 
 target_sources(flexraw_core_tests PRIVATE
+    ../support/qt_core_test_main.cpp
     catalog_database_test.cpp
     catalog_develop_repository_test.cpp
     catalog_folder_importer_test.cpp
@@ -15,12 +16,15 @@ target_sources(flexraw_core_tests PRIVATE
     color_test.cpp
     folder_scanner_test.cpp
     develop_test.cpp
+    develop_params_validation_test.cpp
     histogram_test.cpp
     measurement_test.cpp
     render_test.cpp
     develop_history_test.cpp
+    develop_processing_test.cpp
     export_test.cpp
     preview_cache_test.cpp
+    rgba8_image_view_test.cpp
     raw_file_reader_test.cpp
     source_binding_test.cpp
     source_fingerprint_test.cpp
@@ -31,7 +35,7 @@ target_sources(flexraw_core_tests PRIVATE
 
 target_link_libraries(flexraw_core_tests PRIVATE
     flexraw_core
-    GTest::gtest_main
+    GTest::gtest
 )
 
 include(GoogleTest)

@@ -3,9 +3,12 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include <QBuffer>
 #include <QColor>
 #include <QColorSpace>
 #include <QCoreApplication>
@@ -20,6 +23,8 @@
 #include <gtest/gtest.h>
 
 #include "export.h"
+#include "export_qt_adapter.h"
+#include "raw_file_reader.h"
 
 namespace flexraw::core::export_
 {
@@ -239,6 +244,52 @@ protected:
         static QCoreApplication application(argumentCount, arguments);
     }
 };
+
+TEST_F(RasterExportTest, ConsumesDecodedRawStorageWithoutCopyForAsDecodedImage)
+{
+    std::optional<raw::RawDecodedRaster8> raster =
+        raw::RawDecodedRaster8::create(std::vector<std::uint8_t>{255, 0, 0, 0, 255, 0},
+                                       2,
+                                       1,
+                                       6,
+                                       raw::RawRasterLayout::Rgb8,
+                                       raw::RawOrientation::AsDecoded,
+                                       raw::RawDecodeObservation{2, 1, 2, 1, 0});
+    ASSERT_TRUE(raster.has_value());
+    const std::uint8_t* const decodedStorage = raster->bytes().data();
+    raw::RawPreviewImage rawImage{std::move(*raster), {}};
+
+    const qt_adapter::RasterSourceImageResult result = qt_adapter::consumeRawForRasterExport(std::move(rawImage));
+
+    ASSERT_TRUE(result.hasValue()) << result.error().message.toStdString();
+    EXPECT_EQ(decodedStorage, reinterpret_cast<const std::uint8_t*>(result.value().constBits()));
+    EXPECT_EQ(QSize(2, 1), result.value().size());
+    EXPECT_EQ(QImage::Format_RGB888, result.value().format());
+    EXPECT_EQ(QColor(255, 0, 0), result.value().pixelColor(0, 0));
+    EXPECT_EQ(QColor(0, 255, 0), result.value().pixelColor(1, 0));
+    EXPECT_EQ(QColorSpace(QColorSpace::SRgb), result.value().colorSpace());
+}
+
+TEST_F(RasterExportTest, AppliesPendingOrientationAfterConsumingDecodedRawStorage)
+{
+    std::optional<raw::RawDecodedRaster8> raster =
+        raw::RawDecodedRaster8::create(std::vector<std::uint8_t>{255, 0, 0, 0, 255, 0},
+                                       2,
+                                       1,
+                                       6,
+                                       raw::RawRasterLayout::Rgb8,
+                                       raw::RawOrientation::Rotate90Clockwise,
+                                       raw::RawDecodeObservation{2, 1, 2, 1, 6});
+    ASSERT_TRUE(raster.has_value());
+    raw::RawPreviewImage rawImage{std::move(*raster), {}};
+
+    const qt_adapter::RasterSourceImageResult result = qt_adapter::consumeRawForRasterExport(std::move(rawImage));
+
+    ASSERT_TRUE(result.hasValue()) << result.error().message.toStdString();
+    EXPECT_EQ(QSize(1, 2), result.value().size());
+    EXPECT_EQ(QColor(255, 0, 0), result.value().pixelColor(0, 0));
+    EXPECT_EQ(QColor(0, 255, 0), result.value().pixelColor(0, 1));
+}
 
 TEST_F(RasterExportTest, RejectsOuterWhitespaceWithoutChangingTheOutputLocator)
 {
@@ -688,6 +739,32 @@ TEST_F(RasterExportTest, RejectsUnsupportedFormat)
     ASSERT_TRUE(result.hasError());
     EXPECT_EQ(types::ErrorCode::UnsupportedFormat, result.error().code);
     EXPECT_FALSE(QFileInfo::exists(outputPath));
+}
+
+TEST_F(RasterExportTest, AdapterRejectsInvalidRecipeBeforeEncoding)
+{
+    const QImage sourceImage = makeTestImage();
+
+    RasterExportOptions invalidColorSpaceOptions;
+    invalidColorSpaceOptions.outputColorSpace = static_cast<RasterOutputColorSpace>(std::numeric_limits<int>::max());
+    RasterExportOptions invalidFormatOptions;
+    invalidFormatOptions.format = static_cast<RasterExportFormat>(std::numeric_limits<int>::max());
+
+    for (const RasterExportOptions& options : {invalidColorSpaceOptions, invalidFormatOptions})
+    {
+        QByteArray encodedBytes;
+        QBuffer outputDevice(&encodedBytes);
+        ASSERT_TRUE(outputDevice.open(QIODevice::WriteOnly));
+
+        const auto adapterResult = qt_adapter::encodeRasterImage(sourceImage, outputDevice, options);
+        const RasterExportResult compatibilityResult = validateRasterExportOptions(options);
+
+        ASSERT_TRUE(adapterResult.hasError());
+        ASSERT_TRUE(compatibilityResult.hasError());
+        EXPECT_EQ(compatibilityResult.error().code, adapterResult.error().code);
+        EXPECT_EQ(compatibilityResult.error().message, adapterResult.error().message);
+        EXPECT_TRUE(encodedBytes.isEmpty());
+    }
 }
 
 TEST_F(RasterExportTest, RejectsMissingParentDirectory)
