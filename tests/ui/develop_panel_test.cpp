@@ -13,6 +13,7 @@
 #include "adjustment_control.h"
 #include "clipping.h"
 #include "develop_panel.h"
+#include "hsl_mixer_widget.h"
 
 namespace flexraw::ui::editor
 {
@@ -111,11 +112,88 @@ TEST(DevelopPanelTest, StyleSwitchPreservesParamsWithoutCreatingHistoryEvent)
     EXPECT_EQ(0, adjustmentStartedCount);
     EXPECT_EQ(0, adjustmentFinishedCount);
     const QList<AdjustmentParameterControl*> controls = panel.findChildren<AdjustmentParameterControl*>();
-    ASSERT_EQ(26, controls.size());
+    ASSERT_EQ(29, controls.size());
     for (const AdjustmentParameterControl* control : controls)
     {
-        EXPECT_EQ(AdjustmentControlStyle::Relative, control->controlStyle());
+        const bool hslControl = control->objectName().startsWith(QStringLiteral("hsl"));
+        EXPECT_EQ(hslControl ? AdjustmentControlStyle::Classic : AdjustmentControlStyle::Relative,
+                  control->controlStyle());
     }
+}
+
+TEST(DevelopPanelTest, HslEditPreservesOtherDevelopValuesAndChannels)
+{
+    DevelopPanel panel;
+    core::types::DevelopParams initial;
+    initial.exposureEv = 1.25F;
+    initial.contrast = -0.2F;
+    initial.hsl.channels[0].hue = -0.4F;
+    initial.hsl.channels[5].luminance = 0.3F;
+    panel.setParams(initial);
+    HslMixerWidget* mixer = panel.findChild<HslMixerWidget*>(QStringLiteral("hslMixer"));
+    ASSERT_NE(nullptr, mixer);
+    mixer->findChild<QToolButton*>(QStringLiteral("hslBlueButton"))->click();
+    core::types::DevelopParams published;
+    int changedCount = 0;
+    QObject::connect(
+        &panel, &DevelopPanel::paramsChanged, [&published, &changedCount](const core::types::DevelopParams& params) {
+            published = params;
+            ++changedCount;
+        });
+
+    mixer->findChild<QSlider*>(QStringLiteral("hslSaturationSlider"))->setValue(25);
+
+    ASSERT_EQ(1, changedCount);
+    EXPECT_FLOAT_EQ(initial.exposureEv, published.exposureEv);
+    EXPECT_FLOAT_EQ(initial.contrast, published.contrast);
+    EXPECT_FLOAT_EQ(initial.hsl.channels[0].hue, published.hsl.channels[0].hue);
+    EXPECT_FLOAT_EQ(0.25F, published.hsl.channels[5].saturation);
+    EXPECT_FLOAT_EQ(initial.hsl.channels[5].luminance, published.hsl.channels[5].luminance);
+}
+
+TEST(DevelopPanelTest, ExternalHslSnapshotSynchronizesWithoutHistoryTransaction)
+{
+    DevelopPanel panel;
+    HslMixerWidget* mixer = panel.findChild<HslMixerWidget*>(QStringLiteral("hslMixer"));
+    ASSERT_NE(nullptr, mixer);
+    mixer->findChild<QToolButton*>(QStringLiteral("hslMagentaButton"))->click();
+    int adjustmentStartedCount = 0;
+    int adjustmentFinishedCount = 0;
+    QObject::connect(&panel, &DevelopPanel::adjustmentStarted, [&adjustmentStartedCount] { ++adjustmentStartedCount; });
+    QObject::connect(
+        &panel, &DevelopPanel::adjustmentFinished, [&adjustmentFinishedCount] { ++adjustmentFinishedCount; });
+    core::types::DevelopParams snapshot;
+    snapshot.hsl.channels[7] = {0.2F, -0.3F, 0.4F};
+
+    panel.setParams(snapshot);
+
+    EXPECT_EQ(20, mixer->findChild<QSlider*>(QStringLiteral("hslHueSlider"))->value());
+    EXPECT_EQ(-30, mixer->findChild<QSlider*>(QStringLiteral("hslSaturationSlider"))->value());
+    EXPECT_EQ(40, mixer->findChild<QSlider*>(QStringLiteral("hslLuminanceSlider"))->value());
+    EXPECT_EQ(0, adjustmentStartedCount);
+    EXPECT_EQ(0, adjustmentFinishedCount);
+}
+
+TEST(DevelopPanelTest, HslResetPublishesOneHistoryTransaction)
+{
+    DevelopPanel panel;
+    core::types::DevelopParams initial;
+    initial.exposureEv = 0.5F;
+    initial.hsl.channels[0].hue = 0.4F;
+    initial.hsl.channels[7].saturation = -0.6F;
+    panel.setParams(initial);
+    int adjustmentStartedCount = 0;
+    int adjustmentFinishedCount = 0;
+    QObject::connect(&panel, &DevelopPanel::adjustmentStarted, [&adjustmentStartedCount] { ++adjustmentStartedCount; });
+    QObject::connect(
+        &panel, &DevelopPanel::adjustmentFinished, [&adjustmentFinishedCount] { ++adjustmentFinishedCount; });
+
+    panel.findChild<QToolButton*>(QStringLiteral("hslResetAllButton"))->click();
+
+    EXPECT_EQ(core::types::HslParams{}, panel.params().hsl);
+    EXPECT_FLOAT_EQ(0.5F, panel.params().exposureEv);
+    EXPECT_EQ(1, adjustmentStartedCount);
+    EXPECT_EQ(1, adjustmentFinishedCount);
 }
 
 TEST(DevelopPanelTest, UsesFullWidthCommonRowsForLightSliders)
@@ -134,6 +212,35 @@ TEST(DevelopPanelTest, UsesFullWidthCommonRowsForLightSliders)
     EXPECT_EQ(QSizePolicy::Expanding, exposureControl->sizePolicy().horizontalPolicy());
     EXPECT_EQ(QSizePolicy::Expanding, contrastControl->sizePolicy().horizontalPolicy());
     EXPECT_EQ(exposureControl->width(), contrastControl->width());
+}
+
+TEST(DevelopPanelTest, ReflowsHslChannelsAcrossSupportedDrawerWidths)
+{
+    DevelopPanel panel;
+    panel.resize(200, 900);
+    panel.show();
+    QToolButton* colorMixerToggle = nullptr;
+    for (QToolButton* button : panel.findChildren<QToolButton*>())
+    {
+        if (button->text() == QObject::tr("Color Mixer"))
+        {
+            colorMixerToggle = button;
+            break;
+        }
+    }
+    ASSERT_NE(nullptr, colorMixerToggle);
+    colorMixerToggle->click();
+    QApplication::processEvents();
+    QToolButton* red = panel.findChild<QToolButton*>(QStringLiteral("hslRedButton"));
+    QToolButton* yellow = panel.findChild<QToolButton*>(QStringLiteral("hslYellowButton"));
+    ASSERT_NE(nullptr, red);
+    ASSERT_NE(nullptr, yellow);
+    EXPECT_NE(red->geometry().top(), yellow->geometry().top());
+
+    panel.resize(320, 900);
+    QApplication::processEvents();
+
+    EXPECT_EQ(red->geometry().top(), yellow->geometry().top());
 }
 
 TEST(DevelopPanelTest, AppliesDehazeFromSlider)

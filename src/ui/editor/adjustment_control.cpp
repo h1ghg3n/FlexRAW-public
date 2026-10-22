@@ -489,6 +489,7 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
     auto* headerLayout = new QHBoxLayout();
     headerLayout->setContentsMargins({});
     auto* label = new QLabel(configuration.label, this);
+    setAccessibleName(configuration.label);
     m_valueSpinBox = configuration.showPlusSign ? static_cast<QDoubleSpinBox*>(new SignedDoubleSpinBox(this))
                                                 : new QDoubleSpinBox(this);
     label->setBuddy(m_valueSpinBox);
@@ -500,6 +501,7 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
     m_valueSpinBox->setAlignment(Qt::AlignRight);
     m_valueSpinBox->setButtonSymbols(QAbstractSpinBox::NoButtons);
     m_valueSpinBox->setFixedWidth(64);
+    m_valueSpinBox->setAccessibleName(tr("%1 value").arg(configuration.label));
     m_spinCommitTimer = new QTimer(this);
     m_spinCommitTimer->setSingleShot(true);
     m_spinCommitTimer->setInterval(SpinCommitDelayMs);
@@ -513,6 +515,7 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
     classicLayout->setContentsMargins({});
     m_classicSlider = new DirectTrackSlider(Qt::Horizontal, m_classicPage);
     m_classicSlider->setObjectName(configuration.sliderObjectName);
+    m_classicSlider->setAccessibleName(tr("%1 slider").arg(configuration.label));
     m_classicSlider->setRange(static_cast<int>(std::lround(m_minimum * m_sliderScale)),
                               static_cast<int>(std::lround(m_maximum * m_sliderScale)));
     m_classicSlider->setSingleStep(1);
@@ -524,6 +527,7 @@ AdjustmentParameterControl::AdjustmentParameterControl(const AdjustmentParameter
     relativeLayout->setContentsMargins({});
     m_relativeControl = new RelativeAdjustmentControl(m_relativePage);
     m_relativeControl->setObjectName(objectBase + QStringLiteral("RelativeControl"));
+    m_relativeControl->setAccessibleName(tr("%1 relative adjustment").arg(configuration.label));
     m_relativeControl->setRange(m_minimum, m_maximum);
     m_relativeControl->setSingleStep(configuration.singleStep);
     m_relativeControl->setResolution(1.0 / m_sliderScale);

@@ -13,6 +13,8 @@ target_sources(flexraw_ui_editor PRIVATE
     editor.cpp
     histogram_widget.cpp
     histogram_widget.h
+    hsl_mixer_widget.cpp
+    hsl_mixer_widget.h
     preview_widget.h
 )
 

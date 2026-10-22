@@ -22,6 +22,7 @@ namespace flexraw::ui::editor
 
 class HistogramWidget;
 class AdjustmentParameterControl;
+class HslMixerWidget;
 struct AdjustmentParameterConfiguration;
 
 class DevelopPanel : public QWidget
@@ -165,6 +166,7 @@ private:
     QSpinBox* m_whiteBalanceTemperatureSpinBox{nullptr};
     AdjustmentParameterControl* m_whiteBalanceTintControl{nullptr};
     HistogramWidget* m_histogramWidget{nullptr};
+    HslMixerWidget* m_hslMixer{nullptr};
     std::vector<ParameterControlBinding> m_parameterControls;
     AdjustmentControlStyle m_adjustmentControlStyle{AdjustmentControlStyle::Classic};
     bool m_adjustmentInProgress{false};
