@@ -16,6 +16,7 @@
 
 #include "adjustment_control.h"
 #include "histogram_widget.h"
+#include "hsl_mixer_widget.h"
 
 namespace flexraw::ui::editor
 {
@@ -121,6 +122,16 @@ DevelopPanel::DevelopPanel(QWidget* parent) : QWidget(parent)
     addNormalizedControl(
         colorLayout, tr("Saturation"), QStringLiteral("saturationSlider"), &core::types::DevelopParams::saturation);
     contentLayout->addWidget(new CollapsibleSection(tr("Color"), colorGroup, false, contentWidget));
+
+    m_hslMixer = new HslMixerWidget(contentWidget);
+    contentLayout->addWidget(new CollapsibleSection(tr("Color Mixer"), m_hslMixer, false, contentWidget));
+    connect(m_hslMixer, &HslMixerWidget::hslChanged, this, [this](const core::types::HslParams& hsl) {
+        m_params.hsl = hsl;
+        m_histogramWidget->setClippingAnalysisPending();
+        emit paramsChanged(m_params);
+    });
+    connect(m_hslMixer, &HslMixerWidget::adjustmentStarted, this, &DevelopPanel::beginAdjustment);
+    connect(m_hslMixer, &HslMixerWidget::adjustmentFinished, this, &DevelopPanel::finishAdjustment);
 
     auto* presenceGroup = new QGroupBox(contentWidget);
     presenceGroup->setObjectName(QStringLiteral("presenceGroup"));
@@ -466,6 +477,8 @@ void DevelopPanel::updateControls()
     {
         binding.control->setValue(m_params.*(binding.parameter));
     }
+
+    m_hslMixer->setHsl(m_params.hsl);
 
     updateWhiteBalanceControls();
 }

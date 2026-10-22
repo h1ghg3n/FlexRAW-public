@@ -20,6 +20,7 @@ target_sources(flexraw_ui_tests PRIVATE
     export_dialog_test.cpp
     export_source_projection_test.cpp
     general_settings_test.cpp
+    hsl_mixer_widget_test.cpp
     qt_export_settings_adapter_test.cpp
     qt_export_client_adapter_test.cpp
     qt_folder_import_event_adapter_test.cpp

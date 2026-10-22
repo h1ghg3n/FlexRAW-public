@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(flexraw VERSION 0.2.0 LANGUAGES CXX)
+project(flexraw VERSION 0.3.0 LANGUAGES CXX)
 
 set(FLEXRAW_VERSION_PRERELEASE "")
 if(FLEXRAW_VERSION_PRERELEASE)
