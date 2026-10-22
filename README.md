@@ -5,12 +5,11 @@ Windows 데스크톱을 우선 지원하며, 동일한 처리 경로를 사용�
 함께 제공합니다.
 
 > 현재 버전: **0.3.0**
-> 현재 체크포인트: **Windows x64 Desktop 0.3.0 공개 소스 후보**
+> 현재 체크포인트: **Windows x64 Desktop 0.3.0 정식 릴리스와 공개 소스**
 
-현재 공개된 Windows x64 Desktop ZIP과 SHA-256 checksum은
-[Flexraw 0.2.0 GitHub Release](https://github.com/h1ghg3n/FlexRAW-public/releases/tag/v0.2.0)에서 받을 수 있습니다.
-0.3.0 binary package와 `v0.3.0` tag는 이 source 후보의 최종 package 검증 뒤 별도 Release gate에서 게시합니다.
-Installer와 code signing은 아직 제공하지 않습니다.
+Windows x64 Desktop ZIP과 SHA-256 checksum은
+[FlexRAW 0.3.0 GitHub Release](https://github.com/h1ghg3n/FlexRAW-public/releases/tag/v0.3.0)에서 받을 수 있습니다.
+Installer와 code signing은 아직 제공하지 않으며, 해당 Release의 `v0.3.0` tag가 binary에 대응하는 전체 소스를 고정합니다.
 
 ![FlexRAW Windows 릴리스 편집기](images/flexraw-editor.png)
 
