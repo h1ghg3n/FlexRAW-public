@@ -1,5 +1,21 @@
 # FlexRAW 변경 내역
 
+## 0.3.0
+
+### 제품 기능
+
+- Develop panel에 red/orange/yellow/green/aqua/blue/purple/magenta 8채널 HSL Color Mixer를 추가했습니다.
+- 각 channel의 Hue/Saturation/Luminance 조정, channel reset과 전체 reset을 기존 Develop history에 연결했습니다.
+- slider gesture는 기존 adjustment transaction을 재사용하고, 저장·재열기와 Local Export에 같은 Develop recipe를 적용합니다.
+- 다른 사진과 선택하지 않은 HSL channel의 값을 보존하며 별도 Runtime state나 scheduling consumer를 추가하지 않습니다.
+
+### 검증과 배포
+
+- focused HSL/DevelopPanel test와 전체 UI test, Windows Release/Debug 및 staged Desktop runtime 검증을 통과했습니다.
+- Linux x64 portable processing과 Linux ARM64 native processing 검증을 통과했습니다.
+- 대표 Canon/Nikon/Sony RAW에서 사진별 보정값 저장·재열기와 JPEG Export를 확인했습니다.
+- 첫 0.3.0 binary package는 Windows Desktop을 대상으로 하며 MCP, Worker와 CLI는 source/build capability로 제공합니다.
+
 ## 0.2.0
 
 ### 제품 기능

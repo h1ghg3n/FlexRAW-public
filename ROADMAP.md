@@ -3,13 +3,13 @@
 이 문서는 공개 source에서 확인할 수 있는 현재 기능과 가까운 제품 개발 범위를 요약합니다. 세부 구현 상태는 실제 source와
 test를 기준으로 합니다.
 
-## 0.2.0 현재 상태
+## 0.3.0 현재 상태
 
 | 영역 | 현재 상태 |
 |---|---|
-| Windows Desktop | Catalog, Editor, Preview, Settings와 Local/Remote/Auto Export 제공 |
+| Windows Desktop | Catalog, Editor, Preview, HSL Color Mixer, Settings와 Local/Remote/Auto Export 제공 |
 | Catalog | Folder import, Project, 선별·제외, source replacement/relink와 사진별 Develop 저장 지원 |
-| Processing | RAW decode, 기본 Develop, color transform와 JPEG/PNG/TIFF output 지원 |
+| Processing | RAW decode, 기본 Develop와 8채널 HSL, color transform와 JPEG/PNG/TIFF output 지원 |
 | Batch Export | 현재 선택 및 Catalog에 저장된 사진별 Develop 값 적용 |
 | Terminal CLI | RAW 한 장을 neutral processing 경로로 처리해 PNG로 기록 |
 | MCP | Catalog/Project/Editor와 선택 사진의 bounded Local JPEG Export 제공 |
@@ -20,7 +20,6 @@ test를 기준으로 합니다.
 
 ### 편집과 표시
 
-- HSL 조작 UI와 product workflow 연결
 - crop, rotate, straighten과 before/after 비교
 - monitor별 ICC와 high-bit-depth display 검증
 - 정밀/full-resolution preview 단계

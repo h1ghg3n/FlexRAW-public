@@ -4,12 +4,13 @@ FlexRAW는 로컬 환경에서 RAW 사진을 관리하고 비파괴 보정과 �
 Windows 데스크톱을 우선 지원하며, 동일한 처리 경로를 사용하는 별도 Render Worker와 로컬 STDIO MCP 서버도
 함께 제공합니다.
 
-> 현재 버전: **0.2.0**
-> 현재 체크포인트: **Windows x64 Desktop 정식 릴리스와 공개 소스**
+> 현재 버전: **0.3.0**
+> 현재 체크포인트: **Windows x64 Desktop 0.3.0 공개 소스 후보**
 
-Windows x64 Desktop ZIP과 SHA-256 checksum은
+현재 공개된 Windows x64 Desktop ZIP과 SHA-256 checksum은
 [Flexraw 0.2.0 GitHub Release](https://github.com/h1ghg3n/FlexRAW-public/releases/tag/v0.2.0)에서 받을 수 있습니다.
-Installer와 code signing은 아직 제공하지 않으며, 해당 Release의 `v0.2.0` tag가 binary에 대응하는 전체 소스를 고정합니다.
+0.3.0 binary package와 `v0.3.0` tag는 이 source 후보의 최종 package 검증 뒤 별도 Release gate에서 게시합니다.
+Installer와 code signing은 아직 제공하지 않습니다.
 
 ![FlexRAW Windows 릴리스 편집기](images/flexraw-editor.png)
 
@@ -23,7 +24,7 @@ NASA Earth Observatory를 출처로 표시합니다. NASA의
 - 폴더에서 RAW와 JPEG/PNG/TIFF 사진을 찾아 카탈로그에 등록하고 페이지 단위로 탐색할 수 있습니다.
 - 화면에는 내장 썸네일을 먼저 표시한 뒤 표준 프리뷰로 교체하며, 현재 보이는 항목과 인접 항목의 썸네일만 유지합니다.
 - 노출, 대비, 밝은 영역, 어두운 영역, 흰색 영역, 검은색 영역, 화이트밸런스, 생동감, 채도를 조정할 수 있습니다.
-- 명료도, 디헤이즈, 샤프닝, 휘도/색상 노이즈 감소와 파라메트릭/포인트 톤 커브를 지원합니다.
+- 명료도, 디헤이즈, 샤프닝, 휘도/색상 노이즈 감소, 파라메트릭/포인트 톤 커브와 8채널 HSL Color Mixer를 지원합니다.
 - 사진별 실행 취소/다시 실행, 연속 조작의 실행 이력 병합, 영구 저장되는 리비전과 명시적 저장을 지원합니다.
 - 프로젝트 생성·이름 변경·삭제와 여러 사진을 한 번에 프로젝트에 추가하거나 제거하는 기능을 지원합니다.
 - 카탈로그 사진의 선별 상태와 내보내기 포함 여부를 관리할 수 있습니다.
@@ -55,7 +56,7 @@ Linux ARM64는 운영체제와 아키텍처를 나타내는 명칭이며 Ubuntu�
 Qt Desktop                              Local STDIO MCP
 MainWindow + Qt Adapter                   MCP Adapter
         |                                      |
-        +------ Qt-free Product Contract ------+
+        +--- Frontend-neutral Product Contract ---+
                          ^
                          |
               Product Runtime (현재 Qt-based)
@@ -79,7 +80,7 @@ TCP Server Adapter -> Worker Runtime port -> bounded Worker Runtime
 다음 기능은 아직 구현 또는 제품 검증 범위에 포함되지 않습니다.
 
 - 자동 저장과 디스크 썸네일 캐시
-- 자르기/회전/수평 맞추기, HSL 조작 UI/컬러 그레이딩, 로컬 마스크와 레이어
+- 자르기/회전/수평 맞추기, 컬러 그레이딩, 로컬 마스크와 레이어
 - 모니터별 디스플레이 ICC와 전체 해상도 정밀 편집 단계
 - Lensfun 보정, HDR/파노라마와 ML 추론
 - Worker 자동 탐색, 다중 Worker 스케줄링, 인증/TLS와 공개 인터넷 운영

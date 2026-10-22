@@ -1,7 +1,7 @@
-FlexRAW 0.2.0 Corresponding Source
+FlexRAW 0.3.0 Corresponding Source
 
 The complete corresponding source code for this release, including the build scripts and dependency manifests, is available at:
 
-https://github.com/h1ghg3n/FlexRAW-public/tree/v0.2.0
+https://github.com/h1ghg3n/FlexRAW-public/tree/v0.3.0
 
 Third-party license and source information is listed in THIRD_PARTY_LICENSES.md and in the package-specific notice files included with the binary release.
